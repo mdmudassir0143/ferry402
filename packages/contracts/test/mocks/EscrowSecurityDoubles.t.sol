@@ -80,6 +80,51 @@ contract ReentrantMockUSDC is IEIP3009 {
     }
 }
 
+/// @notice Malicious token whose transfer() reenters Escrow.withdraw before
+/// returning, simulating a token that calls back into the caller mid-transfer
+/// (e.g. an upgradeable or non-standard token). Used to prove nonReentrant
+/// blocks a reentrant withdrawal (task 3 hard gate).
+contract ReentrantWithdrawMockUSDC is IEIP3009 {
+    Escrow public escrow;
+    mapping(address => uint256) private _bal;
+
+    function setEscrow(address e) external {
+        escrow = Escrow(e);
+    }
+
+    function mint(address to, uint256 amount) external {
+        _bal[to] += amount;
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return _bal[account];
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _bal[msg.sender] -= amount;
+        _bal[to] += amount;
+        // Attempt a nested withdraw before this transfer returns, i.e. while
+        // the outer withdraw call is still on the stack.
+        escrow.withdraw(amount, to);
+        return true;
+    }
+
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256, /* validAfter */
+        uint256, /* validBefore */
+        bytes32, /* nonce */
+        uint8, /* v */
+        bytes32, /* r */
+        bytes32 /* s */
+    ) external {
+        _bal[from] -= value;
+        _bal[to] += value;
+    }
+}
+
 contract EscrowSecurityDoublesTest is Test {
     uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
     uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
@@ -162,5 +207,37 @@ contract EscrowSecurityDoublesTest is Test {
 
         vm.expectRevert(Escrow.Reentrancy.selector);
         escrow.settleAuthorization(address(0xBEEF), bytes32(uint256(1)), auth, 27, bytes32(0), bytes32(0));
+    }
+
+    /// @notice Task 3 hard gate: withdraw must carry nonReentrant. A token
+    /// whose transfer() calls back into Escrow.withdraw mid-call must have
+    /// that nested call blocked, and the whole outer withdraw must revert
+    /// rather than silently swallow the nested failure.
+    function test_withdraw_nonReentrant_blocksNestedWithdraw() public {
+        ReentrantWithdrawMockUSDC token = new ReentrantWithdrawMockUSDC();
+        Escrow escrow = new Escrow(address(token));
+        token.setEscrow(address(escrow));
+        token.mint(address(0xA11CE), 1_000e6);
+
+        address merchant = address(0xBEEF);
+        Escrow.Authorization memory auth = Escrow.Authorization({
+            from: address(0xA11CE),
+            to: address(escrow),
+            value: 10e6,
+            validAfter: 0,
+            validBefore: block.timestamp + 3600,
+            nonce: keccak256(abi.encode(merchant, bytes32(uint256(1))))
+        });
+        escrow.settleAuthorization(merchant, bytes32(uint256(1)), auth, 27, bytes32(0), bytes32(0));
+        assertEq(escrow.balanceOf(merchant), 10e6);
+
+        vm.prank(merchant);
+        vm.expectRevert(Escrow.Reentrancy.selector);
+        escrow.withdraw(10e6, merchant);
+
+        // The outer call's effects must also be rolled back: the
+        // checks-effects decrement is not left applied when the interaction
+        // step ultimately reverts.
+        assertEq(escrow.balanceOf(merchant), 10e6);
     }
 }

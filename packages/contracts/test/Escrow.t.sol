@@ -20,11 +20,27 @@ contract EscrowTest is Test {
     uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
     uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
+    // Counter used only to derive unique paymentIds for _payMerchant calls
+    // within a single test; it is NOT the nonce itself. The nonce is
+    // cryptographically bound on-chain to (merchant, paymentId) via
+    // keccak256(abi.encode(merchant, paymentId)) — see _auth().
+    uint256 private _nextPaymentId = 1000;
+
     function setUp() public {
         payer = vm.addr(payerKey);
         usdc = new MockUSDC();
         escrow = new Escrow(address(usdc));
         usdc.mint(payer, 1_000e6);
+    }
+
+    /// @notice Settles a fresh authorization crediting `merchant` with
+    /// `amount`, using a unique paymentId each call so the merchant-bound
+    /// nonce (see Escrow.settleAuthorization) never collides.
+    function _payMerchant(uint256 amount) internal {
+        bytes32 paymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory auth = _auth(merchant, paymentId, amount);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(auth);
+        escrow.settleAuthorization(merchant, paymentId, auth, v, r, s);
     }
 
     function test_settleAuthorization_creditsMerchant() public {
@@ -81,6 +97,53 @@ contract EscrowTest is Test {
 
         vm.expectRevert(Escrow.ZeroMerchant.selector);
         escrow.settleAuthorization(address(0), paymentId, auth, v, r, s);
+    }
+
+    function test_withdraw_transfersToMerchant() public {
+        _payMerchant(10e6);
+        vm.prank(merchant);
+        escrow.withdraw(4e6, merchant);
+        assertEq(escrow.balanceOf(merchant), 6e6);
+        assertEq(usdc.balanceOf(merchant), 4e6);
+    }
+
+    function test_withdraw_revertsWhenOverBalance() public {
+        _payMerchant(10e6);
+        vm.prank(merchant);
+        vm.expectRevert(Escrow.InsufficientBalance.selector);
+        escrow.withdraw(11e6, merchant);
+    }
+
+    /// @notice There is no owner/admin path in Escrow at all — withdraw only
+    /// ever debits `_balances[msg.sender]`. An unrelated caller with no
+    /// ledger balance of their own can't withdraw anything, merchant funds
+    /// included, because `amount > bal` (0) always trips InsufficientBalance.
+    function test_noAdminCanMoveMerchantFunds() public {
+        _payMerchant(10e6);
+        vm.prank(address(0xDEAD));
+        vm.expectRevert(Escrow.InsufficientBalance.selector);
+        escrow.withdraw(10e6, address(0xDEAD));
+    }
+
+    /// @notice Security proof: pooled custody means one token balance backs
+    /// many merchants' ledger rows. A merchant withdrawing their own balance
+    /// must not move or zero out another merchant's `_balances` entry.
+    function test_withdraw_doesNotTouchOtherMerchantBalance() public {
+        _payMerchant(10e6);
+
+        address other = address(0xCAFE);
+        bytes32 otherPaymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory otherAuth = _auth(other, otherPaymentId, 5e6);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(otherAuth);
+        escrow.settleAuthorization(other, otherPaymentId, otherAuth, v, r, s);
+
+        vm.prank(merchant);
+        escrow.withdraw(10e6, merchant);
+
+        assertEq(escrow.balanceOf(merchant), 0);
+        assertEq(escrow.balanceOf(other), 5e6);
+        assertEq(usdc.balanceOf(other), 0);
+        assertEq(usdc.balanceOf(address(escrow)), 5e6);
     }
 
     function _auth(address merchant_, bytes32 paymentId, uint256 value)

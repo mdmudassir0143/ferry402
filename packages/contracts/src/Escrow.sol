@@ -19,11 +19,13 @@ contract Escrow {
     uint256 private _lock = 1;
 
     event PaymentSettled(address indexed merchant, address indexed payer, uint256 value, bytes32 nonce);
+    event Withdrawn(address indexed merchant, address indexed to, uint256 amount);
 
     error Reentrancy();
     error RecipientMismatch();
     error MerchantNotBound();
     error ZeroMerchant();
+    error InsufficientBalance();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrancy();
@@ -68,5 +70,24 @@ contract Escrow {
 
         _balances[merchant] += received;
         emit PaymentSettled(merchant, auth.from, received, auth.nonce);
+    }
+
+    /// @notice Withdraws from the caller's own merchant balance. There is no
+    /// owner/admin path: msg.sender can only ever move `_balances[msg.sender]`,
+    /// never another merchant's funds. Guarded by nonReentrant because this is
+    /// the second function (alongside settleAuthorization) that mutates the
+    /// shared token balance and a per-merchant ledger entry.
+    function withdraw(uint256 amount, address to) external nonReentrant {
+        uint256 bal = _balances[msg.sender];
+        if (amount > bal) revert InsufficientBalance();
+        // Effects before interaction: decrement the ledger before the
+        // external token transfer, so a reentrant call (blocked by
+        // nonReentrant regardless) would in any case see the post-decrement
+        // balance, not a stale one.
+        unchecked {
+            _balances[msg.sender] = bal - amount;
+        }
+        require(token.transfer(to, amount), "transfer failed");
+        emit Withdrawn(msg.sender, to, amount);
     }
 }
