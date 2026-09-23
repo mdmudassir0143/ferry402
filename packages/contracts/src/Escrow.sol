@@ -18,9 +18,7 @@ contract Escrow {
 
     uint256 private _lock = 1;
 
-    event PaymentSettled(
-        address indexed merchant, address indexed payer, uint256 value, bytes32 nonce
-    );
+    event PaymentSettled(address indexed merchant, address indexed payer, uint256 value, bytes32 nonce);
 
     error Reentrancy();
     error RecipientMismatch();
@@ -50,7 +48,9 @@ contract Escrow {
         address merchant,
         bytes32 paymentId,
         Authorization calldata auth,
-        uint8 v, bytes32 r, bytes32 s
+        uint8 v,
+        bytes32 r,
+        bytes32 s
     ) external nonReentrant {
         if (merchant == address(0)) revert ZeroMerchant();
         if (auth.to != address(this)) revert RecipientMismatch();
@@ -58,8 +58,7 @@ contract Escrow {
 
         uint256 before = token.balanceOf(address(this));
         token.receiveWithAuthorization(
-            auth.from, auth.to, auth.value,
-            auth.validAfter, auth.validBefore, auth.nonce, v, r, s
+            auth.from, auth.to, auth.value, auth.validAfter, auth.validBefore, auth.nonce, v, r, s
         );
         uint256 received = token.balanceOf(address(this)) - before;
 

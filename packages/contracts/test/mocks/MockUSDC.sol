@@ -30,8 +30,7 @@ contract MockUSDC is IEIP3009 {
     // secp256k1 curve order / 2, the same bound OpenZeppelin's ECDSA library
     // enforces. Rejecting s above this bound rejects the malleable "other"
     // valid signature for the same message, matching real USDC's behavior.
-    uint256 private constant _SECP256K1N_HALF =
-        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A;
+    uint256 private constant _SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 

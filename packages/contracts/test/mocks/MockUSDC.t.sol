@@ -17,6 +17,7 @@ contract MockUSDCTest is Test {
     // secp256k1 curve order, used to construct the malleable "other" valid
     // signature (r, n - s, flipped v) for the low-s rejection test.
     uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
     function setUp() public {
         payer = vm.addr(payerKey);
@@ -24,13 +25,29 @@ contract MockUSDCTest is Test {
         usdc.mint(payer, 1_000e6);
     }
 
-    function _sign(address from, address recipient, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce)
-        internal
-        view
-        returns (uint8, bytes32, bytes32)
-    {
+    // vm.sign does not canonicalize its output, so roughly half of all signed
+    // digests come back high-s; a real wallet SDK normalizes to low-s (EIP-2)
+    // before returning a signature, so test helpers must do the same to
+    // produce signatures MockUSDC (which rejects high-s, like real USDC)
+    // will actually accept.
+    function _toLowS(uint8 v, bytes32 r, bytes32 s) internal pure returns (uint8, bytes32, bytes32) {
+        if (uint256(s) > SECP256K1N_HALF) {
+            return (v == 27 ? 28 : 27, r, bytes32(SECP256K1N - uint256(s)));
+        }
+        return (v, r, s);
+    }
+
+    function _sign(
+        address from,
+        address recipient,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce
+    ) internal view returns (uint8, bytes32, bytes32) {
         bytes32 digest = usdc.receiveAuthorizationDigest(from, recipient, value, validAfter, validBefore, nonce);
-        return vm.sign(payerKey, digest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(payerKey, digest);
+        return _toLowS(v, r, s);
     }
 
     function test_revertsWhenCallerNotPayee() public {
@@ -75,7 +92,8 @@ contract MockUSDCTest is Test {
         bytes32 nonce = bytes32(uint256(104));
         uint256 wrongKey = 0xB0B;
         bytes32 digest = usdc.receiveAuthorizationDigest(payer, to, 1e6, 0, block.timestamp + 3600, nonce);
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, digest);
+        (uint8 rawV, bytes32 rawR, bytes32 rawS) = vm.sign(wrongKey, digest);
+        (uint8 v, bytes32 r, bytes32 s) = _toLowS(rawV, rawR, rawS);
         vm.prank(to);
         vm.expectRevert(MockUSDC.InvalidSignature.selector);
         usdc.receiveWithAuthorization(payer, to, 1e6, 0, block.timestamp + 3600, nonce, v, r, s);

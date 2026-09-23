@@ -12,6 +12,14 @@ contract EscrowTest is Test {
     uint256 payerKey = 0xA11CE;
     address payer;
 
+    // secp256k1 curve order / 2. vm.sign does not canonicalize its output, so
+    // roughly half of all signed digests come back high-s; a real wallet SDK
+    // (ethers, viem, ...) normalizes to low-s (EIP-2) before returning a
+    // signature, so the test helper must do the same to produce signatures
+    // MockUSDC (which rejects high-s, like real USDC) will actually accept.
+    uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
     function setUp() public {
         payer = vm.addr(payerKey);
         usdc = new MockUSDC();
@@ -90,14 +98,16 @@ contract EscrowTest is Test {
         });
     }
 
-    function _sign(Escrow.Authorization memory a)
-        internal
-        view
-        returns (uint8, bytes32, bytes32)
-    {
-        bytes32 digest = usdc.receiveAuthorizationDigest(
-            a.from, a.to, a.value, a.validAfter, a.validBefore, a.nonce
-        );
-        return vm.sign(payerKey, digest);
+    function _sign(Escrow.Authorization memory a) internal view returns (uint8, bytes32, bytes32) {
+        bytes32 digest = usdc.receiveAuthorizationDigest(a.from, a.to, a.value, a.validAfter, a.validBefore, a.nonce);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(payerKey, digest);
+        return _toLowS(v, r, s);
+    }
+
+    function _toLowS(uint8 v, bytes32 r, bytes32 s) internal pure returns (uint8, bytes32, bytes32) {
+        if (uint256(s) > SECP256K1N_HALF) {
+            return (v == 27 ? 28 : 27, r, bytes32(SECP256K1N - uint256(s)));
+        }
+        return (v, r, s);
     }
 }
