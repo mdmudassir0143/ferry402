@@ -44,6 +44,10 @@ contract Escrow {
     /// keccak256(abi.encode(merchant, paymentId)). Changing the merchant changes the
     /// nonce, which invalidates the payer's signature. This is what stops anyone who
     /// observes the signed payload from redirecting the credit to themselves.
+    /// @dev The nonce deliberately omits the payer (the token already keys nonce
+    /// state per authorizer), so `paymentId` must be unique per (payer, merchant)
+    /// pair: the same payer paying the same merchant twice with the same
+    /// `paymentId` collides on the same nonce and reverts `AuthorizationAlreadyUsed`.
     function settleAuthorization(
         address merchant,
         bytes32 paymentId,

@@ -34,7 +34,9 @@ contract MockUSDC is IEIP3009 {
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 
-    mapping(address => uint256) private _balances;
+    // internal, not private: LossyMockUSDC overrides _transfer to model a
+    // fee-on-transfer token and needs to read/write balances directly.
+    mapping(address => uint256) internal _balances;
     mapping(address => mapping(bytes32 => bool)) private _authorizationStates;
 
     event Transfer(address indexed from, address indexed to, uint256 value);
@@ -124,7 +126,7 @@ contract MockUSDC is IEIP3009 {
         _transfer(from, to, value);
     }
 
-    function _transfer(address from, address to, uint256 amount) internal {
+    function _transfer(address from, address to, uint256 amount) internal virtual {
         uint256 fromBalance = _balances[from];
         if (fromBalance < amount) revert InsufficientBalance();
         unchecked {
