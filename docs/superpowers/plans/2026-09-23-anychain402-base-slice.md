@@ -931,3 +931,27 @@ Arbitrum from v1. Decide before Plan 3 begins, not during it.
 and 8. `buildRequirements` and `Anychain402Config` from Task 5 are used unchanged
 in Task 6. `SettleResponse` field names in Task 8 match the upstream schema
 verified above.
+
+---
+
+## AMENDMENTS (applied mid-execution — supersede the task text above)
+
+**A1 — merchant binding (supersedes Task 2 Step 5 and ripples forward).**
+See spec Amendment 1. `settleAuthorization` gains a `bytes32 paymentId` parameter and
+requires `auth.nonce == keccak256(abi.encode(merchant, paymentId))`. Credit uses the
+observed `balanceOf` delta, not `auth.value`, under a `nonReentrant` guard.
+
+Binding on later tasks:
+- **Task 4:** fuzz that a valid authorization cannot be settled to a different merchant.
+- **Task 5:** `PaymentRequirements.extra` must carry `paymentId` alongside `merchant`.
+- **Task 6:** the client derives `nonce = keccak256(abi.encode(merchant, paymentId))`.
+- **Task 7:** `/verify` recomputes the nonce and rejects a mismatch before settling.
+- **Task 8:** `settlePayment` passes `paymentId` through to the contract call.
+
+**A2 — MockUSDC strictness.** The mock rejects malleable signatures (`s` above
+secp256k1n/2, `v` outside {27,28}) because real USDC does, and its strictness tests are
+committed so CI enforces them.
+
+**A3 — known limitation, deferred.** EIP-1271 smart-contract-wallet signatures are not
+supported. Real USDC v2.2 accepts them and smart wallets are common on Base; adding
+support changes `IEIP3009`, the mock and the verify path, so it belongs to its own plan.

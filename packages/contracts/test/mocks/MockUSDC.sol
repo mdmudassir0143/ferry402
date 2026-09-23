@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IEIP3009} from "../../src/interfaces/IEIP3009.sol";
+
 /// @title MockUSDC
 /// @notice Minimal EIP-3009 + ERC20-ish token for tests. Mimics real USDC's
 ///         6 decimals and `receiveWithAuthorization` semantics closely enough
@@ -8,10 +10,12 @@ pragma solidity ^0.8.24;
 ///         - only the named `to` may submit the authorization
 ///         - nonces are single-use per authorizer
 ///         - authorizations are time-windowed
+///         - signatures must be non-malleable (low-s, v in {27,28}), matching
+///           OpenZeppelin's ECDSA library, which real USDC uses
 ///         This contract is intentionally strict. It must never be weakened
 ///         to make a test pass — a test failing against this mock signals a
 ///         real bug in the caller, not a mock problem.
-contract MockUSDC {
+contract MockUSDC is IEIP3009 {
     string public constant name = "MockUSDC";
     string public constant symbol = "mUSDC";
     uint8 public constant decimals = 6;
@@ -22,6 +26,12 @@ contract MockUSDC {
     bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH = keccak256(
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
     );
+
+    // secp256k1 curve order / 2, the same bound OpenZeppelin's ECDSA library
+    // enforces. Rejecting s above this bound rejects the malleable "other"
+    // valid signature for the same message, matching real USDC's behavior.
+    uint256 private constant _SECP256K1N_HALF =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A;
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 
@@ -36,6 +46,8 @@ contract MockUSDC {
     error AuthorizationExpired();
     error AuthorizationAlreadyUsed();
     error InvalidSignature();
+    error InvalidSignatureSValue();
+    error InvalidSignatureVValue();
     error InsufficientBalance();
 
     constructor() {
@@ -46,6 +58,8 @@ contract MockUSDC {
         );
     }
 
+    /// @notice Test-only faucet. Deliberately unguarded: MockUSDC is never
+    /// deployed outside tests, so anyone-can-mint is intentional, not a bug.
     function mint(address to, uint256 amount) external {
         _balances[to] += amount;
         emit Transfer(address(0), to, amount);
@@ -98,6 +112,8 @@ contract MockUSDC {
         if (block.timestamp <= validAfter) revert AuthorizationNotYetValid();
         if (block.timestamp >= validBefore) revert AuthorizationExpired();
         if (_authorizationStates[from][nonce]) revert AuthorizationAlreadyUsed();
+        if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
+        if (v != 27 && v != 28) revert InvalidSignatureVValue();
 
         bytes32 digest = receiveAuthorizationDigest(from, to, value, validAfter, validBefore, nonce);
         address signer = ecrecover(digest, v, r, s);

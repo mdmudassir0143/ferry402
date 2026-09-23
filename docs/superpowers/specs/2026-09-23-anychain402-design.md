@@ -246,3 +246,68 @@ template uses yarn while the SDK monorepo may use pnpm.
 2. Bridge choice for consolidation (Stargate vs Squid) — decide on measured cost
    in step 5, not now.
 3. Whether the hosted facilitator becomes a paid service — out of scope for v1.
+
+---
+
+## Amendment 1 — merchant binding (2026-09-24)
+
+**Supersedes the Escrow description in Components.** Found by the Task 2 review;
+confirmed by the controller.
+
+### The defect
+
+EIP-3009's `ReceiveWithAuthorization` typehash commits the payer's signature to
+exactly six fields: `from, to, value, validAfter, validBefore, nonce`. The original
+design passed `merchant` as a separate, caller-supplied argument to a permissionless
+`settleAuthorization`. The beneficiary was therefore **not bound to the payer's
+signature**: anyone holding `(auth, v, r, s)` could call
+`settleAuthorization(attacker, auth, v, r, s)` and receive the credit. The token's
+`msg.sender == to` check does not help, because the Escrow is still the caller.
+
+In x402 the signed payload travels in an `X-PAYMENT` header to the resource server,
+which relays it to the facilitator — so the resource server, the facilitator, and any
+proxy between them hold a blob that credits an address of their choosing. This
+silently converted the design into "trust the resource server and facilitator", which
+contradicts the non-custodial goal in Goals #2.
+
+Choosing `receiveWithAuthorization` over `transferWithAuthorization` closed this hole
+at the token layer; the Escrow reintroduced it one layer up, and worse — the observer
+picks the beneficiary rather than merely griefing.
+
+### The fix
+
+The beneficiary is bound into the authorization nonce, which EIP-3009 leaves as a free
+32 bytes:
+
+```
+nonce = keccak256(abi.encode(merchant, paymentId))
+```
+
+The payer signs that nonce as part of the authorization. `Escrow.settleAuthorization`
+takes `paymentId` and recomputes the nonce, rejecting any mismatch. Changing the
+merchant changes the nonce, which invalidates the payer's signature. This costs no
+extra gas, requires no typehash change, and introduces no trusted role.
+
+Rejected alternatives: a second payer signature (doubles signing UX); restricting
+settlement to a facilitator role (narrows who can exploit it rather than removing the
+capability, and creates exactly the privileged fund-moving role the Global Constraints
+forbid).
+
+### Downstream consequences — binding on later tasks
+
+- The SDK client must derive the nonce by this rule, not randomly.
+- `PaymentRequirements.extra` must carry `paymentId` so the client can derive it.
+- The facilitator's `/verify` must recompute the nonce and reject a mismatch **before**
+  settling, so a redirect attempt fails off-chain rather than reverting on-chain.
+
+## Amendment 2 — credit the observed delta (2026-09-24)
+
+`settleAuthorization` credited `auth.value`, the amount *requested*, rather than the
+amount actually received. Under a fee-on-transfer, deflationary or rebasing token the
+ledger over-credits relative to real holdings, and because the Escrow is pooled custody
+this becomes first-come-first-served insolvency once withdrawal exists. "USDC only" is
+project policy, not a code guarantee, and the constructor validates nothing.
+
+Fixed by measuring `token.balanceOf(address(this))` before and after the pull and
+crediting the difference, under a reentrancy guard — the guard is load-bearing, since
+a nested settle would otherwise corrupt the measured window.
