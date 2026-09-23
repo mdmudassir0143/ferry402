@@ -1,0 +1,11 @@
+{
+  "name": "anychain402",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20.18.3" },
+  "scripts": {
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint"
+  }
+}
