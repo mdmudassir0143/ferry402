@@ -11,9 +11,9 @@ const config: Anychain402Config = {
   // is present" would miss a cross-chain mix-up (e.g. every entry getting
   // base-sepolia's address). These must differ so such a bug fails loudly.
   merchantEvm: {
-    base: '0x3333333333333333333333333333333333333d',
+    base: '0x333333333333333333333333333333333333333d',
     'base-sepolia': '0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa',
-    polygon: '0x4444444444444444444444444444444444444e',
+    polygon: '0x444444444444444444444444444444444444444e',
     'polygon-amoy': '0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb',
   },
   facilitator: 'http://localhost:4000',
@@ -54,7 +54,8 @@ describe('buildRequirements', () => {
 
   it('carries merchant and paymentId in extra for every chain option', () => {
     const reqs = buildRequirements(config, 'https://api.test/premium', {
-      paymentId: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      unsafePaymentIdForTesting:
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     })
     for (const r of reqs) {
       expect(r.extra?.merchant).toBe('0.0.123456')
@@ -104,7 +105,7 @@ describe('buildRequirements', () => {
     expect(() =>
       buildRequirements(config, 'https://api.test/premium', {
         // not 32 bytes
-        paymentId: '0xdead' as `0x${string}`,
+        unsafePaymentIdForTesting: '0xdead' as `0x${string}`,
       }),
     ).toThrow(/paymentId/)
   })
@@ -114,6 +115,22 @@ describe('buildRequirements', () => {
     const allowed = new Set(['base', 'base-sepolia', 'polygon', 'polygon-amoy'])
     for (const r of reqs) {
       expect(allowed.has(r.network)).toBe(true)
+    }
+  })
+})
+
+describe('config fixture integrity', () => {
+  // Guards Minor 2 from review: the merchantEvm placeholders for the two
+  // unaccepted chains (base, polygon) were previously 38 hex chars, not 40 -
+  // not a valid 20-byte address. buildRequirements never touched them (it
+  // only iterates config.accept), so nothing caught it. Pin the whole fixture
+  // to valid addresses so extending `accept` later doesn't hit that trap.
+  it('every configured address is a valid 20-byte 0x address', () => {
+    const maps = [config.merchantEvm, config.escrows, config.assets]
+    for (const map of maps) {
+      for (const address of Object.values(map)) {
+        expect(address).toMatch(EVM_ADDRESS_RE)
+      }
     }
   })
 })
@@ -129,5 +146,34 @@ describe('parsePrice', () => {
 
   it('rejects a non-numeric price', () => {
     expect(() => parsePrice('$abc')).toThrow(/invalid price/)
+  })
+
+  // Minor 3 from review: the leading "$" was already optional by accident of
+  // the regex. Pin it down as intentional, both forms parse the same way.
+  it('treats the leading "$" as optional, not required', () => {
+    expect(parsePrice('0.01')).toBe(parsePrice('$0.01'))
+    expect(parsePrice('5')).toBe('5000000')
+  })
+
+  // Important finding from review: parsePrice used to floor anything past 6
+  // fractional digits, so a nonzero configured price could silently become
+  // free (parsePrice('$0.0000001') === '0' before this fix). It must now
+  // reject rather than round, at exactly the boundary USDC can represent.
+  describe('sub-atomic-unit prices (regression for silent truncation)', () => {
+    it('accepts exactly 6 fractional digits at the smallest atomic unit', () => {
+      expect(parsePrice('$0.000001')).toBe('1')
+    })
+
+    it('rejects 7 fractional digits instead of silently flooring to zero', () => {
+      // Before the fix this returned '0' - a configured, nonzero price
+      // silently became a free resource. It must now throw.
+      expect(() => parsePrice('$0.0000001')).toThrow(/6/)
+    })
+
+    it('rejects a price that would floor to a materially different amount', () => {
+      // Before the fix this returned '999999', one atomic unit below the
+      // nearer '1000000' - a silent, wrong-amount charge either way.
+      expect(() => parsePrice('$0.999999999')).toThrow(/6/)
+    })
   })
 })

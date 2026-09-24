@@ -4,12 +4,32 @@ import type { Anychain402Config, PaymentRequirements, SupportedChain } from './t
 const USDC_DECIMALS = 6
 const PAYMENT_ID_RE = /^0x[0-9a-fA-F]{64}$/
 
-/** Converts a decimal-dollar price string (e.g. "$0.01") to 6-decimal USDC atomic units. */
+/**
+ * Converts a decimal-dollar price string (e.g. "$0.01") to 6-decimal USDC
+ * atomic units. The leading "$" is optional — "0.01" and "$0.01" parse
+ * identically; this is a deliberate, tested choice, not an accident of the
+ * regex.
+ *
+ * Rejects (rather than rounds or truncates) a price with more than 6
+ * fractional digits. USDC has 6 decimals, so anything past that cannot be
+ * represented — silently flooring it would either charge a wrong amount or,
+ * for any price under 0.000001, silently charge nothing at all. A payments
+ * library must never invent a price the caller didn't write; it must say so
+ * and let the caller fix their input.
+ */
 export function parsePrice(price: string): string {
   const cleaned = price.replace(/^\$/, '')
   if (!/^\d+(\.\d+)?$/.test(cleaned)) throw new Error(`invalid price: ${price}`)
   const [whole, frac = ''] = cleaned.split('.')
-  const padded = (frac + '0'.repeat(USDC_DECIMALS)).slice(0, USDC_DECIMALS)
+  if (frac.length > USDC_DECIMALS) {
+    throw new Error(
+      `invalid price: ${price} has ${frac.length} fractional digits, but USDC ` +
+        `supports at most ${USDC_DECIMALS}. Rounding would silently change the ` +
+        `price, so this is rejected instead of rounded — use at most ` +
+        `${USDC_DECIMALS} decimal places.`,
+    )
+  }
+  const padded = frac.padEnd(USDC_DECIMALS, '0')
   return BigInt(whole + padded).toString()
 }
 
@@ -33,12 +53,17 @@ export function generatePaymentId(): `0x${string}` {
 
 export interface BuildRequirementsOptions {
   /**
-   * Injects a specific payment id instead of generating one. Intended for
-   * tests that need deterministic assertions; the default (omitted) path
-   * always generates a fresh random id and is the secure choice for
-   * production use. Must be a `0x`-prefixed 32-byte (64 hex char) value.
+   * Injects a specific payment id instead of generating one, for tests that
+   * need deterministic assertions. The name is deliberately loud: supplying
+   * anything other than a fresh CSPRNG value breaks the per-(payer,
+   * merchant) uniqueness the on-chain nonce binding depends on (see
+   * `generatePaymentId`) and WILL collide with the token's nonce tracking —
+   * a predictable value (e.g. a zero-padded counter) still satisfies the
+   * shape check below but is not safe to use in production. Omit this in
+   * production; the default path always generates a fresh random id. Must
+   * be a `0x`-prefixed 32-byte (64 hex char) value.
    */
-  paymentId?: `0x${string}`
+  unsafePaymentIdForTesting?: `0x${string}`
 }
 
 /**
@@ -62,7 +87,7 @@ export function buildRequirements(
   options: BuildRequirementsOptions = {},
 ): PaymentRequirements[] {
   const maxAmountRequired = parsePrice(config.price)
-  const paymentId = options.paymentId ?? generatePaymentId()
+  const paymentId = options.unsafePaymentIdForTesting ?? generatePaymentId()
   if (!PAYMENT_ID_RE.test(paymentId)) {
     throw new Error(`invalid paymentId: expected 0x-prefixed 32-byte hex, got ${paymentId}`)
   }
