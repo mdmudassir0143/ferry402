@@ -132,14 +132,17 @@ try {
 }
 ```
 
-**Whose job deduping is:** this package's. Retrying a failed `writeEntries`
-call is the caller's decision, not something this package does
+**Whose job deduping is: NOT this package's.** Retrying a failed
+`writeEntries` call is the caller's decision, not something this package does
 automatically — a caller that retries the FULL original `entries` array
 (rather than only the ones after `err.committed.length`) will duplicate
-journal entries. Every `JournalEntry` carries `txHash` and `nonce`
-specifically so a downstream reader (a mirror-node consumer reconciling the
-journal, per this package's whole premise) can dedupe by
-`(txHash, nonce)` regardless of how many times an entry appears on the topic.
+journal entries, and this package does nothing to stop that. Every
+`JournalEntry` carries `txHash` and `nonce` specifically so a downstream
+reader — a mirror-node consumer reconciling the journal, per this package's
+whole premise — can dedupe by `(txHash, nonce)` regardless of how many times
+an entry appears on the topic. That reader is the owner of dedup, not this
+package.
+
 Today, nothing in this repository performs that dedup automatically —
 Task 10 (or whichever component first reads the journal back) owns building
 it before treating raw topic messages as an authoritative, once-each ledger.

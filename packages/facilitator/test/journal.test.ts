@@ -251,9 +251,9 @@ describe('writeEntries', () => {
         return { topicId, sequenceNumber: call }
       },
     }
-    // Padded so this produces exactly 3 messages (2 entries each fit
-    // together, per the batching test above; here we want >= 2 messages so
-    // a failure on the SECOND one leaves exactly one already committed).
+    // Padded so this produces exactly 2 messages (2 entries each, per the
+    // batching test above) -- a failure on the SECOND message leaves
+    // exactly one already committed.
     const entries = [0, 1, 2, 3].map((i) => sampleEntry({ txHash: `${TX_HASH.slice(0, -1)}${i}`, sourceChain: `chain-${i}-${'a'.repeat(80)}` }))
 
     const failure = await writeEntries(entries, { topicId: '0.0.8888', submitter }).catch((err: unknown) => err)
