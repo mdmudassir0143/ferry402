@@ -49,7 +49,14 @@ contract MockUSDC is IEIP3009 {
     error InvalidSignature();
     error InvalidSignatureSValue();
     error InvalidSignatureVValue();
-    error InsufficientBalance();
+    // Named distinctly from Escrow.InsufficientBalance(): both are
+    // zero-argument errors, and Solidity selectors are derived from the
+    // signature string alone (not the declaring contract), so identically
+    // named errors in different contracts collide on the same 4-byte
+    // selector. A test asserting Escrow's ledger-check revert must not be
+    // able to pass "by accident" via this token-level revert instead.
+    error TokenInsufficientBalance();
+    error TransferToZeroAddress();
 
     constructor() {
         DOMAIN_SEPARATOR = keccak256(
@@ -127,8 +134,12 @@ contract MockUSDC is IEIP3009 {
     }
 
     function _transfer(address from, address to, uint256 amount) internal virtual {
+        // Real USDC's _transfer reverts on transfers to the zero address;
+        // matching that here keeps this mock at least as strict as the real
+        // token, per this contract's own "intentionally strict" docstring.
+        if (to == address(0)) revert TransferToZeroAddress();
         uint256 fromBalance = _balances[from];
-        if (fromBalance < amount) revert InsufficientBalance();
+        if (fromBalance < amount) revert TokenInsufficientBalance();
         unchecked {
             _balances[from] = fromBalance - amount;
         }

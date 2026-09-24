@@ -26,6 +26,7 @@ contract Escrow {
     error MerchantNotBound();
     error ZeroMerchant();
     error InsufficientBalance();
+    error TransferFailed();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrancy();
@@ -77,6 +78,11 @@ contract Escrow {
     /// never another merchant's funds. Guarded by nonReentrant because this is
     /// the second function (alongside settleAuthorization) that mutates the
     /// shared token balance and a per-merchant ledger entry.
+    /// @dev If `to == address(this)`, the token transfer just returns the
+    /// funds to the pool while `_balances[msg.sender]` is still debited,
+    /// leaving an unattributed surplus in the pool's token balance. This is
+    /// harmless: the solvency invariant is `token.balanceOf(this) >= sum(_balances)`,
+    /// not equality, and a merchant can only ever do this to their own funds.
     function withdraw(uint256 amount, address to) external nonReentrant {
         uint256 bal = _balances[msg.sender];
         if (amount > bal) revert InsufficientBalance();
@@ -87,7 +93,32 @@ contract Escrow {
         unchecked {
             _balances[msg.sender] = bal - amount;
         }
-        require(token.transfer(to, amount), "transfer failed");
+        _safeTransfer(to, amount);
         emit Withdrawn(msg.sender, to, amount);
+    }
+
+    /// @notice Tolerates both bool-returning ERC20 transfers (real USDC) and
+    /// non-standard tokens that return no data at all (e.g. USDT-style),
+    /// without pulling in an OpenZeppelin dependency. `token` has no
+    /// allowlist at construction, so this keeps a non-conforming token from
+    /// bricking every withdrawal on an ABI-decode revert.
+    /// @dev On failure, bubbles the callee's original revert reason instead
+    /// of masking it: a bare low-level call swallows revert data into a
+    /// single `ok == false`, and bubbling matters both for on-chain
+    /// diagnosability and because callers up the stack (including this
+    /// contract's own nonReentrant guard on a reentrant call) may need the
+    /// real reason, not a generic one. `TransferFailed()` is reserved for the
+    /// two cases that carry no reason of their own: a bare revert with empty
+    /// return data, and a token that returns `false`.
+    function _safeTransfer(address to_, uint256 amount) private {
+        (bool ok, bytes memory data) =
+            address(token).call(abi.encodeWithSignature("transfer(address,uint256)", to_, amount));
+        if (!ok) {
+            if (data.length == 0) revert TransferFailed();
+            assembly {
+                revert(add(data, 0x20), mload(data))
+            }
+        }
+        if (data.length != 0 && !abi.decode(data, (bool))) revert TransferFailed();
     }
 }

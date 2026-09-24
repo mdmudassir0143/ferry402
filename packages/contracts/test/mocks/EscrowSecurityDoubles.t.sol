@@ -18,8 +18,9 @@ contract LossyMockUSDC is MockUSDC {
     }
 
     function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == address(0)) revert TransferToZeroAddress();
         uint256 fromBalance = _balances[from];
-        if (fromBalance < amount) revert InsufficientBalance();
+        if (fromBalance < amount) revert TokenInsufficientBalance();
         unchecked {
             _balances[from] = fromBalance - amount;
         }
@@ -84,6 +85,20 @@ contract ReentrantMockUSDC is IEIP3009 {
 /// returning, simulating a token that calls back into the caller mid-transfer
 /// (e.g. an upgradeable or non-standard token). Used to prove nonReentrant
 /// blocks a reentrant withdrawal (task 3 hard gate).
+///
+/// @dev The nested attempt is a direct Solidity call, and Escrow._safeTransfer
+/// bubbles the callee's original revert data rather than masking it, so the
+/// nested revert reason propagates unchanged all the way to the top-level
+/// call. This double's own address never holds an Escrow ledger balance, so
+/// a nested `withdraw` attempted as this contract (msg.sender for the nested
+/// call is this token itself) would fail with Escrow.InsufficientBalance()
+/// even with nonReentrant *removed* -- but that is a *different* selector
+/// than Reentrancy(), which is what the guard produces when present (it is
+/// checked before anything else in the modifier). Asserting on the specific
+/// top-level selector is what makes this mutation-resistant: removing
+/// nonReentrant changes the observed revert from Reentrancy() to
+/// InsufficientBalance(), so the test would fail differently rather than
+/// pass either way.
 contract ReentrantWithdrawMockUSDC is IEIP3009 {
     Escrow public escrow;
     mapping(address => uint256) private _bal;
@@ -104,7 +119,9 @@ contract ReentrantWithdrawMockUSDC is IEIP3009 {
         _bal[msg.sender] -= amount;
         _bal[to] += amount;
         // Attempt a nested withdraw before this transfer returns, i.e. while
-        // the outer withdraw call is still on the stack.
+        // the outer withdraw call is still on the stack. A direct call, so
+        // if this reverts, it reverts transfer() too, whose revert data
+        // Escrow._safeTransfer bubbles unchanged.
         escrow.withdraw(amount, to);
         return true;
     }
@@ -213,6 +230,14 @@ contract EscrowSecurityDoublesTest is Test {
     /// whose transfer() calls back into Escrow.withdraw mid-call must have
     /// that nested call blocked, and the whole outer withdraw must revert
     /// rather than silently swallow the nested failure.
+    /// @dev Asserting the *specific* selector (Reentrancy, not just "some
+    /// revert") is what makes this mutation-resistant. If nonReentrant were
+    /// removed, the nested withdraw would still fail -- this double's own
+    /// address never holds an Escrow ledger balance, so it would revert
+    /// InsufficientBalance() instead -- and since Escrow._safeTransfer
+    /// bubbles the original revert reason, that different selector would
+    /// surface at the top level and this expectRevert would then correctly
+    /// fail to match. Verified manually: see task-3-report.md.
     function test_withdraw_nonReentrant_blocksNestedWithdraw() public {
         ReentrantWithdrawMockUSDC token = new ReentrantWithdrawMockUSDC();
         Escrow escrow = new Escrow(address(token));

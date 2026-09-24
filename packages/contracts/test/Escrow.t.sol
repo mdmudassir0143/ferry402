@@ -101,14 +101,37 @@ contract EscrowTest is Test {
 
     function test_withdraw_transfersToMerchant() public {
         _payMerchant(10e6);
+
         vm.prank(merchant);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Escrow.Withdrawn(merchant, merchant, 4e6);
         escrow.withdraw(4e6, merchant);
+
         assertEq(escrow.balanceOf(merchant), 6e6);
         assertEq(usdc.balanceOf(merchant), 4e6);
     }
 
+    /// @notice I1 regression: MockUSDC's own insufficient-balance error and
+    /// Escrow.InsufficientBalance() are both zero-argument errors, so they
+    /// compile to the identical 4-byte selector (selectors are derived from
+    /// the signature string alone, not the declaring contract). If the pool
+    /// held exactly the merchant's own row, a broken ledger guard could
+    /// "accidentally" revert via the token's own balance check instead of
+    /// Escrow's, with the same selector, and this test would never notice.
+    /// Funding the pool with another merchant's deposit first (so the pool
+    /// holds more than `merchant`'s row) makes the two checks genuinely
+    /// distinguishable: only Escrow's ledger check can fire here, since the
+    /// token has plenty of balance to physically satisfy the request.
     function test_withdraw_revertsWhenOverBalance() public {
         _payMerchant(10e6);
+
+        address other = address(0xCAFE);
+        bytes32 otherPaymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory otherAuth = _auth(other, otherPaymentId, 5e6);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(otherAuth);
+        escrow.settleAuthorization(other, otherPaymentId, otherAuth, v, r, s);
+        // Pool now holds 15e6 total token balance; merchant's own row is 10e6.
+
         vm.prank(merchant);
         vm.expectRevert(Escrow.InsufficientBalance.selector);
         escrow.withdraw(11e6, merchant);
@@ -144,6 +167,36 @@ contract EscrowTest is Test {
         assertEq(escrow.balanceOf(other), 5e6);
         assertEq(usdc.balanceOf(other), 0);
         assertEq(usdc.balanceOf(address(escrow)), 5e6);
+    }
+
+    /// @notice I2 regression: test_withdraw_doesNotTouchOtherMerchantBalance
+    /// (above) only proves a *well-behaved* withdrawal is well-behaved — it
+    /// never attempts an over-withdrawal, so it doesn't prove the headline
+    /// claim of this task: that a merchant cannot reach into another
+    /// merchant's row. This test actually attacks: `merchant` tries to pull
+    /// the entire pool (15e6), which is more than their own row (10e6) but
+    /// no more than the token's physical balance in the escrow (which also
+    /// holds `other`'s 5e6). The request must be rejected by the ledger
+    /// check, and `other`'s row plus the escrow's token holdings must be
+    /// completely untouched afterward.
+    function test_withdraw_attackerCannotDrainOtherMerchantsRow() public {
+        _payMerchant(10e6); // credits `merchant`
+
+        address other = address(0xCAFE);
+        bytes32 otherPaymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory otherAuth = _auth(other, otherPaymentId, 5e6);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(otherAuth);
+        escrow.settleAuthorization(other, otherPaymentId, otherAuth, v, r, s);
+        // Pool: 15e6 total token balance, 10e6 attributable to merchant, 5e6 to other.
+
+        vm.prank(merchant);
+        vm.expectRevert(Escrow.InsufficientBalance.selector);
+        escrow.withdraw(15e6, merchant); // the whole pool, including `other`'s row
+
+        assertEq(escrow.balanceOf(merchant), 10e6);
+        assertEq(escrow.balanceOf(other), 5e6);
+        assertEq(usdc.balanceOf(address(escrow)), 15e6);
+        assertEq(usdc.balanceOf(merchant), 0);
     }
 
     function _auth(address merchant_, bytes32 paymentId, uint256 value)
