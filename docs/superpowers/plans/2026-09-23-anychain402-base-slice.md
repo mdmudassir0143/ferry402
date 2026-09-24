@@ -955,3 +955,110 @@ committed so CI enforces them.
 **A3 — known limitation, deferred.** EIP-1271 smart-contract-wallet signatures are not
 supported. Real USDC v2.2 accepts them and smart wallets are common on Base; adding
 support changes `IEIP3009`, the mock and the verify path, so it belongs to its own plan.
+
+---
+
+# Plan extension — Tasks 11-13 (added 2026-09-24)
+
+Three known limitations, promoted from "recorded" to "must fix". All three block real
+adoption by developers or by agents.
+
+**Sequencing:** finish Tasks 7-9 (the core payment flow) first, then 11-13, then Task 10
+last — so the live end-to-end test exercises everything, including this work.
+
+---
+
+## Task 11: EIP-1271 smart-contract wallet signatures
+
+**Why.** Real USDC v2.2's `receiveWithAuthorization` also accepts a `bytes signature`
+with EIP-1271 support. Our stack is `(v, r, s)`-only, so **every smart-contract wallet is
+excluded** — a large share of Base users, and the majority of agent wallets, which are
+usually smart accounts rather than EOAs. For a product whose pitch is "agents can pay",
+this is the single most limiting gap.
+
+**Files:**
+- Modify: `packages/contracts/src/interfaces/IEIP3009.sol` — add the `bytes signature` overload
+- Modify: `packages/contracts/src/Escrow.sol` — `settleAuthorizationWithSignature(...)` taking `bytes calldata`
+- Modify: `packages/contracts/test/mocks/MockUSDC.sol` — implement both overloads; EIP-1271 path calls `isValidSignature`
+- Create: `packages/contracts/test/mocks/MockSmartWallet.sol` — returns `0x1626ba7e` for signatures it accepts, `0xffffffff` otherwise
+- Modify: `packages/facilitator/src/chains/base.ts` — ECDSA first, then EIP-1271 fallback
+- Test: contracts + facilitator
+
+**Interfaces produced:**
+- `Escrow.settleAuthorizationWithSignature(address merchant, bytes32 paymentId, Authorization calldata auth, bytes calldata signature)`
+- `verifyPayment` accepts either a 65-byte `(v,r,s)` signature or an arbitrary-length EIP-1271 blob
+
+**Required semantics.** A 65-byte signature takes the ECDSA path unchanged. Anything else,
+or a 65-byte signature whose recovered signer is a contract, is validated by calling
+`IERC1271(authorization.from).isValidSignature(digest, signature)` and requiring exactly
+`0x1626ba7e`. Any other return value, a revert, or a call to an address with no code is a
+rejection. Keep malleability rejection on the ECDSA path.
+
+**Tests that must exist and must fail against the unfixed code:**
+a smart wallet accepting → settles; a smart wallet returning `0xffffffff` → rejected;
+a smart wallet that reverts → rejected, no unhandled error; an EOA path unchanged;
+a codeless `from` with a non-65-byte signature → rejected.
+
+---
+
+## Task 12: stateless challenge derivation
+
+**Why.** Today every anonymous request mints one store entry per accepted chain, so
+roughly 5,000 unauthenticated GETs evict all 10,000 outstanding challenges and every
+in-flight payer gets `payment_expired`. Memory is bounded; availability is not. The root
+cause is that the store holds *issued* challenges and issuing is free.
+
+**Files:**
+- Modify: `packages/sdk/src/middleware.ts`
+- Create: `packages/sdk/src/challengeDerivation.ts`
+- Modify: `packages/sdk/src/challengeStore.ts` — becomes a *consumed-nonce* store
+- Modify: `packages/sdk/src/types.ts` — config gains `secret`
+- Test: `packages/sdk/test/challengeDerivation.test.ts`, plus middleware updates
+
+**Design.** Derive rather than store:
+
+```
+paymentId = HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)   // 32 bytes
+nonce     = keccak256(abi.encode(merchantEvm, paymentId))
+```
+
+On the payment path, recompute for the current **and previous** bucket and compare against
+`authorization.nonce`. A match proves the challenge was issued by this server, for this
+resource, within the window — with no storage at all. Resource binding and TTL become
+structural rather than checks that can be forgotten.
+
+Replay defence keeps a **consumed-nonce** set, which only grows on *paid* requests. Minting
+stays free for an attacker; writing to the store now costs them a real on-chain payment.
+
+`secret` is required config, minimum 32 bytes, and the middleware must throw at
+construction if it is missing or short — never silently generate one, because a
+per-process random secret breaks every multi-instance deployment in a way that only shows
+up under load.
+
+**Tests that must fail against the unfixed code:** 10,000 anonymous requests write zero
+store entries; a challenge for resource A is rejected at resource B with no store involved;
+a payment at bucket boundary−1 still verifies; a replayed nonce is rejected; two instances
+sharing a secret accept each other's challenges; a missing or short secret throws at
+construction.
+
+---
+
+## Task 13: SDK packaging
+
+**Why.** `packages/sdk`'s `main` and `types` point straight at `src/index.ts` with no build
+step, so the package works under vitest and `tsc` in this repo and **cannot be consumed by
+anyone else**. A package nobody can install is not a product.
+
+**Files:**
+- Modify: `packages/sdk/package.json` — `exports` map, `main`, `module`, `types`, `files`, `sideEffects: false`, `build` script
+- Create: `packages/sdk/tsup.config.ts` (or a `tsc` build — either is fine)
+- Modify: `.github/workflows/ci.yaml` — build before test
+- Create: `packages/sdk/test/consume-built-package.test.ts`
+
+**The test that matters:** pack the built artifact (`pnpm pack`), install the tarball into
+a temp directory outside the workspace, and import it from plain Node — both ESM and CJS
+if both are published. Importing from `src` in-repo proves nothing about what consumers get.
+Assert the public surface is exported and the type declarations resolve.
+
+Ship both ESM and CJS, or ESM-only with `exports` declared honestly — but do not claim CJS
+support without the smoke test proving it.
