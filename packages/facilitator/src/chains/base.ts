@@ -40,6 +40,7 @@ export type VerifyInvalidReason =
   | 'invalid_exact_evm_payload_authorization_valid_before'
   | 'invalid_exact_evm_payload_signature'
   | 'invalid_network'
+  | 'invalid_payment_requirements'
   | 'unexpected_verify_error'
 
 /**
@@ -75,6 +76,37 @@ export interface VerifyOptions {
    * live network call — see test/support/anvil.ts.
    */
   rpcUrl?: string
+
+  /**
+   * The facilitator operator's OWN, trusted `Escrow` contract address per
+   * network — the only value `requirements.payTo` is ever allowed to be.
+   *
+   * `/verify` and `/settle` are both unauthenticated HTTP endpoints that take
+   * `paymentRequirements` straight from an anonymous caller (see
+   * `createFacilitatorApp`'s doc comment). Without this, `requirements.payTo`
+   * is a value the CALLER controls, and every check in `verifyPayment` that
+   * compares something ELSE against `requirements.payTo` (check 1's
+   * `authorization.to`, `settlePayment`'s own `escrowAddress`) only proves
+   * INTERNAL consistency between two caller-supplied values — never that
+   * `payTo` is actually this facilitator's own escrow. A forger who controls
+   * both `payload.payload` and `paymentRequirements` can keep them
+   * consistent with each other while pointing `payTo` at a hostile contract
+   * that fabricates its own `PaymentSettled` log (task-8 review round 2's
+   * finding: cross-checking that log's `merchant`/`nonce` against the call
+   * args raises the bar but does not close this, since a forger supplying
+   * `paymentRequirements` already knows those values and can echo them).
+   *
+   * Configured the same shape as `rpcUrls` (a per-network map) because the
+   * operational burden is the same: a facilitator operator already has to
+   * know its RPC endpoints, and a self-hosting merchant knows its own
+   * deployed escrow address.
+   *
+   * **Fails closed**: a network with no entry here is REJECTED
+   * (`invalid_payment_requirements`), never treated as "no allowlist
+   * configured, so trust the caller" — see the check in `verifyPayment`
+   * itself for why this must run before every other check, not after.
+   */
+  escrows?: Partial<Record<Task7Network, Address>>
 }
 
 /**
@@ -427,12 +459,16 @@ async function recoverEcdsaSigner(signature: Hex, digest: Hex): Promise<Address 
  * should treat it as genuine.
  *
  * Checks run in a fixed order and return on the first failure — see this
- * function's inline comments for why each one is placed where it is. The
- * merchant-binding check (2) is the off-chain half of `Escrow.sol`'s
- * `MerchantNotBound` guard: without it, a redirect attempt (a valid
- * signature whose nonce was computed against a DIFFERENT merchant address)
- * only fails on-chain, after the facilitator has already spent gas trying
- * to settle it.
+ * function's inline comments for why each one is placed where it is. Check 1
+ * (the trusted-escrow allowlist) runs before every other check, including the
+ * network-support lookup it shares its `chain` resolution with: nothing else
+ * in this function means anything against a `payTo` this facilitator does
+ * not actually operate — see `VerifyOptions.escrows`'s doc comment for why
+ * that check exists at all (task-8 review round 2). The merchant-binding
+ * check (3) is the off-chain half of `Escrow.sol`'s `MerchantNotBound` guard:
+ * without it, a redirect attempt (a valid signature whose nonce was computed
+ * against a DIFFERENT merchant address) only fails on-chain, after the
+ * facilitator has already spent gas trying to settle it.
  */
 export async function verifyPayment(
   payload: PaymentPayload,
@@ -446,8 +482,39 @@ export async function verifyPayment(
   }
   const authorization = payload.payload.authorization
 
-  // 1. Recipient: the signed authorization must name OUR escrow, not some
-  // other address the payload happens to carry. Checked first because
+  // 1. Network support + trusted escrow allowlist (task-8 review round 2).
+  // `/verify` and `/settle` are both unauthenticated and take
+  // `paymentRequirements` straight from an anonymous caller, so
+  // `requirements.payTo` is a value THE CALLER controls unless it is checked
+  // against something the facilitator operator configured out-of-band. Every
+  // OTHER check in this function that touches `requirements.payTo` (check 2
+  // below; `settlePayment`'s own `escrowAddress`) only proves two
+  // caller-supplied values are consistent WITH EACH OTHER — never that
+  // `payTo` is genuinely this facilitator's own `Escrow` deployment. Fails
+  // CLOSED: a network with no configured entry in `options.escrows` is
+  // rejected outright, exactly like a `payTo` that doesn't match — never
+  // silently trusted just because no allowlist happened to be configured for
+  // it. Checked first, before any other work, so a forged `payTo` costs
+  // nothing (not even the cheap off-chain checks below it, let alone gas).
+  //
+  // `chain` is resolved here (not down at the RPC-client step, where it used
+  // to live) because the allowlist lookup needs `requirements.network`
+  // validated as a network this facilitator supports at all before it means
+  // anything to ask "what's the trusted escrow for it" — an entirely
+  // unsupported network (e.g. `'polygon'`) is `invalid_network`, distinct
+  // from a supported network this operator simply hasn't configured an
+  // escrow for (`invalid_payment_requirements`, fail-closed, above).
+  const chain = SUPPORTED_CHAINS[requirements.network as Task7Network]
+  if (!chain) {
+    return { isValid: false, invalidReason: 'invalid_network' }
+  }
+  const trustedEscrow = options.escrows?.[requirements.network as Task7Network]
+  if (!trustedEscrow || !addressesEqual(requirements.payTo, trustedEscrow)) {
+    return { isValid: false, invalidReason: 'invalid_payment_requirements' }
+  }
+
+  // 2. Recipient: the signed authorization must name OUR escrow, not some
+  // other address the payload happens to carry. Checked early because
   // every later check assumes this payload is even trying to pay this
   // requirement's escrow.
   //
@@ -463,7 +530,7 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_recipient_mismatch' }
   }
 
-  // 2. Merchant binding — THE most important check here. `Escrow.sol`
+  // 3. Merchant binding — THE most important check here. `Escrow.sol`
   // enforces `auth.nonce == keccak256(abi.encode(merchant, paymentId))`
   // on-chain (see `settleAuthorization`'s `MerchantNotBound` guard); this
   // recomputes the identical hash off-chain and rejects a mismatch before
@@ -487,7 +554,7 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'invalid_payload' }
   }
 
-  // 3. Amount — both sides are untrusted decimal strings; see
+  // 4. Amount — both sides are untrusted decimal strings; see
   // `parseDecimalBigInt`'s doc comment for why a bare `BigInt(...)` (or
   // trusting an upstream schema's own numeric-string check) is not safe
   // here.
@@ -497,7 +564,7 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_value' }
   }
 
-  // 4. Time window — same untrusted-decimal-string treatment as `value`,
+  // 5. Time window — same untrusted-decimal-string treatment as `value`,
   // range bound included (see `parseDecimalBigInt`'s doc comment, point 2:
   // an oversized `validBefore` is not caught by any earlier check the way
   // an oversized `validAfter` incidentally is by the "not yet valid"
@@ -518,7 +585,7 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_before' }
   }
 
-  // 5. Signature — recovered over the EIP-712 `ReceiveWithAuthorization`
+  // 6. Signature — recovered over the EIP-712 `ReceiveWithAuthorization`
   // struct, using a domain read live from the token contract, and rejected
   // outright if malleable even before recovery is attempted: the EVM's
   // `ecrecover` precompile (and viem's recovery, which uses the same math)
@@ -548,10 +615,8 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }
 
-  const chain = SUPPORTED_CHAINS[requirements.network as Task7Network]
-  if (!chain) {
-    return { isValid: false, invalidReason: 'invalid_network' }
-  }
+  // `chain` was already resolved (and network support already checked) by
+  // check 1, above.
   const client = await getVerifiedClient(requirements.network as Task7Network, chain, options.rpcUrl, 'verify')
   if (!client) {
     // Either the RPC was unreachable, or it reported a chain id that
@@ -940,7 +1005,10 @@ export async function settlePayment(
 
   // 1. Re-verify from scratch. See this function's doc comment, point 1 —
   // nothing below this block may run on a payload that didn't just pass.
-  const verifyResult = await verifyPayment(payload, requirements, { rpcUrl: options.rpcUrl })
+  // `escrows` is forwarded so verify's own trusted-escrow allowlist check
+  // (its check 1 — see `VerifyOptions.escrows`'s doc comment) actually runs
+  // here too, not just when `verifyPayment` is called on its own.
+  const verifyResult = await verifyPayment(payload, requirements, { rpcUrl: options.rpcUrl, escrows: options.escrows })
   if (!verifyResult.isValid) {
     return {
       success: false,
@@ -978,6 +1046,20 @@ export async function settlePayment(
   const chain = SUPPORTED_CHAINS[network as Task7Network]
   if (!chain) {
     return { success: false, errorReason: 'invalid_network', payer, transaction: '', network }
+  }
+
+  // Re-check the trusted-escrow allowlist directly (task-8 review round 2) —
+  // same defense-in-depth reasoning as the merchantEvm/paymentId re-check
+  // above: `verifyPayment` (called with `escrows` forwarded, above) already
+  // requires `requirements.payTo` to match `options.escrows[network]` for
+  // `isValid: true`, so this cannot actually fail here today, but this is
+  // EXACTLY the check whose absence let a hostile contract at `payTo` forge
+  // a `PaymentSettled` log and be reported as a successful settlement — a
+  // future refactor decoupling this call from that check must not silently
+  // reopen that hole one line below, at `escrowAddress = getAddress(requirements.payTo)`.
+  const trustedEscrow = options.escrows?.[network as Task7Network]
+  if (!trustedEscrow || !addressesEqual(requirements.payTo, trustedEscrow)) {
+    return { success: false, errorReason: 'invalid_payment_requirements', payer, transaction: '', network }
   }
 
   const split = splitEcdsaSignature(payload.payload.signature)
@@ -1108,6 +1190,23 @@ export async function settlePayment(
     )
     return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: hash, network }
   }
+
+  // Defense in depth ALONGSIDE the trusted-escrow allowlist above (task-8
+  // review round 2) — not a substitute for it. The allowlist is what
+  // actually stops a hostile contract from being treated as this
+  // facilitator's escrow in the first place; once `escrowAddress` is known
+  // to be the real, trusted `Escrow.sol`, this cross-check exists to catch a
+  // DIFFERENT class of bug — a future change to what this function passes to
+  // `settleAuthorization`, or a bug in `Escrow.sol` itself — before it turns
+  // into a silently-wrong `settledAmount`/`nonce` reported to a caller (e.g.
+  // Task 9's HCS journal entry) as if it were correct.
+  if (!isAddressEqual(settled.args.merchant, merchantEvmAddress) || settled.args.nonce.toLowerCase() !== authTuple.nonce.toLowerCase()) {
+    console.error(
+      `settlePayment: transaction ${hash} on ${network} emitted PaymentSettled with an unexpected merchant/nonce (expected merchant ${merchantEvmAddress}, nonce ${authTuple.nonce})`,
+    )
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: hash, network }
+  }
+
   const requiredValue = parseDecimalBigInt(requirements.maxAmountRequired)
   if (requiredValue === undefined || settled.args.value < requiredValue) {
     console.error(

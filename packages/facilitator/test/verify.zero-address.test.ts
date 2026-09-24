@@ -27,7 +27,7 @@ vi.mock('viem', async (importOriginal) => {
 
 const { verifyPayment } = await import('../src/chains/base.js')
 const { startAnvilWithDomainToken } = await import('./support/anvil.js')
-const { ESCROW_ADDRESS, buildRequirements, buildPayload } = await import('./support/fixtures.js')
+const { ESCROW_ADDRESS, DEFAULT_ESCROWS, buildRequirements, buildPayload } = await import('./support/fixtures.js')
 const { computeNonce } = await import('@anychain402/sdk')
 
 const MERCHANT_EVM: Address = '0x1111111111111111111111111111111111111111'
@@ -67,7 +67,7 @@ describe('verifyPayment — zero-address recovery guard', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature, authorization: auth }),
       buildRequirements({ asset: anvil.tokenAddress, extra: { merchantEvm: MERCHANT_EVM, paymentId: PAYMENT_ID } }),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
 
     expect(result.isValid).toBe(false)

@@ -12,7 +12,7 @@ import {
   type AnvilFixture,
   type EscrowAnvilFixture,
 } from './support/anvil.js'
-import { ESCROW_ADDRESS, buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
+import { ESCROW_ADDRESS, DEFAULT_ESCROWS, buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
 
 const MERCHANT_EVM: Address = '0x1111111111111111111111111111111111111111'
 const PAYMENT_ID: Hex = '0x00000000000000000000000000000000000000000000000000000000000004d2'
@@ -50,8 +50,11 @@ describe('POST /verify', () => {
   it('returns isValid: true for a well-formed, correctly signed payload', async () => {
     // Without this override, verifyPayment would default to base-sepolia's
     // real public RPC -- unreachable (or simply the wrong chain) for a
-    // token that only exists on this test's local anvil instance.
-    const app = createFacilitatorApp({ rpcUrls: { 'base-sepolia': anvil.rpcUrl } })
+    // token that only exists on this test's local anvil instance. `escrows`
+    // is required too (task-8 review round 2) -- without it every request
+    // for this network is rejected fail-closed, before reaching verifyPayment's
+    // other checks.
+    const app = createFacilitatorApp({ rpcUrls: { 'base-sepolia': anvil.rpcUrl }, escrows: DEFAULT_ESCROWS })
     const auth = authFields()
     const signature = await signAuthorization({
       privateKey: ANVIL_PAYER_PRIVATE_KEY,
@@ -82,7 +85,7 @@ describe('POST /verify', () => {
   })
 
   it('never crashes the process on a malformed authorization.value inside an otherwise well-shaped body', async () => {
-    const app = createFacilitatorApp()
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const auth = authFields({ value: '1e30' })
     const paymentPayload = buildPayload({
       network: 'base-sepolia',
@@ -156,6 +159,9 @@ describe('POST /settle', () => {
     const app = createFacilitatorApp({
       rpcUrls: { 'base-sepolia': escrowAnvil.rpcUrl },
       facilitatorPrivateKey: ANVIL_DEPLOYER_PRIVATE_KEY,
+      // task-8 review round 2: the REAL, deployed escrow -- not
+      // ESCROW_ADDRESS (a fake placeholder used by the /verify tests above).
+      escrows: { 'base-sepolia': escrowAnvil.escrowAddress },
     })
     const merchant = merchantEvm(0xaaaa)
     const paymentId = PAYMENT_ID
@@ -191,6 +197,66 @@ describe('POST /settle', () => {
     expect(res.body.payer).toBe(ANVIL_PAYER_ADDRESS)
     expect(res.body.network).toBe('base-sepolia')
     expect(res.body.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
+  })
+
+  // task-8 review round 2: /settle is unauthenticated and takes
+  // `paymentRequirements` (including `payTo`) straight from the caller. This
+  // proves the HTTP layer actually rejects an untrusted `payTo` rather than
+  // trusting whatever the caller sent, matching settle.fork.test.ts's own
+  // "rejects a hostile contract at payTo" coverage at the unit level (which
+  // asserts the PRECISE `invalid_payment_requirements` reason and the
+  // no-transaction-sent property directly against `settlePayment`).
+  //
+  // `errorReason` here is the pre-existing, separately-recorded
+  // `SettleResponseSchema` limitation (task-8 review round 2's "recorded,
+  // not for this round" item): the schema's `transaction` field is
+  // regex-validated and rejects `''`, so `SettleResponseSchema.safeParse`
+  // in server.ts fails for ANY settle failure that never reached the chain,
+  // and the generic `unexpected_settle_error` fallback is what actually
+  // reaches an HTTP caller -- confirmed directly:
+  // `SettleResponseSchema.safeParse({..., transaction: ''})` fails with a
+  // regex `ZodError` on `transaction`. This test asserts today's real HTTP
+  // behavior, not the more specific reason `settlePayment` itself returns.
+  it('rejects settlement when payTo is not the configured trusted escrow', async () => {
+    const app = createFacilitatorApp({
+      rpcUrls: { 'base-sepolia': escrowAnvil.rpcUrl },
+      facilitatorPrivateKey: ANVIL_DEPLOYER_PRIVATE_KEY,
+      escrows: { 'base-sepolia': escrowAnvil.escrowAddress },
+    })
+    const merchant = merchantEvm(0xbbbb)
+    const paymentId = PAYMENT_ID
+    const untrustedPayTo: Address = '0x9999999999999999999999999999999999999999'
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const auth: AuthorizationFields = {
+      from: ANVIL_PAYER_ADDRESS,
+      to: untrustedPayTo,
+      value: '10000',
+      validAfter: String(nowSeconds - 60),
+      validBefore: String(nowSeconds + 300),
+      nonce: computeNonce(merchant, paymentId),
+    }
+    const signature = await signAuthorization({
+      privateKey: ANVIL_PAYER_PRIVATE_KEY,
+      tokenAddress: escrowAnvil.tokenAddress,
+      tokenName: 'SettleToken',
+      tokenVersion: '1',
+      chainId: escrowAnvil.chainId,
+      authorization: auth,
+    })
+    const paymentPayload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const paymentRequirements = buildRequirements({
+      asset: escrowAnvil.tokenAddress,
+      payTo: untrustedPayTo,
+      maxAmountRequired: '10000',
+      extra: { merchantEvm: merchant, paymentId },
+    })
+
+    const res = await request(app).post('/settle').send({ paymentPayload, paymentRequirements })
+
+    expect(res.status).toBe(200)
+    expect(res.body.success).toBe(false)
+    expect(res.body.errorReason).toBe('unexpected_settle_error')
+    expect(res.body.transaction).toBe('')
   })
 
   it('returns 400 with success:false for a body that does not match SettleRequestSchema', async () => {

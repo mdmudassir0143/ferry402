@@ -212,7 +212,17 @@ export interface EscrowAnvilFixture {
  * has both properties at once.
  */
 export async function startAnvilWithEscrow(
-  params: { payerInitialBalance?: bigint; deployerPrivateKey?: Hex } = {},
+  params: {
+    payerInitialBalance?: bigint
+    deployerPrivateKey?: Hex
+    /** Overrides the deployed token — e.g. `stringRevertTokenAbi`/
+     *  `stringRevertTokenBytecode` for a token whose replay revert is a
+     *  plain string instead of a custom error (see `StringRevertToken.sol`'s
+     *  doc comment). Defaults to `SettleToken`. Must implement the SAME
+     *  `mint(address,uint256)` / `receiveWithAuthorization(...)` ABI shape. */
+    tokenAbi?: typeof settleTokenAbi
+    tokenBytecode?: Hex
+  } = {},
 ): Promise<EscrowAnvilFixture> {
   const port = await getFreePort()
   const rpcUrl = `http://127.0.0.1:${port}`
@@ -239,15 +249,17 @@ export async function startAnvilWithEscrow(
   const walletClient = createWalletClient({ account, chain: foundry, transport: http(rpcUrl) })
   const publicClient = createPublicClient({ chain: foundry, transport: http(rpcUrl) })
 
+  const tokenAbi = params.tokenAbi ?? settleTokenAbi
+  const tokenBytecode = params.tokenBytecode ?? settleTokenBytecode
   const tokenDeployHash = await walletClient.deployContract({
-    abi: settleTokenAbi,
-    bytecode: settleTokenBytecode,
+    abi: tokenAbi,
+    bytecode: tokenBytecode,
     args: [],
   })
   const tokenReceipt = await publicClient.waitForTransactionReceipt({ hash: tokenDeployHash })
   if (!tokenReceipt.contractAddress) {
     await stopChild(child)
-    throw new Error('SettleToken deployment produced no contract address')
+    throw new Error('token deployment produced no contract address')
   }
   const tokenAddress = tokenReceipt.contractAddress
 
@@ -267,7 +279,7 @@ export async function startAnvilWithEscrow(
   const payerInitialBalance = params.payerInitialBalance ?? 1_000_000_000n
   const mintHash = await walletClient.writeContract({
     address: tokenAddress,
-    abi: settleTokenAbi,
+    abi: tokenAbi,
     functionName: 'mint',
     args: [ANVIL_PAYER_ADDRESS, payerInitialBalance],
   })

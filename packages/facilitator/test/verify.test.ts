@@ -7,6 +7,7 @@ import {
   UNREACHABLE_RPC_URL,
   ESCROW_ADDRESS,
   OTHER_ADDRESS,
+  DEFAULT_ESCROWS,
   buildRequirements,
   buildPayload,
   signAuthorization,
@@ -79,7 +80,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_recipient_mismatch')
@@ -98,7 +99,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_payload')
@@ -115,7 +116,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_value')
   })
@@ -127,7 +128,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     // Reaches the (deliberately failing) amount check, i.e. binding passed.
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_value')
@@ -139,7 +140,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements({ extra: { merchantEvm: MERCHANT_EVM, paymentId: PAYMENT_ID }, maxAmountRequired: '1000000' }),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_value')
@@ -154,7 +155,7 @@ describe('verifyPayment', () => {
       verifyPayment(
         buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
         requirements(),
-        { rpcUrl: UNREACHABLE_RPC_URL },
+        { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
       ),
     ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_value' })
   })
@@ -169,7 +170,7 @@ describe('verifyPayment', () => {
       verifyPayment(
         buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
         requirements({ maxAmountRequired: '1e30' }),
-        { rpcUrl: UNREACHABLE_RPC_URL },
+        { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
       ),
     ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_value' })
   })
@@ -180,7 +181,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_valid_before')
   })
@@ -190,7 +191,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_valid_after')
   })
@@ -217,7 +218,7 @@ describe('verifyPayment', () => {
       verifyPayment(
         buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
         requirements(),
-        { rpcUrl: anvil.rpcUrl },
+        { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
       ),
     ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_before' })
   })
@@ -229,7 +230,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature, authorization: auth }),
       requirements(),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(true)
     expect(result.payer).toBe(ANVIL_PAYER_ADDRESS)
@@ -251,7 +252,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature, authorization: auth }),
       requirements(),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_signature')
@@ -262,7 +263,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: '0xdead', authorization: auth }),
       requirements(),
-      { rpcUrl: UNREACHABLE_RPC_URL },
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_signature')
@@ -275,7 +276,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: malleable, authorization: auth }),
       requirements(),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_signature')
@@ -290,7 +291,7 @@ describe('verifyPayment', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: rewritten, authorization: auth }),
       requirements(),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(result.isValid).toBe(false)
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_signature')

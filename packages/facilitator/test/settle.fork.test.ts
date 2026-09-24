@@ -3,7 +3,7 @@ import { createPublicClient, createWalletClient, http, BaseError, ContractFuncti
 import { privateKeyToAccount } from 'viem/accounts'
 import { foundry } from 'viem/chains'
 import { computeNonce } from '@anychain402/sdk'
-import { settlePayment } from '../src/chains/base.js'
+import { settlePayment, type SettleOptions } from '../src/chains/base.js'
 import {
   startAnvilWithEscrow,
   ANVIL_DEPLOYER_PRIVATE_KEY,
@@ -11,7 +11,9 @@ import {
   ANVIL_PAYER_ADDRESS,
   type EscrowAnvilFixture,
 } from './support/anvil.js'
-import { escrowAbi } from './fixtures/Escrow.abi.js'
+import { escrowAbi, escrowBytecode } from './fixtures/Escrow.abi.js'
+import { hostileEscrowAbi, hostileEscrowBytecode } from './fixtures/HostileEscrow.abi.js'
+import { stringRevertTokenAbi, stringRevertTokenBytecode } from './fixtures/StringRevertToken.abi.js'
 import { buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
 
 // The facilitator's own signing key for every settlePayment call in this
@@ -82,8 +84,25 @@ async function sign(authorization: AuthorizationFields): Promise<Hex> {
   })
 }
 
-async function settle(payload: ReturnType<typeof buildPayload>, reqs: ReturnType<typeof buildRequirements>) {
-  return settlePayment(payload, reqs, { rpcUrl: anvil.rpcUrl, facilitatorPrivateKey: FACILITATOR_PRIVATE_KEY })
+/**
+ * `escrows` defaults to trusting the REAL, deployed `anvil.escrowAddress` —
+ * required since task-8 review round 2 (`settlePayment`/`verifyPayment` both
+ * fail closed on a network with no configured trusted escrow). Tests that
+ * need to exercise a DIFFERENT escrow configuration (a misconfigured
+ * allowlist, or a second token/escrow pair) pass `overrides.escrows`
+ * explicitly.
+ */
+async function settle(
+  payload: ReturnType<typeof buildPayload>,
+  reqs: ReturnType<typeof buildRequirements>,
+  overrides: Partial<SettleOptions> = {},
+) {
+  return settlePayment(payload, reqs, {
+    rpcUrl: anvil.rpcUrl,
+    facilitatorPrivateKey: FACILITATOR_PRIVATE_KEY,
+    escrows: { 'base-sepolia': anvil.escrowAddress },
+    ...overrides,
+  })
 }
 
 async function merchantBalance(merchant: Address = MERCHANT_EVM): Promise<bigint> {
@@ -165,7 +184,14 @@ describe('settlePayment', () => {
     const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
     const reqs = requirements(paymentId, { payTo: codelessAddress })
 
-    const result = await settle(payload, reqs)
+    // Escrows overridden to TRUST the codeless address itself (task-8 review
+    // round 2): with the round-2 allowlist in place, an UNTRUSTED payTo like
+    // this is now rejected off-chain before ever reaching this check (see
+    // the dedicated allowlist tests below) -- this override simulates an
+    // operator who has (mistakenly) configured their trusted escrow to be
+    // this codeless address, so the C1 receipt-log check below is still
+    // exercised on its own, as the independent safety net it's meant to be.
+    const result = await settle(payload, reqs, { escrows: { 'base-sepolia': codelessAddress } })
 
     expect(result.success).toBe(false)
     expect(result.errorReason).toBe('unexpected_settle_error')
@@ -305,5 +331,158 @@ describe('settlePayment', () => {
 
     const balanceAfterSecond = await merchantBalance()
     expect(balanceAfterSecond).toBe(balanceAfterFirst)
+  })
+
+  // --- task-8 review round 2: trusted-escrow allowlist ----------------------
+  //
+  // The round-1 `PaymentSettled` emitter check (C1) proves CODE ran at
+  // `payTo` -- it does not prove that code was genuinely this facilitator's
+  // own `Escrow.sol`. A hostile contract deployed AT `payTo` can emit its own
+  // `PaymentSettled` and pass that check trivially. The fix is to never trust
+  // a caller-supplied `payTo` at all: `requirements.payTo` must match a
+  // trusted escrow address configured by the facilitator OPERATOR
+  // (`options.escrows`), checked before any chain interaction.
+  it('rejects a hostile contract at payTo before ever sending a transaction', async () => {
+    // A REAL contract, not just an arbitrary address -- it implements
+    // Escrow.settleAuthorization's exact calldata shape and, if ever
+    // actually called, would emit a fully-formed (forged) PaymentSettled
+    // log. The allowlist must reject it WITHOUT ever finding that out.
+    const deployer = privateKeyToAccount(FACILITATOR_PRIVATE_KEY)
+    const walletClient = createWalletClient({ account: deployer, chain: foundry, transport: http(anvil.rpcUrl) })
+    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [] })
+    const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
+    if (!deployReceipt.contractAddress) throw new Error('HostileEscrow deployment produced no contract address')
+    const hostileAddress = deployReceipt.contractAddress
+
+    const paymentId = freshPaymentId()
+    const auth = authFields(paymentId, { to: hostileAddress })
+    const signature = await sign(auth)
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const reqs = requirements(paymentId, { payTo: hostileAddress })
+
+    const nonceBefore = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
+    // Uses settle()'s DEFAULT escrows (trusting the REAL anvil.escrowAddress)
+    // -- hostileAddress is not in it.
+    const result = await settle(payload, reqs)
+    const nonceAfter = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
+
+    expect(result.success).toBe(false)
+    expect(result.errorReason).toBe('invalid_payment_requirements')
+    expect(result.transaction).toBe('')
+    // The load-bearing assertion, per the review: not just success:false --
+    // the facilitator never submitted anything at all, so the hostile
+    // contract's forged PaymentSettled log was never even a possibility.
+    expect(nonceAfter).toBe(nonceBefore)
+  }, 15_000)
+
+  it('rejects settlement when no escrow is configured for the network at all (fails closed)', async () => {
+    const paymentId = freshPaymentId()
+    const auth = authFields(paymentId)
+    const signature = await sign(auth)
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const reqs = requirements(paymentId)
+
+    const nonceBefore = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
+    // No `escrows` entry for 'base-sepolia' at all -- must reject, never fall
+    // back to trusting requirements.payTo just because nothing was configured.
+    const result = await settle(payload, reqs, { escrows: {} })
+    const nonceAfter = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
+
+    expect(result.success).toBe(false)
+    expect(result.errorReason).toBe('invalid_payment_requirements')
+    expect(result.transaction).toBe('')
+    expect(nonceAfter).toBe(nonceBefore)
+  })
+
+  it('rejects a forged PaymentSettled log even if the trusted-escrow allowlist is itself misconfigured to point at a hostile contract', async () => {
+    // Defense in depth, not redundancy: the merchant/nonce cross-check on the
+    // PaymentSettled log exists for exactly this scenario -- an operator
+    // error (or a compromised config) that puts the WRONG address in
+    // `escrows` still must not let a forged log be reported as a genuine
+    // settlement. Unlike the allowlist tests above, this attempt DOES reach
+    // the chain and DOES mine successfully (the misconfigured allowlist
+    // trusts it); the cross-check catches it from the log's contents.
+    const deployer = privateKeyToAccount(FACILITATOR_PRIVATE_KEY)
+    const walletClient = createWalletClient({ account: deployer, chain: foundry, transport: http(anvil.rpcUrl) })
+    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [] })
+    const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
+    if (!deployReceipt.contractAddress) throw new Error('HostileEscrow deployment produced no contract address')
+    const hostileAddress = deployReceipt.contractAddress
+
+    const paymentId = freshPaymentId()
+    const auth = authFields(paymentId, { to: hostileAddress })
+    const signature = await sign(auth)
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const reqs = requirements(paymentId, { payTo: hostileAddress })
+
+    const result = await settle(payload, reqs, { escrows: { 'base-sepolia': hostileAddress } })
+
+    expect(result.success).toBe(false)
+    expect(result.errorReason).toBe('unexpected_settle_error')
+    expect(result.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
+  }, 15_000)
+
+  // --- task-8 review round 2: duplicate_settlement, Error(string) tier -----
+  describe('duplicate_settlement classification against a plain string revert', () => {
+    let stringTokenAddress: Address
+    let stringEscrowAddress: Address
+
+    beforeAll(async () => {
+      // Deployed onto the SAME already-running anvil instance (not a fresh
+      // one) -- just two more contracts, no need to pay anvil's startup cost
+      // twice.
+      const deployer = privateKeyToAccount(FACILITATOR_PRIVATE_KEY)
+      const walletClient = createWalletClient({ account: deployer, chain: foundry, transport: http(anvil.rpcUrl) })
+
+      const tokenDeployHash = await walletClient.deployContract({ abi: stringRevertTokenAbi, bytecode: stringRevertTokenBytecode, args: [] })
+      const tokenReceipt = await publicClient.waitForTransactionReceipt({ hash: tokenDeployHash })
+      if (!tokenReceipt.contractAddress) throw new Error('StringRevertToken deployment produced no contract address')
+      stringTokenAddress = tokenReceipt.contractAddress
+
+      const escrowDeployHash = await walletClient.deployContract({ abi: escrowAbi, bytecode: escrowBytecode, args: [stringTokenAddress] })
+      const escrowReceipt = await publicClient.waitForTransactionReceipt({ hash: escrowDeployHash })
+      if (!escrowReceipt.contractAddress) throw new Error('Escrow (string-revert token) deployment produced no contract address')
+      stringEscrowAddress = escrowReceipt.contractAddress
+
+      const mintHash = await walletClient.writeContract({
+        address: stringTokenAddress,
+        abi: stringRevertTokenAbi,
+        functionName: 'mint',
+        args: [ANVIL_PAYER_ADDRESS, 1_000_000_000n],
+      })
+      await publicClient.waitForTransactionReceipt({ hash: mintHash })
+    }, 30_000)
+
+    it('classifies a real Error(string) "authorization is used or canceled" revert as duplicate_settlement', async () => {
+      // Real Circle USDC (FiatTokenV2) rejects nonce reuse with exactly this
+      // kind of plain string revert, not a custom error -- SettleToken.sol's
+      // own AuthorizationAlreadyUsed() (exercised by the tests above) only
+      // covers decodeSettleRevert's OTHER tier (a raw selector match). This
+      // proves the Error(string) heuristic tier actually fires against a
+      // real revert, not just a probe.
+      const paymentId = freshPaymentId()
+      const auth = authFields(paymentId, { to: stringEscrowAddress })
+      const signature = await signAuthorization({
+        privateKey: ANVIL_PAYER_PRIVATE_KEY,
+        tokenAddress: stringTokenAddress,
+        tokenName: 'StringRevertToken',
+        tokenVersion: '1',
+        chainId: anvil.chainId,
+        authorization: auth,
+      })
+      const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+      const reqs = requirements(paymentId, { asset: stringTokenAddress, payTo: stringEscrowAddress })
+      const escrows = { 'base-sepolia': stringEscrowAddress } as const
+
+      const first = await settle(payload, reqs, { escrows })
+      expect(first.success).toBe(true)
+
+      const second = await settle(payload, reqs, { escrows })
+      expect(second.success).toBe(false)
+      expect(second.errorReason).toBe('duplicate_settlement')
+
+      const receipt = await publicClient.getTransactionReceipt({ hash: second.transaction as Hex })
+      expect(receipt.status).toBe('reverted')
+    })
   })
 })

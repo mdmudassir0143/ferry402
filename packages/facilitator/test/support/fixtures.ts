@@ -11,6 +11,18 @@ export const UNREACHABLE_RPC_URL = 'http://127.0.0.1:1'
 export const ESCROW_ADDRESS: Address = '0x2222222222222222222222222222222222222222'
 export const OTHER_ADDRESS: Address = '0x9999999999999999999999999999999999999999'
 
+/**
+ * The `escrows` option value matching this file's own `ESCROW_ADDRESS`
+ * default `payTo` — every `verifyPayment`/`settlePayment` call in a test that
+ * doesn't need a REAL, executable `Escrow` deployment (i.e. everything except
+ * `settle.fork.test.ts` and the `/settle` half of `server.test.ts`, which use
+ * a real anvil-deployed escrow address instead) must pass this, or
+ * `verifyPayment`'s trusted-escrow allowlist check (task-8 review round 2)
+ * rejects every one of them with `invalid_payment_requirements` before
+ * reaching whatever check the test actually means to exercise.
+ */
+export const DEFAULT_ESCROWS = { 'base-sepolia': ESCROW_ADDRESS } as const
+
 export const RECEIVE_WITH_AUTHORIZATION_TYPES = {
   ReceiveWithAuthorization: [
     { name: 'from', type: 'address' },

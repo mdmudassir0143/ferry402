@@ -3,7 +3,7 @@ import type { Address, Hex } from 'viem'
 import { computeNonce } from '@anychain402/sdk'
 import { verifyPayment } from '../src/chains/base.js'
 import { startAnvilWithDomainToken, ANVIL_PAYER_PRIVATE_KEY, ANVIL_PAYER_ADDRESS, type AnvilFixture } from './support/anvil.js'
-import { ESCROW_ADDRESS, buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
+import { ESCROW_ADDRESS, DEFAULT_ESCROWS, buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
 
 /**
  * Covers task-7 review round 1's I2 (the domain `chainId` must come from the
@@ -73,7 +73,7 @@ describe('verifyPayment — chain id mismatch (I2)', () => {
     const result = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature, authorization: auth }),
       requirementsFor(mismatched.tokenAddress),
-      { rpcUrl: mismatched.rpcUrl },
+      { rpcUrl: mismatched.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
 
     expect(result.isValid).toBe(false)
@@ -103,7 +103,7 @@ describe('verifyPayment — client/domain caching (I3)', () => {
     const warmup = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: signature1, authorization: auth1 }),
       requirementsFor(anvil.tokenAddress),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(warmup.isValid).toBe(true)
 
@@ -126,7 +126,7 @@ describe('verifyPayment — client/domain caching (I3)', () => {
     const afterRpcDied = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: signature2, authorization: auth2 }),
       requirementsFor(anvil.tokenAddress),
-      { rpcUrl: anvil.rpcUrl },
+      { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(afterRpcDied.isValid).toBe(true)
     expect(afterRpcDied.payer).toBe(ANVIL_PAYER_ADDRESS)
@@ -194,7 +194,7 @@ describe('verifyPayment — domain cache keyed by rpcUrl (task-8 review round 1,
     const resultA = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: signatureA, authorization: authA }),
       requirementsFor(chainA.tokenAddress),
-      { rpcUrl: chainA.rpcUrl },
+      { rpcUrl: chainA.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(resultA.isValid).toBe(true)
     expect(resultA.payer).toBe(ANVIL_PAYER_ADDRESS)
@@ -202,7 +202,7 @@ describe('verifyPayment — domain cache keyed by rpcUrl (task-8 review round 1,
     const resultB = await verifyPayment(
       buildPayload({ network: 'base-sepolia', signature: signatureB, authorization: authB }),
       requirementsFor(chainB.tokenAddress),
-      { rpcUrl: chainB.rpcUrl },
+      { rpcUrl: chainB.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
     expect(resultB.isValid).toBe(true)
     expect(resultB.payer).toBe(ANVIL_PAYER_ADDRESS)

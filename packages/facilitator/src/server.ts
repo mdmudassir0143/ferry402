@@ -1,7 +1,7 @@
 import express, { type Express, type NextFunction, type Request, type Response } from 'express'
 import { SettleRequestSchema, SettleResponseSchema, VerifyRequestSchema, VerifyResponseSchema } from 'x402/types'
 import { settlePayment, verifyPayment } from './chains/base.js'
-import type { Hex } from 'viem'
+import type { Address, Hex } from 'viem'
 
 /**
  * Request body size cap for `POST /verify`. A well-formed `VerifyRequest` —
@@ -64,6 +64,23 @@ export interface FacilitatorAppOptions {
    * Never logged.
    */
   facilitatorPrivateKey?: Hex
+
+  /**
+   * The facilitator operator's own, trusted `Escrow` contract address per
+   * network — see `VerifyOptions.escrows`'s doc comment in `chains/base.ts`
+   * for why this exists at all (task-8 review round 2). `POST /verify` and
+   * `POST /settle` are both unauthenticated and take `paymentRequirements`
+   * straight from the caller, so `requirements.payTo` must be checked
+   * against something the OPERATOR configured, never merely trusted.
+   *
+   * Configured the same shape as `rpcUrls`, for the same reason: a
+   * facilitator operator already has to know its RPC endpoints, and a
+   * self-hosting merchant knows its own deployed escrow address. A network
+   * with no entry here is REJECTED, not silently trusted — see
+   * `VerifyOptions.escrows` for the fail-closed behavior this threads
+   * through to.
+   */
+  escrows?: Partial<Record<'base' | 'base-sepolia', Address>>
 }
 
 /**
@@ -101,7 +118,7 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
 
     let result
     try {
-      result = await verifyPayment(paymentPayload, paymentRequirements, { rpcUrl })
+      result = await verifyPayment(paymentPayload, paymentRequirements, { rpcUrl, escrows: options.escrows })
     } catch {
       // verifyPayment is written to never throw, but a facilitator endpoint
       // must not crash the process even if that invariant is ever broken by
@@ -139,6 +156,7 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
       result = await settlePayment(paymentPayload, paymentRequirements, {
         rpcUrl,
         facilitatorPrivateKey: options.facilitatorPrivateKey,
+        escrows: options.escrows,
       })
     } catch {
       // settlePayment is written to never throw (every fallible step inside
