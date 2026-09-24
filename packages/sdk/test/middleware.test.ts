@@ -4,6 +4,7 @@ import request from 'supertest'
 import type { Server } from 'node:http'
 import { anychain402 } from '../src/index.js'
 import { computeNonce } from '../src/nonce.js'
+import type { ChallengeStore, CachedChallenge } from '../src/challengeStore.js'
 import type { Anychain402Config, PaymentRequirements } from '../src/types.js'
 
 // Reused verbatim from Task 5's requirements.test.ts fixture (per the
@@ -107,6 +108,40 @@ function buildApp(): Server {
 function appWith(verifyResult: unknown): Server {
   globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(verifyResult), { status: 200 })) as any
   return buildApp()
+}
+
+/**
+ * The simplest possible `ChallengeStore`: a raw `Map`, keyed on whatever
+ * string it is given, with NO casing normalization of its own. This is
+ * deliberately naive - it stands in for a third-party store (Redis, a
+ * database) that someone plugs into `anychain402(config, { store })` without
+ * having thought about nonce casing at all, since `ChallengeStore`'s
+ * contract puts that burden on the CALLER (`anychain402` itself), not on
+ * every implementation. If `anychain402` ever stopped normalizing the
+ * payer's nonce before calling this store, an uppercase-hex nonce (valid
+ * per x402's schema; see nonce.test.ts) would silently miss this Map, since
+ * nothing here would fold its casing either.
+ */
+class CaseSensitiveMapStore implements ChallengeStore {
+  private readonly entries = new Map<string, CachedChallenge>()
+
+  async get(nonce: `0x${string}`): Promise<CachedChallenge | undefined> {
+    return this.entries.get(nonce)
+  }
+
+  async set(nonce: `0x${string}`, entry: CachedChallenge): Promise<void> {
+    this.entries.set(nonce, entry)
+  }
+
+  async consume(nonce: `0x${string}`): Promise<CachedChallenge | undefined> {
+    const entry = this.entries.get(nonce)
+    this.entries.delete(nonce)
+    return entry
+  }
+
+  async delete(nonce: `0x${string}`): Promise<void> {
+    this.entries.delete(nonce)
+  }
 }
 
 afterEach(() => {
@@ -388,6 +423,35 @@ describe('anychain402 middleware', () => {
     })
   })
 
+  describe('custom ChallengeStore extension point (review round 3: normalizeNonce must protect it, not just the default store)', () => {
+    it('normalizes the payer-supplied nonce even against a deliberately case-sensitive custom store', async () => {
+      // The in-memory default's OWN internal lowercasing (defense in depth,
+      // see review round 2) does nothing for a third-party store plugged in
+      // via `{ store }` - if it were carrying the real protection here, this
+      // test would be meaningless. Using CaseSensitiveMapStore instead of
+      // the default proves the protection payers of a CUSTOM store actually
+      // get comes from `anychain402` itself normalizing before it ever calls
+      // the store, exactly as `ChallengeStore`'s contract requires.
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const app = express()
+      app.use('/premium', anychain402(config, { store: new CaseSensitiveMapStore() }))
+      app.get('/premium', (_req, res) => res.json({ ok: true }))
+      const server = app.listen(0)
+      servers.push(server)
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const canonicalNonce = nonceFor(requirement)
+      const uppercaseNonce = (`0x${canonicalNonce.slice(2).toUpperCase()}`) as `0x${string}`
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', uppercaseNonce)
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('local floor checks (review I2: do not delegate everything to the facilitator)', () => {
     it('rejects an authorization whose value is below maxAmountRequired', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
@@ -450,6 +514,34 @@ describe('anychain402 middleware', () => {
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
       expect(res.body.error).toBe('invalid_exact_evm_payload_authorization_valid_after')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('returns a clean 402 (not a crash) for a value in exponent notation that BigInt cannot parse', async () => {
+      // x402's own validator for `value` is Number.isInteger(Number(v)) &&
+      // Number(v) >= 0 with a length cap of 18 chars - operating on the
+      // Number() COERCION, not the string's shape. "1e30" passes: Number
+      // ("1e30") is 1e30, an integer per Number.isInteger, and the STRING
+      // is only 4 characters (nowhere near the 18-char cap that bounds
+      // legitimate atomic-unit amounts). BigInt("1e30") throws a
+      // SyntaxError. No real payment is needed to reach this: the 402
+      // challenge body itself publishes extra.merchantEvm and
+      // extra.paymentId, and computeNonce is exported public API, so an
+      // attacker can derive a valid nonce without ever seeing a real
+      // payer's payload (review round 3, new Critical).
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.value = '1e30'
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_exact_evm_payload_authorization_value')
+      expect(res.body.accepts).toHaveLength(2)
       expect(fetchSpy).not.toHaveBeenCalled()
     })
 

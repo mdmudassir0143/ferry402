@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { computeNonce } from '../src/nonce.js'
+import { computeNonce, normalizeNonce } from '../src/nonce.js'
 
 /**
  * Golden vectors generated independently of this codebase, from the actual
@@ -67,5 +67,41 @@ describe('computeNonce', () => {
     expect(() =>
       computeNonce('0x1111111111111111111111111111111111111111', '0xdead' as `0x${string}`),
     ).toThrow(/paymentId/)
+  })
+})
+
+/**
+ * `normalizeNonce` is public API (exported from the package root) and is
+ * exactly what stands between a `ChallengeStore` implementation and the I1
+ * casing bug (review round 2/3) for any store that doesn't ALSO normalize
+ * internally — which `ChallengeStore`'s own contract explicitly permits.
+ * Unit-tested directly here, not just exercised indirectly through
+ * `middleware.test.ts`'s end-to-end cases.
+ */
+describe('normalizeNonce', () => {
+  const CANONICAL = '0xb6f7d82208db09a705e0a7e18d8c0326c05e7fc142836aa6572fa044d76f8b5f'
+
+  it('lowercases an uppercase-hex nonce to the canonical form', () => {
+    // Only the hex body is uppercased, not the "0x" prefix: x402's own
+    // HexEncoded64ByteRegex (and normalizeNonce's) requires a literal
+    // lowercase "0x" - "0X..." is not a valid nonce shape at all, on-chain
+    // hex prefixes are conventionally lowercase and case-insensitivity
+    // applies only to the hex digits themselves.
+    const uppercase = `0x${CANONICAL.slice(2).toUpperCase()}` as `0x${string}`
+    expect(normalizeNonce(uppercase)).toBe(CANONICAL)
+  })
+
+  it('lowercases a mixed-case nonce to the canonical form', () => {
+    const mixed = '0xB6f7D82208db09a705E0a7e18d8c0326C05e7fc142836aa6572fa044d76f8b5f'
+    expect(normalizeNonce(mixed as `0x${string}`)).toBe(CANONICAL)
+  })
+
+  it('leaves an already-lowercase nonce unchanged', () => {
+    expect(normalizeNonce(CANONICAL as `0x${string}`)).toBe(CANONICAL)
+  })
+
+  it('rejects a value that is not a 32-byte 0x hex string', () => {
+    expect(() => normalizeNonce('0xdead')).toThrow(/nonce/)
+    expect(() => normalizeNonce('not-hex-at-all')).toThrow(/nonce/)
   })
 })

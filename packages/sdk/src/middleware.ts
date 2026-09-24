@@ -14,6 +14,29 @@ const DEFAULT_TIMEOUT_SECONDS = 300
  *  — see the task-6 review's I3. */
 const VERIFY_TIMEOUT_MS = 5_000
 
+/**
+ * Parses a decimal-digits-only atomic-unit amount string to a `bigint`, or
+ * returns `undefined` if it isn't one.
+ *
+ * Deliberately stricter than x402's own `value` validator
+ * (`Number.isInteger(Number(v)) && Number(v) >= 0`, length <= 18), which
+ * operates on the `Number()` coercion rather than the string's actual shape
+ * and so accepts JS exponent notation: `"1e30"` is only 4 characters (well
+ * under the 18-char cap) and `Number("1e30")` is an integer, so it passes
+ * x402's schema — but `BigInt("1e30")` throws a `SyntaxError`. Both
+ * `authorization.value` (payer-controlled) and `maxAmountRequired`
+ * (server-controlled, but parsed identically for uniformity) go through
+ * this before any `BigInt` arithmetic, in `middleware.ts`.
+ */
+function parseAtomicAmount(value: string): bigint | undefined {
+  if (!/^\d+$/.test(value)) return undefined
+  try {
+    return BigInt(value)
+  } catch {
+    return undefined
+  }
+}
+
 export interface Anychain402Options {
   /**
    * Storage for outstanding 402 challenges. Defaults to a fresh
@@ -121,12 +144,18 @@ export interface Anychain402Options {
  * configured URL) to reject a payload that authorizes too little value, pays
  * the wrong address, or has already expired. These are checked locally
  * before `consume`. There is deliberately no separate "asset" check: x402's
- * exact-evm `authorization` carries no asset field at all — the token is
- * pinned implicitly by `payTo`, since in this v1 design each `Escrow` is
- * deployed against one immutable token (`Escrow.token` is set at
- * construction and never changes), so an authorization paying the correct
- * `payTo` cannot be paying a different asset than the one that `Escrow`
- * accepts.
+ * exact-evm `authorization` carries no asset field at all, so there is
+ * nothing payer-supplied to validate here in the first place — the `asset`
+ * that reaches `/verify` is always `cached.requirement.asset`, this
+ * middleware's own value from `buildRequirements`/`config`, never anything
+ * the payer could substitute. (It is ALSO true that `payTo` transitively
+ * pins the token in this v1 design, since each `Escrow` is deployed against
+ * one immutable token — but that is a secondary observation, not the reason
+ * the check is unnecessary; it holds only so long as `config.escrows` and
+ * `config.assets` are configured consistently with each other, which
+ * `anychain402` does not itself validate — a configuration hazard for the
+ * developer wiring up `Anychain402Config`, not something a payer can
+ * exploit.)
  *
  * KNOWN LIMITATIONS (accepted for this task's slice, see the task-6 report):
  * - The default `InMemoryChallengeStore` is in-memory and per process. It
@@ -147,6 +176,26 @@ export interface Anychain402Options {
  *   outstanding challenge (there is no nonce to look up yet), so it is
  *   answered with a freshly-minted challenge rather than the one — if any —
  *   the payer actually intended to pay against.
+ * - The consume-before-verify window (see above) is a transient DENIAL
+ *   vector, not a bypass, and it is a real one: everything needed to compute
+ *   a challenge's nonce — `extra.merchantEvm`, `extra.paymentId` — is public
+ *   in the 402 response body, and `computeNonce` is exported public API. So
+ *   anyone who observes an outstanding challenge (not only its intended
+ *   payer) can derive its nonce and submit a bogus-signature payload that
+ *   passes every local check here. Doing so `consume`s the challenge for the
+ *   duration of the `/verify` round trip; the legitimate payer's own
+ *   (valid) submission arriving during that window sees `payment_expired`.
+ *   `/verify` will reject the bogus signature and the entry gets reinstated
+ *   (see above), which is exactly what keeps this transient rather than
+ *   permanent — but an attacker looping this against one specific challenge,
+ *   especially paired with a slow or hanging facilitator, can keep that
+ *   challenge effectively unavailable for as long as they keep trying, at a
+ *   cost of one request per cycle to them and one `VERIFY_TIMEOUT_MS` (or
+ *   less) of denial per cycle to the victim. This is a structural consequence
+ *   of reserving a single-slot-per-nonce entry before its verdict is known;
+ *   the actual fix is a stateless-challenge redesign that doesn't require
+ *   reserving anything before confirmation, which is intentionally NOT
+ *   implemented here — it is separately scoped follow-up work.
  */
 export function anychain402(config: Anychain402Config, options: Anychain402Options = {}): RequestHandler {
   const store = options.store ?? new InMemoryChallengeStore()
@@ -293,7 +342,23 @@ export function anychain402(config: Anychain402Config, options: Anychain402Optio
     // Local floor checks - cheap, and every input is already in hand. A
     // facilitator is a separate trust domain reachable over the network;
     // there is no reason to ask it to reject what we can already reject.
-    if (BigInt(authorization.value) < BigInt(cached.requirement.maxAmountRequired)) {
+    //
+    // `value` is parsed via `parseAtomicAmount`, NOT a bare `BigInt(...)`:
+    // x402's own validator for this field is
+    // `Number.isInteger(Number(v)) && Number(v) >= 0`, which operates on the
+    // `Number()` coercion rather than the string's shape and so admits JS
+    // exponent notation - `"1e30"` passes (an integer, and only 4 characters,
+    // nowhere near the 18-char length cap) but `BigInt("1e30")` throws a
+    // SyntaxError. Reaching this line needs no valid payment at all: the 402
+    // challenge body itself publishes `extra.merchantEvm`/`extra.paymentId`,
+    // and `computeNonce` is exported public API, so anyone can derive a
+    // matching nonce and reach here with a crafted `value` alone (review
+    // round 3's Critical finding - on Express 4, within our declared peer
+    // range, an unguarded throw here doesn't just 500 the request, it kills
+    // the process outright under Node's default unhandled-rejection policy).
+    const authorizedValue = parseAtomicAmount(authorization.value)
+    const requiredValue = parseAtomicAmount(cached.requirement.maxAmountRequired)
+    if (authorizedValue === undefined || requiredValue === undefined || authorizedValue < requiredValue) {
       send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_value')
       return
     }
