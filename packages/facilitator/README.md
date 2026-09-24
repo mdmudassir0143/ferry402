@@ -103,6 +103,47 @@ await writeEntry(entry, { topicId: process.env.HCS_TOPIC_ID!, submitter })
   submission seam, but has no Hedera credentials to prove a real submit
   against.
 
+### Partial-batch failure semantics
+
+**HCS gives ordering, not deduplication.** If `writeEntries` submits several
+messages and one FAILS partway through, the messages that already landed are
+already immutable consensus history — there is no rollback, and nothing on
+the Hedera side prevents the same entries from being submitted again.
+
+`writeEntries` never silently drops that fact. On a partial failure it
+rejects with `PartialBatchWriteError`, whose `committed` field is exactly the
+array of `{ topicId, sequenceNumber }` results `writeEntries` would have
+returned had it stopped there (`error.cause` carries the underlying
+submitter error):
+
+```ts
+import { writeEntries, PartialBatchWriteError } from '@anychain402/facilitator'
+
+try {
+  await writeEntries(entries, { topicId, submitter })
+} catch (err) {
+  if (err instanceof PartialBatchWriteError) {
+    // err.committed: messages that ALREADY landed on HCS. Record these
+    // before doing anything else -- do NOT just retry the same call, or
+    // these will be submitted a second time.
+    await recordCommitted(err.committed)
+  }
+  throw err
+}
+```
+
+**Whose job deduping is:** this package's. Retrying a failed `writeEntries`
+call is the caller's decision, not something this package does
+automatically — a caller that retries the FULL original `entries` array
+(rather than only the ones after `err.committed.length`) will duplicate
+journal entries. Every `JournalEntry` carries `txHash` and `nonce`
+specifically so a downstream reader (a mirror-node consumer reconciling the
+journal, per this package's whole premise) can dedupe by
+`(txHash, nonce)` regardless of how many times an entry appears on the topic.
+Today, nothing in this repository performs that dedup automatically —
+Task 10 (or whichever component first reads the journal back) owns building
+it before treating raw topic messages as an authoritative, once-each ledger.
+
 ## Environment variables
 
 See `.env.example` at the repo root for the full list
@@ -123,4 +164,10 @@ Chain-facing tests (`verify.test.ts`, `settle.fork.test.ts`, `server.test.ts`,
 etc.) spin up a local `anvil` instance per suite — no real network access or
 credentials required. `journal.test.ts` is fully offline: it exercises
 encoding, validation, and batching directly, and `writeEntry`/`writeEntries`
-against a fake `TopicSubmitter` that records calls instead of touching Hedera.
+against a fake `TopicSubmitter` that records calls instead of touching
+Hedera. `journal.hedera-adapter.test.ts` is the one file that mocks
+`@hashgraph/sdk` itself (`vi.mock`), to exercise
+`createHederaTopicSubmitter`'s one pure conditional
+(`topicSequenceNumber === null`) without a live account; its actual
+network-calling path is untested here by design (see that function's doc
+comment) — proving it end to end is Task 10's job.

@@ -5,6 +5,7 @@ import {
   writeEntry,
   writeEntries,
   journalEntryForSettlement,
+  PartialBatchWriteError,
   HCS_MAX_MESSAGE_BYTES,
   type JournalEntry,
   type TopicSubmitter,
@@ -122,6 +123,29 @@ describe('encodeEntry', () => {
     const oversized = sampleEntry({ sourceChain: 'x'.repeat(2000) })
     expect(() => encodeEntry(oversized)).toThrow(/1024/)
   })
+
+  // Review round 1, Important 1: every OTHER oversize test above pads with
+  // pure ASCII, where JS string `.length` and UTF-8 `byteLength` are
+  // identical -- so none of them could tell a correct `byteLength` check
+  // apart from a regression that checked `.length` instead. '€' (the
+  // Euro sign) is a single UTF-16 code unit (`.length` counts it as 1) but
+  // 3 bytes in UTF-8, so this entry's JSON `.length` is comfortably under
+  // 1024 while its actual UTF-8 byte length is over -- a check using
+  // `.length` would wrongly ACCEPT this entry. See the mutation transcript
+  // in the task-9 report: swapping the implementation to `.length` turns
+  // this test red while every ASCII-padded test stays green.
+  it('rejects an entry whose UTF-8 byte length exceeds 1024 even though its JS string .length does not', () => {
+    const multiByte = sampleEntry({ sourceChain: '€'.repeat(250) })
+    const jsonLength = JSON.stringify(multiByte).length
+    const utf8Length = new TextEncoder().encode(JSON.stringify(multiByte)).byteLength
+    // Sanity-check the fixture itself proves what this test needs: a
+    // .length comfortably under the limit, and a byteLength comfortably
+    // over it.
+    expect(jsonLength).toBeLessThan(1024)
+    expect(utf8Length).toBeGreaterThan(1024)
+
+    expect(() => encodeEntry(multiByte)).toThrow(/1024/)
+  })
 })
 
 describe('encodeEntries (batching)', () => {
@@ -208,6 +232,37 @@ describe('writeEntries', () => {
 
     await expect(writeEntries(entries, { topicId: '0.0.8888', submitter })).rejects.toThrow(/txHash/)
     expect(submitter.calls).toHaveLength(0)
+  })
+
+  // Review round 1, Important 2: HCS gives ORDERING, not deduplication. If a
+  // batch fails partway through, the messages that already landed are
+  // immutable consensus history -- silently dropping proof of them (a bare
+  // rejection with no trace of what succeeded) is the worst shape for an
+  // audit trail, and it invites a caller to "just retry", which would
+  // RE-SUBMIT (duplicate) the entries that already committed.
+  it('surfaces already-committed results via PartialBatchWriteError.committed when a later message fails', async () => {
+    let call = 0
+    const submitter: TopicSubmitter = {
+      async submitMessage({ topicId }) {
+        call += 1
+        if (call === 2) {
+          throw new Error('simulated network failure on the second message')
+        }
+        return { topicId, sequenceNumber: call }
+      },
+    }
+    // Padded so this produces exactly 3 messages (2 entries each fit
+    // together, per the batching test above; here we want >= 2 messages so
+    // a failure on the SECOND one leaves exactly one already committed).
+    const entries = [0, 1, 2, 3].map((i) => sampleEntry({ txHash: `${TX_HASH.slice(0, -1)}${i}`, sourceChain: `chain-${i}-${'a'.repeat(80)}` }))
+
+    const failure = await writeEntries(entries, { topicId: '0.0.8888', submitter }).catch((err: unknown) => err)
+
+    expect(failure).toBeInstanceOf(PartialBatchWriteError)
+    const batchError = failure as PartialBatchWriteError
+    expect(batchError.committed).toEqual([{ topicId: '0.0.8888', sequenceNumber: 1 }])
+    expect(batchError.message).toMatch(/1 of 2/)
+    expect((batchError.cause as Error).message).toMatch(/simulated network failure/)
   })
 })
 

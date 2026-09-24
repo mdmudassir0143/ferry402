@@ -10,6 +10,7 @@ export {
   writeEntries,
   journalEntryForSettlement,
   createHederaTopicSubmitter,
+  PartialBatchWriteError,
   HCS_MAX_MESSAGE_BYTES,
 } from './journal.js'
 export type { JournalEntry, JournalEntryType, TopicSubmitter, WriteEntryOptions, JournalEntryForSettlementInput } from './journal.js'

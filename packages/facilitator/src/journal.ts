@@ -187,6 +187,18 @@ export function encodeEntry(entry: JournalEntry): Uint8Array {
  * chunk anything oversized rather than letting a submit fail at runtime";
  * a single `JournalEntry` is atomic JSON and cannot itself be chunked
  * further, so rejection is the only safe option at that point.
+ *
+ * NOTE on the two size checks: the "does this fit alone" check below
+ * re-serializes the entry wrapped in a 1-element array (`[entry]`), matching
+ * this function's own array wire shape -- NOT `encodeEntry`'s bare-object
+ * shape, which is 2 bytes shorter (`[`/`]`). An entry within 2 bytes of
+ * `HCS_MAX_MESSAGE_BYTES` can therefore be accepted by `encodeEntry` but
+ * rejected here (or vice versa for the "solo batch" case), because the two
+ * functions produce genuinely different bytes on the wire for what looks
+ * like "the same" entry. This is intentional (see the wire-shape note
+ * above), not a bug, and each function's own bound is exactly correct FOR
+ * THE BYTES IT ACTUALLY PRODUCES -- but it means "does entry X fit" is not a
+ * single yes/no answer independent of which function you ask.
  */
 export function encodeEntries(entries: readonly JournalEntry[]): Uint8Array[] {
   if (entries.length === 0) {
@@ -265,6 +277,34 @@ export async function writeEntry(entry: JournalEntry, options: WriteEntryOptions
 }
 
 /**
+ * Thrown by `writeEntries` when a batch fails PARTWAY through submission --
+ * i.e. at least one message already landed on HCS before a later one failed.
+ *
+ * This matters operationally, not just as an error shape: HCS gives
+ * ORDERING, not deduplication. Every message in `committed` is already
+ * immutable consensus history; simply retrying the same call re-submits
+ * (duplicates) those entries rather than resuming where it left off. This
+ * error exists so a caller can't lose track of what already landed --
+ * `committed` is exactly the return value `writeEntries` would have produced
+ * had it stopped there, so the caller can record it (and skip those entries
+ * on any retry) instead of the successful submissions being silently
+ * dropped along with the thrown error. See the README's "Partial-batch
+ * failure semantics" section for who is responsible for deduping a retry
+ * (a mirror-node consumer, keyed on each entry's `txHash` + `nonce`).
+ */
+export class PartialBatchWriteError extends Error {
+  /** Results for every message that WAS successfully submitted before the
+   *  failure, in submission order. */
+  readonly committed: ReadonlyArray<{ topicId: string; sequenceNumber: number }>
+
+  constructor(message: string, committed: ReadonlyArray<{ topicId: string; sequenceNumber: number }>, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'PartialBatchWriteError'
+    this.committed = committed
+  }
+}
+
+/**
  * Batches `entries` (see `encodeEntries`) and submits one HCS message per
  * batch, in order. Every entry is validated before ANY message is submitted
  * (fail-closed across the whole call, not just the entry that happens to be
@@ -276,12 +316,28 @@ export async function writeEntry(entry: JournalEntry, options: WriteEntryOptions
  * being an ORDERED record), and the real `TopicSubmitter` signs through one
  * Hedera operator account, so concurrent submission would race rather than
  * preserve order.
+ *
+ * If `submitter.submitMessage` throws partway through a multi-message batch,
+ * this rejects with `PartialBatchWriteError` rather than the bare underlying
+ * error -- see that class's doc comment. Messages already submitted before
+ * the failure are NOT retried or rolled back (HCS has no rollback); they are
+ * surfaced via `error.committed` instead of being silently discarded.
  */
 export async function writeEntries(entries: readonly JournalEntry[], options: WriteEntryOptions): Promise<Array<{ topicId: string; sequenceNumber: number }>> {
   const messages = encodeEntries(entries)
   const results: Array<{ topicId: string; sequenceNumber: number }> = []
   for (const message of messages) {
-    results.push(await options.submitter.submitMessage({ topicId: options.topicId, message }))
+    let result: { topicId: string; sequenceNumber: number }
+    try {
+      result = await options.submitter.submitMessage({ topicId: options.topicId, message })
+    } catch (err) {
+      throw new PartialBatchWriteError(
+        `writeEntries: submitted ${results.length} of ${messages.length} messages before failing -- the ${results.length} already-submitted message(s) are immutable on HCS; retrying this call will RE-SUBMIT (duplicate) them. See error.committed for what already landed.`,
+        results,
+        { cause: err },
+      )
+    }
+    results.push(result)
   }
   return results
 }
@@ -347,18 +403,22 @@ export function journalEntryForSettlement(input: JournalEntryForSettlementInput)
  * `new TopicMessageSubmitTransaction().setTopicId(topicId).setMessage(bytes)`,
  * executed against the given, already-constructed `Client`.
  *
- * Deliberately UNTESTED by this task's own suite: every check above this
- * function is pure and network-free by construction specifically so it COULD
- * be unit-tested without credentials (see this task's brief). This function
- * is the opposite -- a thin wrapper whose only job is to call the real SDK,
- * which itself opens a gRPC channel and expects a funded operator account to
- * sign with. There are no Hedera credentials available to this codebase
- * right now (see the task brief's "Credentials" section), so proving this
- * function works end to end -- a real topic, a real submit, a real mirror
- * node query -- is explicitly Task 10's job, not this one's. `client` is
- * accepted as a parameter (never constructed from `process.env` internally)
- * so this function has exactly one responsibility: adapt `TopicSubmitter` to
- * the real SDK, not also decide how the operator is configured.
+ * The NETWORK-CALLING path (`execute`/`getReceipt` actually reaching Hedera
+ * and succeeding) is deliberately UNTESTED by this task's own suite: that
+ * requires a funded operator account and a real gRPC round trip, and there
+ * are no Hedera credentials available to this codebase right now (see the
+ * task brief's "Credentials" section) -- proving THAT end to end (a real
+ * topic, a real submit, a real mirror node query) is Task 10's job, not this
+ * one's. `client` is accepted as a parameter (never constructed from
+ * `process.env` internally) so this function has exactly one responsibility:
+ * adapt `TopicSubmitter` to the real SDK, not also decide how the operator
+ * is configured.
+ *
+ * The one PURE conditional in this function -- `receipt.topicSequenceNumber
+ * === null` -- needs no live account to exercise: it's covered by
+ * `test/journal.hedera-adapter.test.ts` via `vi.mock('@hashgraph/sdk')`,
+ * which fakes `TopicMessageSubmitTransaction` entirely rather than touching
+ * the network.
  */
 export function createHederaTopicSubmitter(client: Client): TopicSubmitter {
   return {
