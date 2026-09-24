@@ -18,7 +18,7 @@ export function parsePrice(price: string): string {
  * with a `0x` prefix (66 chars total).
  *
  * This becomes the `paymentId` half of the on-chain nonce binding
- * (`keccak256(abi.encode(merchant, paymentId))`, see `Escrow.sol`). The
+ * (`keccak256(abi.encode(merchantEvm, paymentId))`, see `Escrow.sol`). The
  * contract's own doc comment on `settleAuthorization` is explicit that the
  * nonce omits the payer, so `paymentId` must be unique per (payer, merchant)
  * pair — a counter or timestamp could collide across concurrent processes or
@@ -46,6 +46,12 @@ export interface BuildRequirementsOptions {
  * describing the same payment request (same `resource`, same price, same
  * `paymentId`) so a client can pay on whichever accepted chain it prefers.
  *
+ * Each entry's `extra.merchantEvm` is that chain's address specifically
+ * (`config.merchantEvm[network]`), not a single global value — a client
+ * computing the nonce for e.g. `polygon-amoy` must hash the `polygon-amoy`
+ * payout address, not `base-sepolia`'s. Mixing those up would make every
+ * settlement attempt revert `MerchantNotBound`.
+ *
  * Pure function: no network calls, no chain reads. Every value comes from
  * `config`, `resource`, and (by default) a fresh CSPRNG draw for
  * `paymentId` — nothing here is looked up or awaited.
@@ -71,6 +77,11 @@ export function buildRequirements(
     payTo: config.escrows[network],
     maxTimeoutSeconds: 300,
     asset: config.assets[network],
-    extra: { settleTo: config.settleTo, merchant: config.merchant, paymentId },
+    extra: {
+      settleTo: config.settleTo,
+      merchant: config.merchant,
+      merchantEvm: config.merchantEvm[network],
+      paymentId,
+    },
   }))
 }

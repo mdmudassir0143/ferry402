@@ -38,8 +38,23 @@ export type Anychain402Config = {
   accept: SupportedChain[]
   /** anychain402 v1 always settles to Hedera. */
   settleTo: 'hedera'
-  /** Merchant identity the facilitator credits once a payment settles. */
+  /**
+   * Merchant identity on the clearing layer: a Hedera account id (e.g.
+   * "0.0.123456"). The HCS journal and settlement ledger key on this — it is
+   * NOT what the `Escrow` contract binds into the authorization nonce (see
+   * `merchantEvm`), because it isn't an EVM address.
+   */
   merchant: string
+  /**
+   * Per-chain EVM address for this merchant. This is the `Escrow` ledger row
+   * key, the account allowed to call `withdraw`, and (together with
+   * `paymentId`) one of the two preimages of the on-chain nonce:
+   * `keccak256(abi.encode(merchantEvm[network], paymentId))`. Per-chain
+   * rather than a single global address because a merchant may control a
+   * different payout address on each chain — the settlement ledger maps one
+   * Hedera account id to several per-chain payout addresses.
+   */
+  merchantEvm: Record<SupportedChain, `0x${string}`>
   /** Base URL of the facilitator that verifies/settles payments. */
   facilitator: string
   /** Per-chain `Escrow` contract address funds are paid into. */

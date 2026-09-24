@@ -7,6 +7,15 @@ const config: Anychain402Config = {
   accept: ['base-sepolia', 'polygon-amoy'],
   settleTo: 'hedera',
   merchant: '0.0.123456',
+  // Deliberately distinct per chain: a test that only checked "some address
+  // is present" would miss a cross-chain mix-up (e.g. every entry getting
+  // base-sepolia's address). These must differ so such a bug fails loudly.
+  merchantEvm: {
+    base: '0x3333333333333333333333333333333333333d',
+    'base-sepolia': '0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa',
+    polygon: '0x4444444444444444444444444444444444444e',
+    'polygon-amoy': '0xBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb',
+  },
   facilitator: 'http://localhost:4000',
   escrows: {
     base: '0x0000000000000000000000000000000000000000',
@@ -23,6 +32,7 @@ const config: Anychain402Config = {
 }
 
 const PAYMENT_ID_RE = /^0x[0-9a-fA-F]{64}$/
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 
 describe('buildRequirements', () => {
   it('emits one entry per accepted chain', () => {
@@ -52,6 +62,25 @@ describe('buildRequirements', () => {
         '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       )
     }
+  })
+
+  it("carries this chain's merchantEvm address, not another chain's", () => {
+    const reqs = buildRequirements(config, 'https://api.test/premium')
+    for (const r of reqs) {
+      expect(r.extra?.merchantEvm).toMatch(EVM_ADDRESS_RE)
+      // Must equal config.merchantEvm for r's OWN network specifically — a
+      // buggy implementation that hard-codes or reuses one chain's address
+      // across every entry would fail this, even though each entry does
+      // carry *some* well-formed address.
+      expect(r.extra?.merchantEvm).toBe(config.merchantEvm[r.network as keyof typeof config.merchantEvm])
+    }
+    // Guard the fixture itself: if the two accepted chains' addresses ever
+    // collapsed to the same value, the assertion above couldn't distinguish
+    // "correct per-chain lookup" from "always returns the same address".
+    const [baseSepolia, polygonAmoy] = reqs
+    expect(baseSepolia.extra?.merchantEvm).toBe(config.merchantEvm['base-sepolia'])
+    expect(polygonAmoy.extra?.merchantEvm).toBe(config.merchantEvm['polygon-amoy'])
+    expect(baseSepolia.extra?.merchantEvm).not.toBe(polygonAmoy.extra?.merchantEvm)
   })
 
   it('shares one paymentId across all chain options in a single call', () => {
