@@ -311,3 +311,45 @@ project policy, not a code guarantee, and the constructor validates nothing.
 Fixed by measuring `token.balanceOf(address(this))` before and after the pull and
 crediting the difference, under a reentrancy guard — the guard is load-bearing, since
 a nested settle would otherwise corrupt the measured window.
+
+## Amendment 3 — merchant identity is two identifiers, not one (2026-09-24)
+
+**Found during Task 5.** The design conflated two different things under the name
+`merchant`:
+
+- On **Hedera**, the clearing layer, a merchant is a Hedera account id (`0.0.123456`).
+  This is what the HCS journal and `SettlementLedger` key on.
+- On **each source chain**, the merchant is an **EVM address**. This is the key of the
+  `Escrow` ledger row, the account allowed to `withdraw`, and — critically — one of the
+  two preimages of the authorization nonce:
+  `keccak256(abi.encode(merchant, paymentId))` where `merchant` is `address`.
+
+Emitting the Hedera account id in `PaymentRequirements.extra` makes the nonce
+uncomputable by the client: it cannot produce an authorization the contract will accept,
+because the contract hashes an `address` and the client was handed a dotted account id.
+The two never agree, so **every payment would fail `MerchantNotBound`**.
+
+### Fix
+
+The SDK config carries both:
+
+- `merchant: string` — the Hedera account id, clearing-layer identity
+- `merchantEvm: Record<SupportedChain, \`0x${string}\`>` — the merchant's EVM address per
+  source chain, mirroring the existing `escrows` map
+
+Each `PaymentRequirements` entry's `extra` carries the `merchantEvm` for *that* chain
+alongside `merchant` and `paymentId`, so the client computes
+`nonce = keccak256(abi.encode(extra.merchantEvm, extra.paymentId))` — exactly what the
+contract recomputes.
+
+Per-chain rather than a single address because a merchant may control different
+addresses on different chains, and `SettlementLedger`'s merchant registry was already
+specified as "Hedera account ↔ per-chain payout addresses".
+
+### Binding on later tasks
+
+- **Task 6:** the client derives the nonce from `extra.merchantEvm`, never `extra.merchant`.
+- **Task 7:** `/verify` recomputes the binding using the EVM address.
+- **Task 8:** `settlePayment` passes the EVM address as the contract's `merchant` argument.
+- **Task 9:** the HCS journal records the Hedera account id as `merchant`, and should also
+  record the EVM address so the two identities can be reconciled off-chain.
