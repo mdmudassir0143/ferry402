@@ -1,0 +1,28 @@
+{
+  "name": "@anychain402/facilitator",
+  "version": "0.1.0",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20.18.3" },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@anychain402/sdk": "workspace:*",
+    "express": "^5.2.1",
+    "viem": "^2.56.8",
+    "x402": "1.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.13.4",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
