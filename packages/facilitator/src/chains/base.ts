@@ -1,5 +1,8 @@
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
+  createWalletClient,
   getAddress,
   hashTypedData,
   http,
@@ -10,6 +13,7 @@ import {
   type Address,
   type Hex,
 } from 'viem'
+import { privateKeyToAccount } from 'viem/accounts'
 import { base, baseSepolia } from 'viem/chains'
 import { ErrorReasons } from 'x402/types'
 import type { PaymentPayload, PaymentRequirements } from 'x402/types'
@@ -519,4 +523,421 @@ export async function verifyPayment(
   }
 
   return { isValid: true, payer: recovered }
+}
+
+// --- Task 8: /settle -------------------------------------------------------
+
+/**
+ * The minimal ABI `settlePayment` needs against `Escrow.sol`: the one
+ * function it calls, plus every custom error `Escrow.sol` can revert with
+ * (see `packages/contracts/src/Escrow.sol`). Hand-written rather than
+ * imported from a build artifact — this facilitator has exactly one contract
+ * it ever calls, and hand-writing the handful of entries it actually uses
+ * avoids a build-time dependency from `@anychain402/facilitator` on
+ * `@anychain402/contracts`' compiled output. Declaring the errors here (not
+ * just the function) matters for more than documentation: viem's own revert
+ * decoding (`decodeErrorResult`, used internally by
+ * `ContractFunctionRevertedError`) only recognizes a custom error if its
+ * signature is present in the ABI passed to the call that reverted — see
+ * `decodeSettleRevert`'s doc comment.
+ */
+const ESCROW_SETTLE_ABI = [
+  {
+    type: 'function',
+    name: 'settleAuthorization',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'merchant', type: 'address' },
+      { name: 'paymentId', type: 'bytes32' },
+      {
+        name: 'auth',
+        type: 'tuple',
+        components: [
+          { name: 'from', type: 'address' },
+          { name: 'to', type: 'address' },
+          { name: 'value', type: 'uint256' },
+          { name: 'validAfter', type: 'uint256' },
+          { name: 'validBefore', type: 'uint256' },
+          { name: 'nonce', type: 'bytes32' },
+        ],
+      },
+      { name: 'v', type: 'uint8' },
+      { name: 'r', type: 'bytes32' },
+      { name: 's', type: 'bytes32' },
+    ],
+    outputs: [],
+  },
+  { type: 'error', name: 'Reentrancy', inputs: [] },
+  { type: 'error', name: 'RecipientMismatch', inputs: [] },
+  { type: 'error', name: 'MerchantNotBound', inputs: [] },
+  { type: 'error', name: 'ZeroMerchant', inputs: [] },
+  { type: 'error', name: 'InsufficientBalance', inputs: [] },
+  { type: 'error', name: 'TransferFailed', inputs: [] },
+] as const
+
+/**
+ * A conservative fixed gas limit for `settleAuthorization`, passed
+ * explicitly on every settlement submission — see `settlePayment`'s doc
+ * comment for why this is load-bearing, not just an optimization: it is what
+ * makes `receipt.status === 'reverted'` (rather than a thrown error from
+ * client-side gas estimation) the path every on-chain revert actually takes.
+ * `settleAuthorization` does one external call (`receiveWithAuthorization`)
+ * plus a couple of cold `SSTORE`s; real USDC's own implementation (a proxy
+ * delegatecall plus its own EIP-712/nonce bookkeeping) is heavier than
+ * `MockUSDC`'s, so this leaves several times the headroom real mainnet USDC
+ * transfers typically consume, while staying far below any Base block's gas
+ * limit.
+ */
+const SETTLE_GAS_LIMIT = 500_000n
+
+/**
+ * `settlePayment`'s own additions to `VerifyInvalidReason`'s vocabulary —
+ * see that type's doc comment for the same `AssertSubtype` discipline this
+ * union is checked against below.
+ */
+export type SettleInvalidReason =
+  | VerifyInvalidReason
+  | 'unexpected_settle_error'
+  | 'insufficient_funds'
+  | 'duplicate_settlement'
+
+// See `_VerifyInvalidReasonIsSubsetOfX402ErrorReasons` above for why this
+// check exists and why it is written this specific (non-distributive) way.
+type _SettleInvalidReasonIsSubsetOfX402ErrorReasons = AssertSubtype<SettleInvalidReason, (typeof ErrorReasons)[number]>
+
+export interface SettleOptions extends VerifyOptions {
+  /**
+   * Overrides the facilitator's signing key for this call. Defaults to
+   * `process.env.FACILITATOR_PRIVATE_KEY`. Tests pass one of anvil's
+   * well-known dev keys here instead of mutating `process.env` (which would
+   * leak across other tests sharing the same worker) — see
+   * `test/support/anvil.ts`.
+   *
+   * Never logged, here or anywhere downstream of this module.
+   */
+  facilitatorPrivateKey?: Hex
+}
+
+export interface SettleResult {
+  success: boolean
+  errorReason?: SettleInvalidReason
+  /**
+   * Best-effort even on failure: the signer `authorization.from` claims to
+   * be, independent of whether that claim actually checked out. Matches
+   * x402's own reference exact-evm `settle` (see its `settle2`), which
+   * likewise reports `payload.authorization.from` in its failure responses.
+   */
+  payer: string
+  /** A 32-byte transaction hash once one was actually submitted; `''` when
+   *  settlement never reached the chain (verify failed, or submission threw
+   *  before a hash existed). */
+  transaction: string
+  network: string
+}
+
+/** Best-effort label for an on-chain revert or submission failure, used only
+ *  for the operator-facing log line `settlePayment` emits — never part of
+ *  the `SettleResult` returned to a caller. Contains no payer-supplied data
+ *  beyond a revert's OWN error name/args (which the payer doesn't control)
+ *  and the escrow/network context; never the signature or the private key. */
+interface DecodedSettleFailure {
+  errorReason: SettleInvalidReason
+  label: string
+}
+
+/**
+ * Best-effort decoding of a revert or submission failure into an x402
+ * `errorReason` plus a human-readable label for logging.
+ *
+ * Three tiers, in order:
+ *
+ * 1. One of `Escrow.sol`'s own custom errors (`MerchantNotBound`,
+ *    `Reentrancy`, `ZeroMerchant`, `InsufficientBalance`, `TransferFailed`)
+ *    — decodable because `ESCROW_SETTLE_ABI` declares them. These are
+ *    facilitator/contract-level problems, not something a payer's payload
+ *    caused, so they map to the generic `unexpected_settle_error` — except
+ *    `RecipientMismatch`, which is exactly x402's own
+ *    `invalid_exact_evm_payload_recipient_mismatch` (the escrow's own
+ *    on-chain re-check of the same condition `verifyPayment`'s check 1
+ *    already performs off-chain) and is reported as such.
+ * 2. A plain Solidity `require`/`revert("...")` string reason — decodable
+ *    for ANY contract, regardless of the ABI passed in, because viem always
+ *    additionally checks the standard `Error(string)` selector (see
+ *    `decodeErrorResult`). This is how a real EIP-3009 token's OWN revert
+ *    reasons surface (e.g. real USDC is older Solidity and reverts with
+ *    strings, not custom errors) even though this module has no ABI for
+ *    whatever token `requirements.asset` names. A reason that reads as an
+ *    insufficient-balance complaint is reported as x402's `insufficient_funds`;
+ *    anything else falls back to `unexpected_settle_error`.
+ * 3. Anything else — a custom error this ABI doesn't declare (e.g.
+ *    `MockUSDC.AuthorizationAlreadyUsed`, used in `settle.fork.test.ts`'s
+ *    double-settlement test — MockUSDC is a test fixture, not something this
+ *    production module carries an ABI for), a `Panic(uint256)`, or a
+ *    non-revert failure (RPC/network error). Reported as
+ *    `unexpected_settle_error`, with whatever raw signature/message viem
+ *    could still surface included in the label — an unresolved 4-byte
+ *    selector is still far more debuggable than nothing.
+ */
+function decodeSettleRevert(err: unknown): DecodedSettleFailure {
+  const reverted =
+    err instanceof BaseError ? (err.walk((e) => e instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | null) : null
+
+  if (reverted) {
+    const errorName = reverted.data?.errorName
+    if (errorName === 'RecipientMismatch') {
+      return { errorReason: 'invalid_exact_evm_payload_recipient_mismatch', label: 'Escrow.RecipientMismatch' }
+    }
+    if (
+      errorName === 'MerchantNotBound' ||
+      errorName === 'Reentrancy' ||
+      errorName === 'ZeroMerchant' ||
+      errorName === 'InsufficientBalance' ||
+      errorName === 'TransferFailed'
+    ) {
+      return { errorReason: 'unexpected_settle_error', label: `Escrow.${errorName}` }
+    }
+    if (errorName === 'Error' && typeof reverted.reason === 'string') {
+      const reason = reverted.reason
+      const looksLikeInsufficientFunds = /insufficient|exceeds balance/i.test(reason)
+      return {
+        errorReason: looksLikeInsufficientFunds ? 'insufficient_funds' : 'unexpected_settle_error',
+        label: `token revert: "${reason}"`,
+      }
+    }
+    if (errorName === 'Panic') {
+      return { errorReason: 'unexpected_settle_error', label: `Panic(${String(reverted.reason ?? 'unknown')})` }
+    }
+    if (reverted.signature) {
+      return { errorReason: 'unexpected_settle_error', label: `unrecognized revert selector ${reverted.signature}` }
+    }
+    return { errorReason: 'unexpected_settle_error', label: 'revert with no decodable reason' }
+  }
+
+  const message = err instanceof Error ? err.message : String(err)
+  return { errorReason: 'unexpected_settle_error', label: `non-revert failure: ${message}` }
+}
+
+/**
+ * Best-effort re-decoding of an ALREADY-MINED, reverted transaction (see
+ * check 6 in `settlePayment`'s doc comment for why this path exists at all).
+ * A mined receipt carries no revert data of its own, so this replays the
+ * identical call via `eth_call` against current chain state to recover a
+ * decodable reason. Current state is not guaranteed to be byte-identical to
+ * the state the original transaction actually executed against (another
+ * transaction could have landed in between), so this is inherently
+ * best-effort — if the replay no longer fails the same way (or at all), that
+ * itself is reported rather than guessed at.
+ */
+async function decodeMinedRevert(
+  publicClient: ReturnType<typeof createChainClient>,
+  call: {
+    address: Address
+    account: Address
+    args: readonly [Address, Hex, { from: Address; to: Address; value: bigint; validAfter: bigint; validBefore: bigint; nonce: Hex }, number, Hex, Hex]
+  },
+): Promise<DecodedSettleFailure> {
+  try {
+    await publicClient.simulateContract({
+      address: call.address,
+      abi: ESCROW_SETTLE_ABI,
+      functionName: 'settleAuthorization',
+      args: call.args,
+      account: call.account,
+    })
+    return {
+      errorReason: 'unexpected_settle_error',
+      label: 're-simulation succeeded against current state; mined revert reason unavailable',
+    }
+  } catch (err) {
+    return decodeSettleRevert(err)
+  }
+}
+
+/**
+ * Redeems a verified EIP-3009 authorization on-chain: submits
+ * `Escrow.settleAuthorization` from the facilitator's own wallet, waits for
+ * the receipt, and reports the x402 `SettleResponse` shape.
+ *
+ * Two correctness properties matter more than the rest here:
+ *
+ * 1. **Never submit an unverified authorization.** `verifyPayment` is
+ *    re-run, from scratch, as this function's very first step, and any
+ *    failure returns immediately — before a wallet client is even
+ *    constructed, let alone before any RPC call that could submit a
+ *    transaction. Gas is real money and a revert is a worse failure mode
+ *    than a same-latency rejection; there is no scenario where trusting a
+ *    caller's own prior `/verify` call (rather than re-checking) is worth
+ *    that risk. This is also why the unverified-payload test in
+ *    `settle.fork.test.ts` asserts NO transaction was sent, not merely that
+ *    `success` came back `false`.
+ * 2. **A mined-but-reverted transaction is a failure**, even though
+ *    `writeContract` itself did not throw. This function deliberately passes
+ *    an explicit `gas` (`SETTLE_GAS_LIMIT`) on every submission specifically
+ *    so this path is reachable at all: viem's wallet actions only run
+ *    client-side gas estimation (which itself simulates the call, and would
+ *    throw synchronously for a call that reverts) when `gas` is left
+ *    unspecified. With `gas` fixed, a reverting call is broadcast and mined
+ *    like any other transaction, and the ONLY signal that it failed is
+ *    `receipt.status`. Real facilitators (and the `MerchantNotBound` /
+ *    double-settlement tests here) go through exactly this path, not a
+ *    thrown exception — a facilitator that checked `success` and forgot to
+ *    ALSO check `receipt.status` would report a reverted payment as settled.
+ *
+ * The merchant identity passed to the contract is
+ * `requirements.extra.merchantEvm` — the per-chain EVM address the payer's
+ * nonce is bound to (see `computeNonce`'s doc comment) — never
+ * `requirements.extra.merchant`, the Hedera clearing-layer account id. The
+ * two are easy to confuse (this project has already done so once); only
+ * `merchantEvm` means anything to `Escrow.sol`, and submitting the wrong one
+ * doesn't silently miscredit anyone — it reverts `MerchantNotBound`, since
+ * the payer's signed nonce is bound to `merchantEvm` specifically.
+ */
+export async function settlePayment(
+  payload: PaymentPayload,
+  requirements: PaymentRequirements,
+  options: SettleOptions = {},
+): Promise<SettleResult> {
+  const network = requirements.network
+  const payerBestEffort = 'authorization' in payload.payload ? payload.payload.authorization.from : ''
+
+  // 1. Re-verify from scratch. See this function's doc comment, point 1 —
+  // nothing below this block may run on a payload that didn't just pass.
+  const verifyResult = await verifyPayment(payload, requirements, { rpcUrl: options.rpcUrl })
+  if (!verifyResult.isValid) {
+    return {
+      success: false,
+      errorReason: verifyResult.invalidReason ?? 'unexpected_settle_error',
+      payer: verifyResult.payer ?? payerBestEffort,
+      transaction: '',
+      network,
+    }
+  }
+
+  // verifyPayment only returns isValid:true for the exact-evm
+  // { signature, authorization } payload shape (see its first check) — this
+  // re-narrows for TypeScript and, cheaply, for defense-in-depth against a
+  // future change that decoupled the two.
+  if (!('authorization' in payload.payload)) {
+    return { success: false, errorReason: 'unexpected_settle_error', payer: payerBestEffort, transaction: '', network }
+  }
+  const authorization = payload.payload.authorization
+  const payer = verifyResult.payer ?? authorization.from
+
+  // 2 & 3. The contract's `merchant` argument and `paymentId` — see this
+  // function's doc comment for why `merchantEvm` specifically (never
+  // `extra.merchant`). Both are re-extracted (not just trusted from the
+  // verify call above) as defense-in-depth: `verifyPayment` already requires
+  // both to be present and shaped correctly for a valid result, so this
+  // cannot actually fail here today, but a future refactor decoupling that
+  // requirement from this one must not turn into a silent `undefined` reaching
+  // `computeNonce`/the contract call below.
+  const merchantEvm = requirements.extra?.merchantEvm as Address | undefined
+  const paymentId = requirements.extra?.paymentId as Hex | undefined
+  if (!merchantEvm || !paymentId) {
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+
+  const chain = SUPPORTED_CHAINS[network as Task7Network]
+  if (!chain) {
+    return { success: false, errorReason: 'invalid_network', payer, transaction: '', network }
+  }
+
+  const split = splitEcdsaSignature(payload.payload.signature)
+  if (!split) {
+    // verifyPayment's check 5 already requires a well-formed 65-byte ECDSA
+    // signature for isValid:true; unreachable in practice.
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+
+  const facilitatorPrivateKey = options.facilitatorPrivateKey ?? (process.env.FACILITATOR_PRIVATE_KEY as Hex | undefined)
+  if (!facilitatorPrivateKey) {
+    console.error('settlePayment: FACILITATOR_PRIVATE_KEY is not configured (checked options and process.env)')
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+
+  // Prepare every value the contract call needs. Wrapped in one try/catch:
+  // every input here already passed verifyPayment's own validation (address
+  // shape, decimal-string range via parseDecimalBigInt, etc.), so none of
+  // this is expected to throw — this exists purely so an unanticipated
+  // future edge case fails closed (an `unexpected_settle_error`) rather than
+  // crashing the facilitator process, matching this codebase's existing
+  // "verifyPayment is written to never throw" discipline (see server.ts).
+  let account: ReturnType<typeof privateKeyToAccount>
+  let escrowAddress: Address
+  let merchantEvmAddress: Address
+  let authTuple: { from: Address; to: Address; value: bigint; validAfter: bigint; validBefore: bigint; nonce: Hex }
+  try {
+    account = privateKeyToAccount(facilitatorPrivateKey)
+    escrowAddress = getAddress(requirements.payTo)
+    merchantEvmAddress = getAddress(merchantEvm)
+    const value = parseDecimalBigInt(authorization.value)
+    const validAfter = parseDecimalBigInt(authorization.validAfter)
+    const validBefore = parseDecimalBigInt(authorization.validBefore)
+    if (value === undefined || validAfter === undefined || validBefore === undefined) {
+      throw new Error('authorization field failed re-validation after verifyPayment reported it valid')
+    }
+    authTuple = {
+      from: getAddress(authorization.from),
+      to: getAddress(authorization.to),
+      value,
+      validAfter,
+      validBefore,
+      nonce: authorization.nonce as Hex,
+    }
+  } catch (err) {
+    console.error(`settlePayment: failed to prepare settlement inputs: ${err instanceof Error ? err.message : String(err)}`)
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+
+  // Reuses the SAME cached, chain-id-verified client `verifyPayment` (called
+  // above, moments ago, for this exact (network, rpcUrl) pair) already
+  // populated — see `getVerifiedClient`'s doc comment. Deliberately NOT a
+  // fresh `createPublicClient({ chain, transport })` here: this file's own
+  // multi-viem-install hazard (see `createChainClient`'s doc comment) means
+  // every client instantiation must flow through that one function, or
+  // TypeScript can spuriously reject assigning one client to a
+  // differently-inferred-but-identical type elsewhere (`decodeMinedRevert`'s
+  // parameter, in this case).
+  const publicClient = await getVerifiedClient(network as Task7Network, chain, options.rpcUrl)
+  if (!publicClient) {
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+  const walletClient = createWalletClient({ account, chain, transport: http(options.rpcUrl, { timeout: 10_000, retryCount: 1 }) })
+
+  const callArgs = [merchantEvmAddress, paymentId, authTuple, split.v, split.r, split.s] as const
+
+  // 4. Submit, funded from the facilitator's own wallet. `gas` is always
+  // explicit — see this function's doc comment, point 2.
+  let hash: Hex
+  try {
+    hash = await walletClient.writeContract({
+      address: escrowAddress,
+      abi: ESCROW_SETTLE_ABI,
+      functionName: 'settleAuthorization',
+      args: callArgs,
+      gas: SETTLE_GAS_LIMIT,
+    })
+  } catch (err) {
+    const decoded = decodeSettleRevert(err)
+    console.error(`settlePayment: submission to escrow ${escrowAddress} on ${network} failed: ${decoded.label}`)
+    return { success: false, errorReason: decoded.errorReason, payer, transaction: '', network }
+  }
+
+  let receipt: Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>
+  try {
+    receipt = await publicClient.waitForTransactionReceipt({ hash })
+  } catch (err) {
+    console.error(`settlePayment: never got a receipt for ${hash} on ${network}: ${err instanceof Error ? err.message : String(err)}`)
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: hash, network }
+  }
+
+  // 6. A mined-but-reverted transaction is a failure — see this function's
+  // doc comment, point 2. `success: true` is returned ONLY past this check.
+  if (receipt.status !== 'success') {
+    const decoded = await decodeMinedRevert(publicClient, { address: escrowAddress, account: account.address, args: callArgs })
+    console.error(`settlePayment: transaction ${hash} on ${network} was mined but reverted: ${decoded.label}`)
+    return { success: false, errorReason: decoded.errorReason, payer, transaction: hash, network }
+  }
+
+  return { success: true, payer, transaction: hash, network }
 }
