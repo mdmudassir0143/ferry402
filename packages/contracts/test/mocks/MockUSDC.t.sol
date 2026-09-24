@@ -126,4 +126,22 @@ contract MockUSDCTest is Test {
         vm.expectRevert(MockUSDC.InvalidSignatureVValue.selector);
         usdc.receiveWithAuthorization(payer, to, 1e6, 0, block.timestamp + 3600, nonce, invalidV, r, s);
     }
+
+    /// @notice R4 guardrail: without this test, TransferToZeroAddress (M1)
+    /// could be silently removed from _transfer and the suite would stay
+    /// green, quietly making this mock more permissive than real USDC.
+    function test_transferRevertsOnZeroAddress() public {
+        vm.prank(payer);
+        vm.expectRevert(MockUSDC.TransferToZeroAddress.selector);
+        usdc.transfer(address(0), 1e6);
+    }
+
+    /// @notice R4 guardrail: without this test, TokenInsufficientBalance
+    /// (I1, renamed from the colliding InsufficientBalance) could be
+    /// silently removed from _transfer and the suite would stay green.
+    function test_transferRevertsOnInsufficientBalance() public {
+        vm.prank(payer);
+        vm.expectRevert(MockUSDC.TokenInsufficientBalance.selector);
+        usdc.transfer(to, 1_000e6 + 1);
+    }
 }

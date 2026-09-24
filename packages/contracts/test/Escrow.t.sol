@@ -99,16 +99,23 @@ contract EscrowTest is Test {
         escrow.settleAuthorization(address(0), paymentId, auth, v, r, s);
     }
 
+    /// @notice R5: withdraws to a `to` distinct from `merchant`, so a
+    /// mutation swapping the Withdrawn event's (merchant, to) argument
+    /// positions would produce a mismatched log and fail this test. Sending
+    /// to `merchant` itself would leave both indexed topics holding the same
+    /// value, masking exactly that kind of bug.
     function test_withdraw_transfersToMerchant() public {
         _payMerchant(10e6);
+        address payoutAddress = address(0xFEED);
 
         vm.prank(merchant);
         vm.expectEmit(true, true, false, true, address(escrow));
-        emit Escrow.Withdrawn(merchant, merchant, 4e6);
-        escrow.withdraw(4e6, merchant);
+        emit Escrow.Withdrawn(merchant, payoutAddress, 4e6);
+        escrow.withdraw(4e6, payoutAddress);
 
         assertEq(escrow.balanceOf(merchant), 6e6);
-        assertEq(usdc.balanceOf(merchant), 4e6);
+        assertEq(usdc.balanceOf(payoutAddress), 4e6);
+        assertEq(usdc.balanceOf(merchant), 0);
     }
 
     /// @notice I1 regression: MockUSDC's own insufficient-balance error and

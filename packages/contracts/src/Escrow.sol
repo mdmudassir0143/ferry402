@@ -108,17 +108,27 @@ contract Escrow {
     /// diagnosability and because callers up the stack (including this
     /// contract's own nonReentrant guard on a reentrant call) may need the
     /// real reason, not a generic one. `TransferFailed()` is reserved for the
-    /// two cases that carry no reason of their own: a bare revert with empty
-    /// return data, and a token that returns `false`.
+    /// cases that carry no reason of their own: a bare revert with empty
+    /// return data; a codeless `token` address, since a low-level call
+    /// trivially succeeds with empty returndata against one (the high-level
+    /// call this replaced got an automatic extcodesize check from solc for
+    /// free, because it expects a return value -- this restores that check
+    /// explicitly); a return shorter than one word; and a token that
+    /// explicitly returns `false`. The length check on the success path
+    /// specifically avoids ever calling `abi.decode` on malformed
+    /// (non-empty, non-word-sized) data, which would itself revert with no
+    /// reason of its own -- the same anonymous-masking failure mode this
+    /// helper exists to eliminate.
     function _safeTransfer(address to_, uint256 amount) private {
-        (bool ok, bytes memory data) =
-            address(token).call(abi.encodeWithSignature("transfer(address,uint256)", to_, amount));
+        (bool ok, bytes memory data) = address(token).call(abi.encodeCall(IEIP3009.transfer, (to_, amount)));
         if (!ok) {
             if (data.length == 0) revert TransferFailed();
-            assembly {
+            // Bubble the original revert reason rather than masking it.
+            assembly ("memory-safe") {
                 revert(add(data, 0x20), mload(data))
             }
         }
-        if (data.length != 0 && !abi.decode(data, (bool))) revert TransferFailed();
+        if (data.length == 0 && address(token).code.length == 0) revert TransferFailed();
+        if (data.length != 0 && (data.length < 32 || !abi.decode(data, (bool)))) revert TransferFailed();
     }
 }
