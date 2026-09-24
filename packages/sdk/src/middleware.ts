@@ -1,26 +1,18 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
-import { PaymentPayloadSchema } from 'x402/types'
-import type { PaymentPayload } from 'x402/types'
+import { PaymentPayloadSchema, VerifyResponseSchema } from 'x402/types'
+import type { PaymentPayload, VerifyResponse } from 'x402/types'
 import { buildRequirements } from './requirements.js'
-import { computeNonce } from './nonce.js'
+import { computeNonce, normalizeNonce } from './nonce.js'
 import { InMemoryChallengeStore } from './challengeStore.js'
-import type { ChallengeStore } from './challengeStore.js'
+import type { ChallengeStore, CachedChallenge } from './challengeStore.js'
 import type { Anychain402Config, PaymentRequirements } from './types.js'
 
-/**
- * Shape of a facilitator's `POST /verify` response, per x402's
- * `VerifyResponseSchema`. Not imported from `x402/types` because we only
- * read two fields and never construct or validate a value against it — the
- * facilitator is Task 7's concern, this middleware just trusts its answer
- * (a network/HTTP-level failure is handled separately, see `callVerify`).
- */
-interface VerifyResponse {
-  isValid: boolean
-  invalidReason?: string
-  payer?: string
-}
-
 const DEFAULT_TIMEOUT_SECONDS = 300
+
+/** Timeout for the facilitator's `/verify` round trip. A facilitator that
+ *  hangs (rather than erroring quickly) must not hang this request forever
+ *  — see the task-6 review's I3. */
+const VERIFY_TIMEOUT_MS = 5_000
 
 export interface Anychain402Options {
   /**
@@ -67,27 +59,74 @@ export interface Anychain402Options {
  * `resource` (the requested URL). That collapses under ordinary concurrency:
  * two payers requesting the same protected endpoint at close to the same
  * time would get two different `paymentId`s, but the *second* challenge
- * would overwrite the first's cache entry — so the first payer's
- * subsequently-submitted payment, signed against a nonce derived from their
- * own `paymentId`, would be looked up against the *second* payer's
- * `paymentId` and (correctly) fail to match. Two users hitting one paid
- * endpoint is the ordinary case for an API, not a corner one; keying by
- * `resource` made this middleware reliable only at a concurrency of one.
- *
- * The fix: at challenge time, this middleware already knows exactly which
- * nonce a payer would have to sign to pay each issued `PaymentRequirements`
- * entry — `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)` —
- * so it stores one `ChallengeStore` entry per entry (one per accepted
- * chain), keyed by that nonce. On the payment path, the payer's own
+ * would overwrite the first's cache entry. The fix: at challenge time, this
+ * middleware already knows exactly which nonce a payer would have to sign to
+ * pay each issued `PaymentRequirements` entry —
+ * `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)` — so it
+ * stores one `ChallengeStore` entry per entry (one per accepted chain),
+ * keyed by that nonce (always normalized to lowercase — see `normalizeNonce`
+ * — since x402's schema permits mixed-case hex but a `bytes32` has no
+ * casing on-chain). On the payment path, the payer's own
  * `authorization.nonce` is an exact key into that store: no guessing via
- * `resource`, no collision between concurrent payers (different `paymentId`s
- * hash to different nonces), and a nonce with no matching entry means
- * exactly one thing — "no such outstanding challenge" — rather than
- * "someone else's challenge overwrote yours."
+ * `resource`, no collision between concurrent payers.
+ *
+ * ## One challenge, one payment: consume, don't just verify
+ *
+ * A `ChallengeStore` entry is a bearer credential once its nonce is known —
+ * whoever can replay a valid `X-PAYMENT` header can replay it again. Nothing
+ * about a successful `/verify` prevents that on its own: `/verify` is a
+ * stateless signature/shape check, and `Escrow`'s on-chain nonce tracking
+ * only ever runs at *settlement*, which this function does not perform (see
+ * "known limitations" below). Without an explicit step here, one signed
+ * authorization would buy unlimited calls to the protected route for the
+ * entire `maxTimeoutSeconds` window.
+ *
+ * So a payment that passes every local check is `store.consume`d —
+ * atomically returned-and-removed — immediately before calling `/verify`,
+ * not `get` followed by a separate `delete` after. `get`-then-`delete` would
+ * leave a window where several concurrent replays of the identical header
+ * all observe the entry as present (via `get`) before any one of them
+ * removes it, so several would independently pass verification. `consume`
+ * closes that window: at most one caller ever receives the entry back: every
+ * concurrent or later `consume` of the same nonce gets `undefined`.
+ *
+ * Consuming happens optimistically, before we know whether the facilitator
+ * will actually approve the payment. If it turns out NOT to be valid — a
+ * facilitator network/HTTP error, or an explicit `isValid: false` — the
+ * consumed entry is reinstated (`store.set` with the same data) rather than
+ * left gone, deliberately: nothing was actually collected in either case (no
+ * on-chain settlement has happened), so there is no reason to force the
+ * payer to fetch a brand-new challenge (a new price commitment) just because
+ * our own infrastructure hiccuped, or to make an honest retry-with-a-corrected-signature
+ * impossible after a rejected attempt. Only a confirmed `isValid: true`
+ * permanently retires the challenge.
+ *
+ * Checks that can be answered locally (resource match, network match, the
+ * authorization's value/recipient/time-window) run BEFORE `consume`, against
+ * a read-only `get` — a payload that fails one of these was never a genuine
+ * attempt at this specific challenge, so there is nothing to consume or
+ * reinstate; the challenge simply remains available for a corrected retry.
  *
  * A payment that arrives with an unrecognized nonce (never issued, already
- * expired) fails closed: `402` with a *freshly* issued challenge and
- * `error: 'payment_expired'`, without ever calling the facilitator.
+ * consumed, already expired) fails closed: `402` with a *freshly* issued
+ * challenge and `error: 'payment_expired'`, without ever calling the
+ * facilitator.
+ *
+ * ## Local floor checks
+ *
+ * `maxAmountRequired`, `payTo`, and the authorization's time window are all
+ * inputs this middleware already has in hand once it has looked up the
+ * matching `PaymentRequirements` — there is no reason to spend a network
+ * round trip to a facilitator (a separate trust domain, reachable at a
+ * configured URL) to reject a payload that authorizes too little value, pays
+ * the wrong address, or has already expired. These are checked locally
+ * before `consume`. There is deliberately no separate "asset" check: x402's
+ * exact-evm `authorization` carries no asset field at all — the token is
+ * pinned implicitly by `payTo`, since in this v1 design each `Escrow` is
+ * deployed against one immutable token (`Escrow.token` is set at
+ * construction and never changes), so an authorization paying the correct
+ * `payTo` cannot be paying a different asset than the one that `Escrow`
+ * accepts.
  *
  * KNOWN LIMITATIONS (accepted for this task's slice, see the task-6 report):
  * - The default `InMemoryChallengeStore` is in-memory and per process. It
@@ -97,17 +136,17 @@ export interface Anychain402Options {
  *   expired. Pass `{ store }` with a shared implementation (Redis, a
  *   database) to fix this; `anychain402`'s signature does not need to
  *   change.
- * - This function only calls `/verify`, never `/settle`. Preventing the same
- *   verified-but-unsettled payload from being replayed against `/verify`
- *   twice is explicitly out of scope here — the `Escrow` contract's
- *   single-use nonce is the actual double-spend defense at settlement time.
+ * - This function only calls `/verify`, never `/settle`. Double-*collection*
+ *   protection (the same authorization being settled on-chain twice) is the
+ *   `Escrow` contract's single-use nonce, at settlement time — out of scope
+ *   here. What IS in scope here, and implemented, is double-*service*
+ *   protection: consuming the challenge on first use means a replayed
+ *   `X-PAYMENT` header cannot buy a second response, independent of
+ *   whatever happens (or doesn't) at settlement.
  * - A malformed or schema-invalid `X-PAYMENT` cannot be correlated to any
  *   outstanding challenge (there is no nonce to look up yet), so it is
  *   answered with a freshly-minted challenge rather than the one — if any —
- *   the payer actually intended to pay against. This is unavoidable without
- *   also authenticating challenge issuance, which is out of scope here; see
- *   the report for the (pre-existing, not newly introduced) resource
- *   implication of minting on every such attempt.
+ *   the payer actually intended to pay against.
  */
 export function anychain402(config: Anychain402Config, options: Anychain402Options = {}): RequestHandler {
   const store = options.store ?? new InMemoryChallengeStore()
@@ -116,19 +155,34 @@ export function anychain402(config: Anychain402Config, options: Anychain402Optio
     const requirements = buildRequirements(config, resource)
     const maxTimeoutSeconds = requirements[0]?.maxTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS
     const expiresAt = Date.now() + maxTimeoutSeconds * 1000
-    await Promise.all(
-      requirements.map((requirement) => {
-        const nonce = computeNonce(
-          requirement.extra?.merchantEvm as `0x${string}`,
-          requirement.extra?.paymentId as `0x${string}`,
-        )
-        return store.set(nonce, { requirement, accepts: requirements, expiresAt })
-      }),
-    )
+    try {
+      await Promise.all(
+        requirements.map((requirement) => {
+          const nonce = computeNonce(
+            requirement.extra?.merchantEvm as `0x${string}`,
+            requirement.extra?.paymentId as `0x${string}`,
+          )
+          return store.set(nonce, { requirement, accepts: requirements, resource, expiresAt })
+        }),
+      )
+    } catch {
+      // A store backed by something remote (Redis, a database) can fail on
+      // its own terms. The challenge we hand back may end up unredeemable
+      // (any payment against it will simply see "no such challenge" — a
+      // safe, if unhelpful, failure mode) but returning SOME valid 402 body
+      // beats letting this rejection propagate: on Express 4 (within our
+      // declared peer range) an async middleware's rejected promise is not
+      // forwarded anywhere, which would otherwise surface as an unhandled
+      // rejection and a hung request rather than a clean response.
+    }
     return requirements
   }
 
   function send402(res: Response, accepts: PaymentRequirements[], error?: string): void {
+    // A 402 challenge/rejection must never be cached by an intermediary —
+    // each one is tied to a fresh paymentId and, once consumed, to a
+    // specific one-time nonce.
+    res.set('Cache-Control', 'no-store')
     res.status(402).json(error === undefined ? { x402Version: 1, accepts } : { x402Version: 1, accepts, error })
   }
 
@@ -141,13 +195,22 @@ export function anychain402(config: Anychain402Config, options: Anychain402Optio
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ paymentPayload, paymentRequirements }),
+        signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
       })
       if (!verifyRes.ok) return { networkError: true }
-      return (await verifyRes.json()) as VerifyResponse
+      const json: unknown = await verifyRes.json()
+      // Parsed against x402's own VerifyResponseSchema, not an `as` cast —
+      // the facilitator is a separate trust domain reachable at a configured
+      // URL, and its response deserves the same "parse, don't hand-roll"
+      // treatment as the inbound X-PAYMENT payload (task-6 correction 1).
+      const parsed = VerifyResponseSchema.safeParse(json)
+      if (!parsed.success) return { networkError: true }
+      return parsed.data
     } catch {
-      // Facilitator unreachable, timed out, or returned unparseable JSON.
-      // Never let this reject the request handler — a down facilitator must
-      // fail the payment cleanly, not crash the route.
+      // Facilitator unreachable, timed out (including our own
+      // AbortSignal.timeout firing), or returned unparseable JSON. Never let
+      // this reject the request handler — a down facilitator must fail the
+      // payment cleanly, not crash the route.
       return { networkError: true }
     }
   }
@@ -191,11 +254,29 @@ export function anychain402(config: Anychain402Config, options: Anychain402Optio
       send402(res, await issueChallenge(resource), 'invalid_payload')
       return
     }
-    const nonce = paymentPayload.payload.authorization.nonce as `0x${string}`
+    const authorization = paymentPayload.payload.authorization
+    const nonce = normalizeNonce(authorization.nonce)
 
-    const cached = await store.get(nonce)
+    let cached: CachedChallenge | undefined
+    try {
+      cached = await store.get(nonce)
+    } catch {
+      send402(res, await issueChallenge(resource), 'unexpected_verify_error')
+      return
+    }
     if (!cached) {
       send402(res, await issueChallenge(resource), 'payment_expired')
+      return
+    }
+
+    // Resource binding: a challenge issued for one resource must never be
+    // honored for another, even under the same route mount (`resource`
+    // includes the full request URL, query string and all) and even if a
+    // shared store makes another route's challenge technically reachable.
+    // Without this, a nonce is only bound to a chain and a price - not to
+    // WHICH protected resource that price was for.
+    if (cached.resource !== resource) {
+      send402(res, cached.accepts, 'invalid_payment_requirements')
       return
     }
 
@@ -209,21 +290,74 @@ export function anychain402(config: Anychain402Config, options: Anychain402Optio
       return
     }
 
-    const verdict = await callVerify(paymentPayload, cached.requirement)
+    // Local floor checks - cheap, and every input is already in hand. A
+    // facilitator is a separate trust domain reachable over the network;
+    // there is no reason to ask it to reject what we can already reject.
+    if (BigInt(authorization.value) < BigInt(cached.requirement.maxAmountRequired)) {
+      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_value')
+      return
+    }
+    if (authorization.to.toLowerCase() !== cached.requirement.payTo.toLowerCase()) {
+      send402(res, cached.accepts, 'invalid_exact_evm_payload_recipient_mismatch')
+      return
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    if (Number(authorization.validAfter) > nowSeconds) {
+      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_valid_after')
+      return
+    }
+    if (Number(authorization.validBefore) <= nowSeconds) {
+      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_valid_before')
+      return
+    }
+
+    // Every check above was read-only (via `get`). Only now, immediately
+    // before the facilitator call, do we actually consume the challenge —
+    // see this function's doc comment ("consume, don't just verify") for why
+    // this is the precise point that must be atomic.
+    let consumed: CachedChallenge | undefined
+    try {
+      consumed = await store.consume(nonce)
+    } catch {
+      send402(res, await issueChallenge(resource), 'unexpected_verify_error')
+      return
+    }
+    if (!consumed) {
+      // Raced with another consumer of the same nonce (a genuine replay, or
+      // a concurrent duplicate request), or expired in the gap since `get`.
+      // Either way: no longer redeemable.
+      send402(res, await issueChallenge(resource), 'payment_expired')
+      return
+    }
+
+    const verdict = await callVerify(paymentPayload, consumed.requirement)
     if ('networkError' in verdict) {
-      send402(res, cached.accepts, 'unexpected_verify_error')
+      await reinstate(nonce, consumed)
+      send402(res, consumed.accepts, 'unexpected_verify_error')
       return
     }
 
     if (!verdict.isValid) {
-      send402(res, cached.accepts, verdict.invalidReason ?? 'invalid_payment')
+      await reinstate(nonce, consumed)
+      send402(res, consumed.accepts, verdict.invalidReason ?? 'invalid_payment')
       return
     }
 
     // Never log `paymentPayload` (carries the payer's signature) or the raw
     // X-PAYMENT header anywhere on this path — see the task-6 judgement
     // notes. res.locals is request-scoped app state, not a log sink.
-    res.locals.x402 = { payload: paymentPayload, requirements: cached.requirement, payer: verdict.payer }
+    res.locals.x402 = { payload: paymentPayload, requirements: consumed.requirement, payer: verdict.payer }
     next()
+  }
+
+  async function reinstate(nonce: `0x${string}`, entry: CachedChallenge): Promise<void> {
+    try {
+      await store.set(nonce, entry)
+    } catch {
+      // Best effort: if the store can't be written back to, the payer will
+      // see this challenge as expired on retry rather than reinstated. That
+      // is still fail-closed (no unintended access granted), just less
+      // convenient than a successful reinstatement would have been.
+    }
   }
 }

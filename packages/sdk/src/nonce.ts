@@ -47,3 +47,25 @@ export function computeNonce(merchantEvm: `0x${string}`, paymentId: `0x${string}
   const preimage = Buffer.concat([addressWord, paymentIdWord])
   return `0x${Buffer.from(keccak_256(preimage)).toString('hex')}`
 }
+
+/**
+ * Normalizes a payer-supplied EIP-3009 nonce to the canonical lowercase form
+ * `computeNonce` always produces, so a `ChallengeStore` lookup by nonce is
+ * never defeated by casing alone.
+ *
+ * `bytes32` has no casing on-chain — `0xAB…` and `0xab…` are the identical
+ * 32-byte value — but x402's own `PaymentPayloadSchema` validates
+ * `authorization.nonce` against `HexEncoded64ByteRegex`
+ * (`/^0x[0-9a-fA-F]{64}$/`), which accepts mixed and upper case. A store
+ * keyed on the raw, un-normalized string would silently miss a perfectly
+ * valid uppercase-hex nonce (the exact bug class the `computeNonce` golden
+ * vectors — including the EIP-55 checksummed-address one — exist to catch,
+ * one level lower in the same computation). Every nonce a `ChallengeStore`
+ * is asked to `get`/`set`/`consume` MUST pass through this function first.
+ */
+export function normalizeNonce(nonce: string): `0x${string}` {
+  if (!HEX_32_BYTE_RE.test(nonce)) {
+    throw new Error(`normalizeNonce: invalid nonce, expected a 32-byte 0x value, got ${nonce}`)
+  }
+  return nonce.toLowerCase() as `0x${string}`
+}

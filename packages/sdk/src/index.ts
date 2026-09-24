@@ -3,6 +3,6 @@ export { buildRequirements, parsePrice, generatePaymentId } from './requirements
 export type { BuildRequirementsOptions } from './requirements.js'
 export { anychain402 } from './middleware.js'
 export type { Anychain402Options } from './middleware.js'
-export { computeNonce } from './nonce.js'
+export { computeNonce, normalizeNonce } from './nonce.js'
 export { InMemoryChallengeStore } from './challengeStore.js'
 export type { ChallengeStore, CachedChallenge } from './challengeStore.js'

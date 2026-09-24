@@ -123,7 +123,12 @@ describe('anychain402 middleware', () => {
   })
 
   it('serves the route when the facilitator says the payment is valid', async () => {
-    const server = appWith({ isValid: true, payer: '0xabc' })
+    // A real 20-byte address, not a placeholder like '0xabc' - x402's
+    // VerifyResponseSchema validates `payer` against EvmAddressRegex
+    // (/^0x[0-9a-fA-F]{40}$/), so a short/invalid one fails the "parse,
+    // don't hand-roll" check middleware.ts now applies to /verify responses
+    // and would misreport as `unexpected_verify_error` here.
+    const server = appWith({ isValid: true, payer: '0xCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc' })
     const challengeRes = await request(server).get('/premium')
     const requirement = challengeRes.body.accepts[0] as PaymentRequirements
     const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
@@ -268,6 +273,202 @@ describe('anychain402 middleware', () => {
     })
   })
 
+  describe('replay protection (review C1: a consumed challenge must not grant unlimited service)', () => {
+    it('serves the route once, then rejects the identical X-PAYMENT header replayed a second time', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const first = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(first.status).toBe(200)
+      expect(first.body).toEqual({ ok: true })
+
+      // Same header, byte for byte - a bearer credential replay, not a new
+      // payment. Must not buy a second response even though the facilitator
+      // would (per this mock) happily say isValid: true again.
+      const second = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(second.status).toBe(402)
+      expect(second.body.error).toBe('payment_expired')
+      expect(second.body.accepts).toHaveLength(2)
+
+      // The replay was rejected locally, from the now-consumed challenge
+      // store - it never reached the facilitator a second time.
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('reinstates the challenge (does not burn it) when the facilitator rejects the payment', async () => {
+      // Consuming happens optimistically, before the verdict is known. A
+      // rejected (not merely replayed) payment must not permanently destroy
+      // the challenge - nothing was collected, so the payer gets to correct
+      // their signature and retry with the SAME nonce within the TTL.
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ isValid: false, invalidReason: 'insufficient_funds' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const rejected = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(rejected.status).toBe(402)
+      expect(rejected.body.error).toBe('insufficient_funds')
+
+      const retried = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(retried.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  describe('resource binding (review C2: a challenge for one resource must not pay for another)', () => {
+    it('rejects a challenge presented at a different resource than it was issued for', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium?id=1')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      // Same nonce, same everything - just a different resource string
+      // (`resource` includes the query string). The reviewer's probe used
+      // two distinct routes under one router mount; a differing query
+      // string reproduces the identical class of bug against a single route.
+      const res = await request(server).get('/premium?id=999').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_payment_requirements')
+      expect(res.body.accepts).toHaveLength(2)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('still honors the SAME challenge when presented back at the SAME resource it was issued for', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium?id=1')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      const res = await request(server).get('/premium?id=1').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('nonce casing (review I1: x402 permits mixed-case hex; bytes32 has no casing on-chain)', () => {
+    it('accepts a payment whose authorization.nonce is presented in uppercase hex', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const canonicalNonce = nonceFor(requirement)
+      const uppercaseNonce = (`0x${canonicalNonce.slice(2).toUpperCase()}`) as `0x${string}`
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', uppercaseNonce)
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+      // And the store key genuinely normalized rather than coincidentally
+      // matching: the /verify body still carries the original (lowercase)
+      // paymentId the challenge issued.
+      const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
+      const sentBody = JSON.parse(init.body as string)
+      expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirement.extra?.paymentId)
+    })
+  })
+
+  describe('local floor checks (review I2: do not delegate everything to the facilitator)', () => {
+    it('rejects an authorization whose value is below maxAmountRequired', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.value = '1' // maxAmountRequired is '10000'
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_exact_evm_payload_authorization_value')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('rejects an authorization paying an address other than the required payTo', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.to = '0xdEaDdEaDdEaDdEaDdEaDdEaDdEaDdEaDdEaDdEaD' // not the Escrow
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_exact_evm_payload_recipient_mismatch')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('rejects an authorization that has already expired (validBefore in the past)', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.validBefore = '1'
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_exact_evm_payload_authorization_valid_before')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('rejects an authorization that is not valid yet (validAfter in the future)', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.validAfter = '9999999999'
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('invalid_exact_evm_payload_authorization_valid_after')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('still accepts a well-formed authorization that pays MORE than maxAmountRequired', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      payload.payload.authorization.value = '20000' // more than the required 10000
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('malformed input handling', () => {
     it('returns 402 (not a thrown error) for a non-base64, non-JSON X-PAYMENT header', async () => {
       const server = appWith({})
@@ -304,9 +505,10 @@ describe('anychain402 middleware', () => {
 
   describe('facilitator failure handling', () => {
     it('returns a clean 402 (not an unhandled rejection) when the facilitator is unreachable', async () => {
-      globalThis.fetch = vi.fn(async () => {
+      const fetchSpy = vi.fn(async () => {
         throw new Error('ECONNREFUSED')
-      }) as any
+      })
+      globalThis.fetch = fetchSpy as any
       const server = buildApp()
 
       const challengeRes = await request(server).get('/premium')
@@ -316,10 +518,17 @@ describe('anychain402 middleware', () => {
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
       expect(res.body.accepts).toHaveLength(2)
+      expect(res.body.error).toBe('unexpected_verify_error')
+      // Pins that this genuinely exercised the facilitator-error path rather
+      // than short-circuiting on payment_expired before ever reaching fetch
+      // (the bug that silently made the pre-fix version of these two tests
+      // pass for the wrong reason - see the task-6 report).
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
 
     it('returns a clean 402 when the facilitator responds with a non-2xx status', async () => {
-      globalThis.fetch = vi.fn(async () => new Response('internal error', { status: 500 })) as any
+      const fetchSpy = vi.fn(async () => new Response('internal error', { status: 500 }))
+      globalThis.fetch = fetchSpy as any
       const server = buildApp()
 
       const challengeRes = await request(server).get('/premium')
@@ -329,6 +538,8 @@ describe('anychain402 middleware', () => {
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
       expect(res.body.accepts).toHaveLength(2)
+      expect(res.body.error).toBe('unexpected_verify_error')
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
   })
 })
