@@ -58,6 +58,27 @@ contract EscrowTest is Test {
         assertEq(usdc.balanceOf(payer), 1_000e6 - 10e6);
     }
 
+    /// @notice Fuzzed replay proof: no matter the settled amount, resubmitting
+    /// the exact same (auth, v, r, s) pair a second time must never credit
+    /// the merchant again. Replay protection lives in the token's per-nonce
+    /// `_authorizationStates` (see MockUSDC.receiveWithAuthorization), so the
+    /// expected revert selector belongs to MockUSDC, not Escrow.
+    function testFuzz_authorizationCannotBeReplayed(uint96 amountSeed) public {
+        uint256 value = bound(uint256(amountSeed), 1, 1_000e6);
+        bytes32 paymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory auth = _auth(merchant, paymentId, value);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(auth);
+
+        escrow.settleAuthorization(merchant, paymentId, auth, v, r, s);
+        assertEq(escrow.balanceOf(merchant), value);
+
+        vm.expectRevert(MockUSDC.AuthorizationAlreadyUsed.selector);
+        escrow.settleAuthorization(merchant, paymentId, auth, v, r, s);
+
+        assertEq(escrow.balanceOf(merchant), value);
+        assertEq(usdc.balanceOf(address(escrow)), value);
+    }
+
     /// @notice C1 regression: the payer's signature binds `merchant` into the
     /// nonce (nonce == keccak256(abi.encode(merchant, paymentId))). Replaying
     /// the exact same (auth, v, r, s) against a different `merchant` argument
@@ -72,6 +93,37 @@ contract EscrowTest is Test {
         address attacker = address(0xA77AC4);
         vm.expectRevert(Escrow.MerchantNotBound.selector);
         escrow.settleAuthorization(attacker, paymentId, auth, v, r, s);
+    }
+
+    /// @notice C1 regression, fuzzed: the single hand-picked `attacker` above
+    /// proves the property once. This proves it for the whole address space
+    /// (minus the trivial signedMerchant == submittedMerchant case) and every
+    /// (paymentId, amount) combination -- an authorization signed for
+    /// `signedMerchant` must never settle to any other address. This is the
+    /// regression barrier for the critical flaw found in Task 2: without the
+    /// on-chain nonce binding, anyone holding a signed payload could redirect
+    /// the credit to themselves.
+    function testFuzz_settleAuthorization_merchantBindingRejectsMismatch(
+        address signedMerchant,
+        address submittedMerchant,
+        uint256 paymentIdSeed,
+        uint96 amountSeed
+    ) public {
+        vm.assume(signedMerchant != address(0));
+        vm.assume(submittedMerchant != address(0));
+        vm.assume(signedMerchant != submittedMerchant);
+
+        uint256 value = bound(uint256(amountSeed), 1, 1_000e6);
+        bytes32 paymentId = bytes32(paymentIdSeed);
+
+        Escrow.Authorization memory auth = _auth(signedMerchant, paymentId, value);
+        (uint8 v, bytes32 r, bytes32 s) = _sign(auth);
+
+        vm.expectRevert(Escrow.MerchantNotBound.selector);
+        escrow.settleAuthorization(submittedMerchant, paymentId, auth, v, r, s);
+
+        assertEq(escrow.balanceOf(signedMerchant), 0);
+        assertEq(escrow.balanceOf(submittedMerchant), 0);
     }
 
     function test_settleAuthorization_revertsOnRecipientMismatch() public {
