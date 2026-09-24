@@ -132,3 +132,79 @@ describe('verifyPayment — client/domain caching (I3)', () => {
     expect(afterRpcDied.payer).toBe(ANVIL_PAYER_ADDRESS)
   })
 })
+
+describe('verifyPayment — domain cache keyed by rpcUrl (task-8 review round 1, M-c)', () => {
+  let chainA: AnvilFixture
+  let chainB: AnvilFixture
+
+  beforeAll(async () => {
+    // Both `startAnvilWithDomainToken` calls use the SAME default deployer
+    // (`ANVIL_DEPLOYER_PRIVATE_KEY`, account #0) and each deploys its
+    // first-ever contract on a fresh, independent chain. A CREATE address
+    // depends only on `(sender, nonce)`, never on chain id, so these two
+    // otherwise-unrelated tokens land on the byte-IDENTICAL address despite
+    // genuinely different domains (`name`/`version`) and independent RPC
+    // endpoints — deliberately reproducing the exact collision a
+    // `domainCache` keyed by `(chainId, asset)` ALONE would conflate: both
+    // instances also share the identical `chainId` (84532, the shared
+    // default), so `(chainId, asset)` is indistinguishable between them.
+    // `rpcUrl` is the only thing that actually tells them apart.
+    ;[chainA, chainB] = await Promise.all([
+      startAnvilWithDomainToken({ name: 'Chain A Token', version: '1' }),
+      startAnvilWithDomainToken({ name: 'Chain B Token', version: '2' }),
+    ])
+  }, 30_000)
+
+  afterAll(async () => {
+    await Promise.all([chainA?.stop(), chainB?.stop()])
+  })
+
+  it('reads each chain’s own domain even though both tokens share a (chainId, asset) identity', async () => {
+    // Confirms the setup actually reproduces the collision this test exists
+    // to guard against — if this ever stops holding (e.g. anvil changes its
+    // CREATE nonce bookkeeping), the test below would pass VACUOUSLY.
+    expect(chainA.tokenAddress).toBe(chainB.tokenAddress)
+    expect(chainA.chainId).toBe(chainB.chainId)
+
+    const authA = authFields()
+    const signatureA = await signAuthorization({
+      privateKey: ANVIL_PAYER_PRIVATE_KEY,
+      tokenAddress: chainA.tokenAddress,
+      tokenName: 'Chain A Token',
+      tokenVersion: '1',
+      chainId: chainA.chainId,
+      authorization: authA,
+    })
+    const authB = authFields()
+    const signatureB = await signAuthorization({
+      privateKey: ANVIL_PAYER_PRIVATE_KEY,
+      tokenAddress: chainB.tokenAddress,
+      tokenName: 'Chain B Token',
+      tokenVersion: '2',
+      chainId: chainB.chainId,
+      authorization: authB,
+    })
+
+    // Query chain A first — this is what populates the domain cache entry
+    // for the shared (chainId, asset) pair. A cache keyed WITHOUT rpcUrl
+    // would then silently serve chain A's {name: "Chain A Token", version:
+    // "1"} domain for chain B's query below too, recovering the wrong
+    // signer and failing signature verification for a perfectly valid,
+    // correctly-signed chain-B payload.
+    const resultA = await verifyPayment(
+      buildPayload({ network: 'base-sepolia', signature: signatureA, authorization: authA }),
+      requirementsFor(chainA.tokenAddress),
+      { rpcUrl: chainA.rpcUrl },
+    )
+    expect(resultA.isValid).toBe(true)
+    expect(resultA.payer).toBe(ANVIL_PAYER_ADDRESS)
+
+    const resultB = await verifyPayment(
+      buildPayload({ network: 'base-sepolia', signature: signatureB, authorization: authB }),
+      requirementsFor(chainB.tokenAddress),
+      { rpcUrl: chainB.rpcUrl },
+    )
+    expect(resultB.isValid).toBe(true)
+    expect(resultB.payer).toBe(ANVIL_PAYER_ADDRESS)
+  })
+})

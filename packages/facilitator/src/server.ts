@@ -12,6 +12,34 @@ import type { Hex } from 'viem'
  */
 const MAX_REQUEST_BODY_SIZE = '16kb'
 
+/**
+ * A syntactically valid member of `SettleResponseSchema`'s `network` enum,
+ * used ONLY as a last-resort placeholder in an error response when a
+ * genuinely malformed request gives no way to know which network the caller
+ * actually meant (task-8 review round 1, M-a). Not a claim about which chain
+ * was actually involved — there is no way to make that claim honestly for a
+ * body that failed to parse at all — just the least-arbitrary choice
+ * available: this facilitator's own real deployment target in this slice.
+ */
+const UNKNOWN_NETWORK_PLACEHOLDER = 'base-sepolia'
+
+/**
+ * Best-effort recovery of the caller's intended `network` for an error
+ * response, without ever echoing unvalidated caller JSON back to them
+ * (task-8 review round 1, M-a): a bare `req.body?.paymentPayload?.network ??
+ * ''` both fails `SettleResponseSchema`'s strict network enum (so a strict
+ * client parsing our own error response would itself reject it) AND echoes
+ * whatever the caller put there verbatim — including an object, an array, or
+ * a script-bearing string, none of which `SettleRequestSchema` has
+ * necessarily rejected yet at the point this runs. Checking `candidate`
+ * against `SettleResponseSchema`'s OWN `network` sub-schema means only one of
+ * the finite, known-safe enum values can ever come back from this function.
+ */
+function safeNetworkOrPlaceholder(candidate: unknown): string {
+  const parsed = SettleResponseSchema.shape.network.safeParse(candidate)
+  return parsed.success ? parsed.data : UNKNOWN_NETWORK_PLACEHOLDER
+}
+
 export interface FacilitatorAppOptions {
   /**
    * Per-network RPC endpoint overrides, used to read each token's EIP-712
@@ -98,7 +126,8 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
   app.post('/settle', async (req, res) => {
     const parsedRequest = SettleRequestSchema.safeParse(req.body)
     if (!parsedRequest.success) {
-      res.status(400).json({ success: false, errorReason: 'invalid_payload', transaction: '', network: req.body?.paymentPayload?.network ?? '' })
+      const network = safeNetworkOrPlaceholder((req.body as { paymentPayload?: { network?: unknown } } | undefined)?.paymentPayload?.network)
+      res.status(400).json({ success: false, errorReason: 'invalid_payload', transaction: '', network })
       return
     }
 
@@ -150,7 +179,8 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
   // `{isValid, invalidReason}` shape, and a needless information leak to
   // an unauthenticated caller.
   //
-  // The error itself is deliberately never inspected or logged: for a
+  // The error's `status`/`statusCode` is read (see below), but it is
+  // deliberately never LOGGED, and no other field of it is inspected: for a
   // malformed-JSON body specifically, `body-parser` (which `express.json`
   // wraps) attaches the raw request body to `err.body` — the same payload
   // this module's "never log the payload" rule exists to protect — so
@@ -163,13 +193,34 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
   // `transaction`/`network` fields `/verify`'s shape doesn't have, so a
   // single hardcoded shape here would itself fail `/settle` callers'
   // parsing of a legitimate error response.
+  //
+  // The match is a case-insensitive, trailing-slash-tolerant REGEX, not a
+  // bare `===` (task-8 review round 1, M-b): Express's own route matching is
+  // case-insensitive and trailing-slash-tolerant by default (`caseSensitive:
+  // false`, `strict: false`), so `/settle/` and `/SETTLE` are both routed to
+  // the `/settle` handler above — but a JSON-parse failure never reaches that
+  // handler (body-parser's error skips straight to this middleware via
+  // `next(err)`), and `req.path` here is the RAW inbound path, unnormalized.
+  // A strict `===` would send `/verify`'s shape for those two variants,
+  // which x402's own client rejects outright for `/settle`.
+  //
+  // `err.status`/`err.statusCode` is honored, not hardcoded to 400
+  // (task-8 review round 1, M-b): `body-parser`'s own `PayloadTooLargeError`
+  // (a body over `MAX_REQUEST_BODY_SIZE`) carries `status`/`statusCode: 413`;
+  // flattening that to 400 would misreport a size-limit rejection as a
+  // generic bad-request to any caller that branches on status code.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  app.use((_err: unknown, req: Request, res: Response, _next: NextFunction) => {
-    if (req.path === '/settle') {
-      res.status(400).json({ success: false, errorReason: 'invalid_payload', transaction: '', network: '' })
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const status = (() => {
+      const candidate = (err as { status?: unknown; statusCode?: unknown } | undefined)?.status ?? (err as { statusCode?: unknown } | undefined)?.statusCode
+      return typeof candidate === 'number' && candidate >= 400 && candidate < 600 ? candidate : 400
+    })()
+    if (/^\/settle\/?$/i.test(req.path)) {
+      const network = safeNetworkOrPlaceholder((req.body as { paymentPayload?: { network?: unknown } } | undefined)?.paymentPayload?.network)
+      res.status(status).json({ success: false, errorReason: 'invalid_payload', transaction: '', network })
       return
     }
-    res.status(400).json({ isValid: false, invalidReason: 'invalid_payload' })
+    res.status(status).json({ isValid: false, invalidReason: 'invalid_payload' })
   })
 
   return app

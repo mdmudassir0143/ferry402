@@ -8,7 +8,10 @@ import {
   http,
   isAddress,
   isAddressEqual,
+  keccak256,
+  parseEventLogs,
   recoverAddress,
+  toBytes,
   zeroAddress,
   type Address,
   type Hex,
@@ -191,9 +194,25 @@ function addressesEqual(a: string, b: string): boolean {
 //   once, the first time a given `(network, rpcUrl)` pair is used, and the
 //   result is memoized. Later calls reuse the cached verdict instead of
 //   repeating the `eth_chainId` round trip.
-// - `{name, version}` is memoized per `(chainId, asset)`: a token's EIP-712
+// - `{name, version}` is memoized per `(chainId, rpcUrl, asset)`: a token's EIP-712
 //   domain fields are immutable for the life of the contract, so there is
 //   no reason to re-read them on every call.
+//
+//   `rpcUrl` is part of that key (task-8 review round 1, M-c) — it was NOT,
+//   originally, and `clientCacheKey` below already included it, which left
+//   the two caches disagreeing about what identifies "a chain": `chainId`
+//   ALONE is caller-declared and not globally unique in practice (any two
+//   independent chains that happen to declare the same id — e.g. two
+//   separate local/test networks both started as `base-sepolia`'s `84532` —
+//   collide here). Since a CREATE address depends only on `(sender, nonce)`,
+//   never chain id, two such chains can easily hold DIFFERENT tokens at the
+//   IDENTICAL address, and without `rpcUrl` in the key this cache would
+//   silently serve one token's `{name, version}` for the other — building a
+//   signing domain against the wrong token and failing every signature
+//   recovery with no indication why. This is exactly how a test-fixture bug
+//   surfaced during Task 8 (see `settle.fork.test.ts`'s history); fixing the
+//   cache key here removes the underlying hazard for any future caller,
+//   rather than leaving it to every fixture's choice of deployer key.
 //
 // Both caches are process-lifetime, unbounded maps. That's acceptable here:
 // keys are bounded by the number of (network, rpcUrl) pairs this process is
@@ -217,48 +236,100 @@ function addressesEqual(a: string, b: string): boolean {
 // more general `ReturnType<typeof createPublicClient>`) — one concrete
 // instantiation, referenced consistently, sidesteps the hazard entirely
 // rather than papering over it with `any`.
-function createChainClient(chain: (typeof SUPPORTED_CHAINS)[Task7Network], rpcUrl: string | undefined) {
-  // Short timeout/no retries: `/verify` is on the hot path of an
-  // unauthenticated HTTP endpoint (`paymentRequirements` is caller-supplied
-  // and satisfies checks 1-4 trivially — see I3 in the task-7 review), so a
-  // stalled upstream RPC must fail fast rather than hold the request for
-  // anywhere near viem's defaults (10s timeout * 3 retries ≈ 40s),
-  // especially since `anychain402`'s own middleware already gives up on
-  // `/verify` at 5s.
-  return createPublicClient({ chain, transport: http(rpcUrl, { timeout: 2_000, retryCount: 1 }) })
+/**
+ * `/verify`'s own transport tuning: short timeout, no retries. `/verify` is
+ * on the hot path of an unauthenticated HTTP endpoint (`paymentRequirements`
+ * is caller-supplied and satisfies checks 1-4 trivially — see I3 in the
+ * task-7 review), so a stalled upstream RPC must fail fast rather than hold
+ * the request for anywhere near viem's defaults (10s timeout * 3 retries ≈
+ * 40s), especially since `anychain402`'s own middleware already gives up on
+ * `/verify` at 5s.
+ */
+const VERIFY_TRANSPORT_OPTIONS = { timeout: 2_000, retryCount: 1 } as const
+
+/**
+ * `/settle`'s own transport tuning (task-8 review round 1, I2) — deliberately
+ * NOT `VERIFY_TRANSPORT_OPTIONS`. `settlePayment` reuses this same client for
+ * `waitForTransactionReceipt`, which polls this transport for up to its own,
+ * much longer timeout (default 180s) while a real transaction gets mined —
+ * there is no hot-path reason to keep verify's aggressive 2s cutoff here, and
+ * keeping it would be actively harmful: in viem 2.56.8, `waitForTransactionReceipt`
+ * treats any transport error OTHER than "not found yet" as fatal to the
+ * whole wait (`done(() => emit.reject(err))` — it does not retry the poll,
+ * it abandons waiting entirely). A single slow round trip against a live RPC
+ * — likely, not a tail case, across the ~45 polls a real settlement can take
+ * — would report an already-settled payment as `success: false`. These
+ * values are simply viem's OWN `http()` defaults, spelled out explicitly
+ * rather than left implicit, since settle has no latency pressure that would
+ * justify overriding them the way `/verify` does.
+ */
+const SETTLE_TRANSPORT_OPTIONS = { timeout: 10_000, retryCount: 3 } as const
+
+type ClientProfile = 'verify' | 'settle'
+
+// Deliberately NOT annotated with viem's `PublicClient`/`Chain` types: this
+// workspace currently resolves more than one physically-distinct install of
+// `viem`/`ox` (visible as multiple `zod@...`-suffixed variants under
+// node_modules/.pnpm — a pnpm peer-dependency fork, not a version
+// mismatch). Naming one of those types explicitly forces TypeScript to
+// check assignability against whichever copy — or whichever generic
+// overload of `createPublicClient` — that reference happened to resolve
+// to, which can differ from the one actually instantiated below, producing
+// a spurious "two different types with this name exist, but they are
+// unrelated" error despite both being the identical published type. Every
+// client this module ever creates flows through this ONE function, and
+// every other function that needs a client's type derives it from THIS
+// function specifically (`ReturnType<typeof createChainClient>`, not the
+// more general `ReturnType<typeof createPublicClient>`) — one concrete
+// instantiation, referenced consistently, sidesteps the hazard entirely
+// rather than papering over it with `any`.
+function createChainClient(
+  chain: (typeof SUPPORTED_CHAINS)[Task7Network],
+  rpcUrl: string | undefined,
+  transportOptions: { timeout: number; retryCount: number },
+) {
+  return createPublicClient({ chain, transport: http(rpcUrl, transportOptions) })
 }
 
 interface CachedClient {
   client: ReturnType<typeof createChainClient>
-  /** Resolves once — the first time this (network, rpcUrl) pair is used —
-   *  to whether the RPC's actual chain id matches `chain.id`. Awaited on
-   *  every call, but the underlying `eth_chainId` request only ever fires
-   *  once per pair. */
+  /** Resolves once — the first time this (network, rpcUrl, profile) triple is
+   *  used — to whether the RPC's actual chain id matches `chain.id`. Awaited
+   *  on every call, but the underlying `eth_chainId` request only ever fires
+   *  once per triple. */
   chainIdVerified: Promise<boolean>
 }
 
 const clientCache = new Map<string, CachedClient>()
 const domainCache = new Map<string, { name: string; version: string }>()
 
-function clientCacheKey(network: string, rpcUrl: string | undefined): string {
-  return `${network}::${rpcUrl ?? ''}`
+// `profile` is part of the key: `/verify` and `/settle` deliberately use
+// DIFFERENT transport tuning (see `VERIFY_TRANSPORT_OPTIONS`/
+// `SETTLE_TRANSPORT_OPTIONS` above) against the very same `(network, rpcUrl)`
+// pair, and a shared cache entry would silently hand settle's long-lived
+// receipt wait the same 2-second, no-retry transport verify's hot path
+// needs — reintroducing I2 through the cache instead of the constructor.
+function clientCacheKey(network: string, rpcUrl: string | undefined, profile: ClientProfile): string {
+  return `${network}::${rpcUrl ?? ''}::${profile}`
 }
 
-function domainCacheKey(chainId: number, asset: Address): string {
-  return `${chainId}::${asset.toLowerCase()}`
+function domainCacheKey(chainId: number, rpcUrl: string | undefined, asset: Address): string {
+  return `${chainId}::${rpcUrl ?? ''}::${asset.toLowerCase()}`
 }
 
 async function getVerifiedClient(
   network: Task7Network,
   chain: (typeof SUPPORTED_CHAINS)[Task7Network],
   rpcUrl: string | undefined,
+  profile: ClientProfile,
 ) {
-  const key = clientCacheKey(network, rpcUrl)
+  const key = clientCacheKey(network, rpcUrl, profile)
   const existing = clientCache.get(key)
   const entry: CachedClient =
     existing ??
     (() => {
-      const client = createChainClient(chain, rpcUrl)
+      const transportOptions = profile === 'verify' ? VERIFY_TRANSPORT_OPTIONS : SETTLE_TRANSPORT_OPTIONS
+      const client = createChainClient(chain, rpcUrl, transportOptions)
       const chainIdVerified = client
         .getChainId()
         .then((liveChainId) => liveChainId === chain.id)
@@ -281,9 +352,10 @@ async function getVerifiedClient(
 async function getTokenDomain(
   client: ReturnType<typeof createChainClient>,
   chainId: number,
+  rpcUrl: string | undefined,
   asset: Address,
 ): Promise<{ name: string; version: string } | undefined> {
-  const key = domainCacheKey(chainId, asset)
+  const key = domainCacheKey(chainId, rpcUrl, asset)
   const cached = domainCache.get(key)
   if (cached) return cached
   try {
@@ -480,7 +552,7 @@ export async function verifyPayment(
   if (!chain) {
     return { isValid: false, invalidReason: 'invalid_network' }
   }
-  const client = await getVerifiedClient(requirements.network as Task7Network, chain, options.rpcUrl)
+  const client = await getVerifiedClient(requirements.network as Task7Network, chain, options.rpcUrl, 'verify')
   if (!client) {
     // Either the RPC was unreachable, or it reported a chain id that
     // doesn't match `chain.id` — see `getVerifiedClient`'s doc comment.
@@ -489,7 +561,7 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'unexpected_verify_error' }
   }
 
-  const tokenDomain = await getTokenDomain(client, chain.id, assetAddress)
+  const tokenDomain = await getTokenDomain(client, chain.id, options.rpcUrl, assetAddress)
   if (!tokenDomain) {
     return { isValid: false, invalidReason: 'unexpected_verify_error' }
   }
@@ -529,17 +601,19 @@ export async function verifyPayment(
 
 /**
  * The minimal ABI `settlePayment` needs against `Escrow.sol`: the one
- * function it calls, plus every custom error `Escrow.sol` can revert with
- * (see `packages/contracts/src/Escrow.sol`). Hand-written rather than
- * imported from a build artifact — this facilitator has exactly one contract
- * it ever calls, and hand-writing the handful of entries it actually uses
- * avoids a build-time dependency from `@anychain402/facilitator` on
- * `@anychain402/contracts`' compiled output. Declaring the errors here (not
- * just the function) matters for more than documentation: viem's own revert
- * decoding (`decodeErrorResult`, used internally by
- * `ContractFunctionRevertedError`) only recognizes a custom error if its
- * signature is present in the ABI passed to the call that reverted — see
- * `decodeSettleRevert`'s doc comment.
+ * function it calls, the `PaymentSettled` event it must observe to prove that
+ * call actually credited a merchant (see requirement C1 in the task-8 review,
+ * and `settlePayment`'s own doc comment), plus every custom error
+ * `Escrow.sol` can revert with (see `packages/contracts/src/Escrow.sol`).
+ * Hand-written rather than imported from a build artifact — this facilitator
+ * has exactly one contract it ever calls, and hand-writing the handful of
+ * entries it actually uses avoids a build-time dependency from
+ * `@anychain402/facilitator` on `@anychain402/contracts`' compiled output.
+ * Declaring the errors here (not just the function) matters for more than
+ * documentation: viem's own revert decoding (`decodeErrorResult`, used
+ * internally by `ContractFunctionRevertedError`) only recognizes a custom
+ * error if its signature is present in the ABI passed to the call that
+ * reverted — see `decodeSettleRevert`'s doc comment.
  */
 const ESCROW_SETTLE_ABI = [
   {
@@ -566,6 +640,17 @@ const ESCROW_SETTLE_ABI = [
       { name: 's', type: 'bytes32' },
     ],
     outputs: [],
+  },
+  {
+    type: 'event',
+    name: 'PaymentSettled',
+    anonymous: false,
+    inputs: [
+      { name: 'merchant', type: 'address', indexed: true },
+      { name: 'payer', type: 'address', indexed: true },
+      { name: 'value', type: 'uint256', indexed: false },
+      { name: 'nonce', type: 'bytes32', indexed: false },
+    ],
   },
   { type: 'error', name: 'Reentrancy', inputs: [] },
   { type: 'error', name: 'RecipientMismatch', inputs: [] },
@@ -633,6 +718,25 @@ export interface SettleResult {
    *  before a hash existed). */
   transaction: string
   network: string
+  /**
+   * The OBSERVED on-chain credit — `Escrow.sol`'s own `PaymentSettled.value`,
+   * i.e. `balanceOf(after) - balanceOf(before)` on the token, never
+   * `auth.value` (see `Escrow.sol`'s doc comment on `settleAuthorization`,
+   * and this task's requirement C1) — and the nonce it was recorded against.
+   * Present only when `success` is true.
+   *
+   * Deliberately an IN-PROCESS-ONLY field (task-8 review round 1, I1):
+   * `SettleResponseSchema` is a fixed x402 wire contract this facilitator
+   * must not extend, and it is `.strip()`-validated in `server.ts`, so
+   * `POST /settle`'s HTTP response never carries this even though it is
+   * present on the value `settlePayment` returns. A future in-process caller
+   * within this SAME facilitator (e.g. an HCS journal writer, per Amendment
+   * 2's fee-on-transfer-token scope) can read the observed delta directly
+   * here instead of re-fetching this receipt by hash over RPC — a second,
+   * avoidable failure point for data this call already has.
+   */
+  settledAmount?: bigint
+  nonce?: Hex
 }
 
 /** Best-effort label for an on-chain revert or submission failure, used only
@@ -645,11 +749,39 @@ interface DecodedSettleFailure {
   label: string
 }
 
+/** Computes a raw 4-byte error/function selector from its canonical Solidity
+ *  signature string (`"Name(type,type,...)"`) — the first 4 bytes of
+ *  `keccak256` of the signature, identical for both functions and errors
+ *  (Solidity derives both the same way). Used, not guessed: every selector
+ *  this module recognizes is computed from an explicit signature string
+ *  right next to its use, so it is independently verifiable rather than a
+ *  bare hex literal someone has to trust. */
+function computeErrorSelector(signature: string): Hex {
+  return keccak256(toBytes(signature)).slice(0, 10) as Hex
+}
+
+/**
+ * A deliberately small, best-effort registry of raw 4-byte selectors for
+ * "this authorization/nonce was already used" CUSTOM errors used by common
+ * EIP-3009 implementations that are NOT decodable via the standard
+ * `Error(string)` tier (see `decodeSettleRevert`'s tier 2) — real USDC
+ * (`FiatTokenV2`) reverts with a plain STRING
+ * ("FiatTokenV2: authorization is used or canceled"), decoded there instead;
+ * this table exists only for tokens that use a genuine custom error instead,
+ * as this project's own `MockUSDC.sol`/`SettleToken.sol` test fixtures do
+ * (`AuthorizationAlreadyUsed()`). This module carries no ABI for any
+ * third-party token, so such an error can only be recognized by raw selector
+ * bytes, never by name — extend this list, never replace the string-based
+ * check above it, if another common implementation's error name becomes
+ * relevant.
+ */
+const KNOWN_ALREADY_USED_SELECTORS: readonly Hex[] = [computeErrorSelector('AuthorizationAlreadyUsed()')]
+
 /**
  * Best-effort decoding of a revert or submission failure into an x402
  * `errorReason` plus a human-readable label for logging.
  *
- * Three tiers, in order:
+ * Four tiers, in order:
  *
  * 1. One of `Escrow.sol`'s own custom errors (`MerchantNotBound`,
  *    `Reentrancy`, `ZeroMerchant`, `InsufficientBalance`, `TransferFailed`)
@@ -667,12 +799,16 @@ interface DecodedSettleFailure {
  *    reasons surface (e.g. real USDC is older Solidity and reverts with
  *    strings, not custom errors) even though this module has no ABI for
  *    whatever token `requirements.asset` names. A reason that reads as an
- *    insufficient-balance complaint is reported as x402's `insufficient_funds`;
- *    anything else falls back to `unexpected_settle_error`.
- * 3. Anything else — a custom error this ABI doesn't declare (e.g.
- *    `MockUSDC.AuthorizationAlreadyUsed`, used in `settle.fork.test.ts`'s
- *    double-settlement test — MockUSDC is a test fixture, not something this
- *    production module carries an ABI for), a `Panic(uint256)`, or a
+ *    already-used/nonce-reuse complaint is reported as x402's
+ *    `duplicate_settlement` — the single most common real settle failure
+ *    (a replay), and the one case a caller most needs distinguished from a
+ *    generic error (a payer polling "was I charged?" needs to know "yes,
+ *    already settled" from "something broke, retry" are different answers).
+ *    A reason that reads as an insufficient-balance complaint is reported as
+ *    `insufficient_funds`; anything else falls back to `unexpected_settle_error`.
+ * 3. A custom error this ABI doesn't declare, but whose raw 4-byte selector
+ *    matches `KNOWN_ALREADY_USED_SELECTORS` — also `duplicate_settlement`.
+ * 4. Anything else — an unrecognized custom error, a `Panic(uint256)`, or a
  *    non-revert failure (RPC/network error). Reported as
  *    `unexpected_settle_error`, with whatever raw signature/message viem
  *    could still surface included in the label — an unresolved 4-byte
@@ -698,16 +834,18 @@ function decodeSettleRevert(err: unknown): DecodedSettleFailure {
     }
     if (errorName === 'Error' && typeof reverted.reason === 'string') {
       const reason = reverted.reason
+      const looksLikeAlreadyUsed = /already used|used or (?:cancell?ed)|nonce.*(?:used|reuse)/i.test(reason)
       const looksLikeInsufficientFunds = /insufficient|exceeds balance/i.test(reason)
-      return {
-        errorReason: looksLikeInsufficientFunds ? 'insufficient_funds' : 'unexpected_settle_error',
-        label: `token revert: "${reason}"`,
-      }
+      const errorReason = looksLikeAlreadyUsed ? 'duplicate_settlement' : looksLikeInsufficientFunds ? 'insufficient_funds' : 'unexpected_settle_error'
+      return { errorReason, label: `token revert: "${reason}"` }
     }
     if (errorName === 'Panic') {
       return { errorReason: 'unexpected_settle_error', label: `Panic(${String(reverted.reason ?? 'unknown')})` }
     }
     if (reverted.signature) {
+      if (KNOWN_ALREADY_USED_SELECTORS.some((selector) => selector === reverted.signature?.toLowerCase())) {
+        return { errorReason: 'duplicate_settlement', label: `token revert: known already-used selector ${reverted.signature}` }
+      }
       return { errorReason: 'unexpected_settle_error', label: `unrecognized revert selector ${reverted.signature}` }
     }
     return { errorReason: 'unexpected_settle_error', label: 'revert with no decodable reason' }
@@ -889,20 +1027,24 @@ export async function settlePayment(
     return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
   }
 
-  // Reuses the SAME cached, chain-id-verified client `verifyPayment` (called
-  // above, moments ago, for this exact (network, rpcUrl) pair) already
-  // populated — see `getVerifiedClient`'s doc comment. Deliberately NOT a
-  // fresh `createPublicClient({ chain, transport })` here: this file's own
-  // multi-viem-install hazard (see `createChainClient`'s doc comment) means
-  // every client instantiation must flow through that one function, or
-  // TypeScript can spuriously reject assigning one client to a
+  // A DIFFERENT cache entry than `verifyPayment`'s own call moments ago for
+  // this same (network, rpcUrl) — same underlying cache and chain-id-verified
+  // mechanism (see `getVerifiedClient`'s doc comment), but keyed by the
+  // `'settle'` profile, which gets its own, much less aggressive transport
+  // tuning (`SETTLE_TRANSPORT_OPTIONS`) than `/verify`'s hot-path `'verify'`
+  // profile — see that constant's doc comment for why sharing verify's 2s/
+  // no-retry transport here would be actively dangerous, not just slow.
+  // Deliberately NOT a fresh `createPublicClient({ chain, transport })` call:
+  // this file's own multi-viem-install hazard (see `createChainClient`'s doc
+  // comment) means every client instantiation must flow through that one
+  // function, or TypeScript can spuriously reject assigning one client to a
   // differently-inferred-but-identical type elsewhere (`decodeMinedRevert`'s
   // parameter, in this case).
-  const publicClient = await getVerifiedClient(network as Task7Network, chain, options.rpcUrl)
+  const publicClient = await getVerifiedClient(network as Task7Network, chain, options.rpcUrl, 'settle')
   if (!publicClient) {
     return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
   }
-  const walletClient = createWalletClient({ account, chain, transport: http(options.rpcUrl, { timeout: 10_000, retryCount: 1 }) })
+  const walletClient = createWalletClient({ account, chain, transport: http(options.rpcUrl, SETTLE_TRANSPORT_OPTIONS) })
 
   const callArgs = [merchantEvmAddress, paymentId, authTuple, split.v, split.r, split.s] as const
 
@@ -932,12 +1074,47 @@ export async function settlePayment(
   }
 
   // 6. A mined-but-reverted transaction is a failure — see this function's
-  // doc comment, point 2. `success: true` is returned ONLY past this check.
+  // doc comment, point 2.
   if (receipt.status !== 'success') {
     const decoded = await decodeMinedRevert(publicClient, { address: escrowAddress, account: account.address, args: callArgs })
     console.error(`settlePayment: transaction ${hash} on ${network} was mined but reverted: ${decoded.label}`)
     return { success: false, errorReason: decoded.errorReason, payer, transaction: hash, network }
   }
 
-  return { success: true, payer, transaction: hash, network }
+  // 7 (task-8 review round 1, C1). `receipt.status === 'success'` proves only
+  // that the CALL didn't revert — it does NOT prove `Escrow.settleAuthorization`
+  // actually ran the code path that credits a merchant. A codeless address
+  // (or any no-op/EOA "escrow") at `escrowAddress` mines a clean, cheap
+  // success receipt and moves nothing; `Escrow._safeTransfer` already
+  // defends exactly this class of hazard one layer down (see its own doc
+  // comment on `payTo`/`token` codelessness) — trusting `receipt.status`
+  // alone here would reintroduce that same hazard one layer up. Requiring a
+  // `PaymentSettled` log actually emitted BY `escrowAddress` is the only
+  // receipt-level proof that real contract code ran.
+  //
+  // Requiring its `value` to meet `maxAmountRequired` additionally catches a
+  // fee-on-transfer token crediting LESS than what the authorization implied:
+  // `Escrow` credits the OBSERVED balance delta, never `auth.value` (see
+  // `Escrow.sol`'s own doc comment on `settleAuthorization`), and Amendment 2
+  // puts fee-taking tokens explicitly in scope — a real, not hypothetical,
+  // way for `received < maxAmountRequired` even though the call succeeded.
+  const settledLogs = parseEventLogs({ abi: ESCROW_SETTLE_ABI, eventName: 'PaymentSettled', logs: receipt.logs }).filter((log) =>
+    isAddressEqual(log.address, escrowAddress),
+  )
+  const settled = settledLogs[0]
+  if (!settled) {
+    console.error(
+      `settlePayment: transaction ${hash} on ${network} mined 'success' but emitted no PaymentSettled log from ${escrowAddress} — treating as a no-op (codeless address, wrong contract, or a no-op escrow)`,
+    )
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: hash, network }
+  }
+  const requiredValue = parseDecimalBigInt(requirements.maxAmountRequired)
+  if (requiredValue === undefined || settled.args.value < requiredValue) {
+    console.error(
+      `settlePayment: transaction ${hash} on ${network} settled only ${settled.args.value} of a required ${requirements.maxAmountRequired} (fee-on-transfer token, or a misconfigured requirement)`,
+    )
+    return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: hash, network }
+  }
+
+  return { success: true, payer, transaction: hash, network, settledAmount: settled.args.value, nonce: settled.args.nonce }
 }

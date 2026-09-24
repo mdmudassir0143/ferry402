@@ -127,6 +127,12 @@ describe('POST /verify', () => {
   // Same regression, for a body that exceeds MAX_REQUEST_BODY_SIZE (16kb) --
   // body-parser's own `PayloadTooLargeError` goes through the identical
   // error-handling middleware, and pre-fix would hit the same HTML-leak bug.
+  //
+  // Status 413, not 400 (task-8 review round 1, M-b): the error-handling
+  // middleware now honors `err.status`/`err.statusCode` instead of
+  // hardcoding 400, so a size-limit rejection is reported as the size-limit
+  // status a caller might actually branch on, not flattened to a generic
+  // bad-request.
   it('returns JSON (not an HTML stack trace) for a body over the size limit', async () => {
     const app = createFacilitatorApp()
     const oversized = 'a'.repeat(20_000)
@@ -135,7 +141,7 @@ describe('POST /verify', () => {
       .set('Content-Type', 'application/json')
       .send(JSON.stringify({ paymentPayload: oversized }))
 
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(413)
     expect(res.body).toEqual({ isValid: false, invalidReason: 'invalid_payload' })
     expect(res.text).not.toMatch(/<html/i)
   })
@@ -200,6 +206,11 @@ describe('POST /settle', () => {
   // `/settle`'s error response has a DIFFERENT shape (`success`/`transaction`/
   // `network`, not `isValid`) -- the shared error-handling middleware branches
   // on `req.path` specifically so this route doesn't get /verify's shape.
+  //
+  // `network` is the placeholder, not `''` (task-8 review round 1, M-a): a
+  // body that fails to parse as JSON at all carries no recoverable network,
+  // and `''` is not a member of `SettleResponseSchema`'s network enum -- see
+  // `safeNetworkOrPlaceholder`'s doc comment in server.ts.
   it('returns JSON (not an HTML stack trace) for a malformed JSON body', async () => {
     const app = createFacilitatorApp()
     const res = await request(app)
@@ -209,7 +220,51 @@ describe('POST /settle', () => {
 
     expect(res.status).toBe(400)
     expect(res.headers['content-type']).toMatch(/^application\/json/)
-    expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: '' })
+    expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: 'base-sepolia' })
     expect(res.text).not.toMatch(/<html/i)
+  })
+
+  // task-8 review round 1, M-b: the error-handling middleware's route check
+  // must survive Express's own case-insensitive, trailing-slash-tolerant
+  // routing (`caseSensitive: false`, `strict: false` are Express defaults),
+  // since a malformed-JSON body never reaches the named route handler at all
+  // (body-parser's error skips straight past it) -- only `req.path`, exactly
+  // as the caller sent it, is available to decide which response shape to
+  // use.
+  it.each(['/settle/', '/SETTLE'])('recognizes %s as the settle route for a malformed JSON body', async (path) => {
+    const app = createFacilitatorApp()
+    const res = await request(app).post(path).set('Content-Type', 'application/json').send('{not valid json')
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: 'base-sepolia' })
+  })
+
+  // task-8 review round 1, M-a: a body that fails `SettleRequestSchema` (here,
+  // missing `paymentRequirements` entirely) but carries a validly-typed
+  // `paymentPayload.network` string should still echo THAT network in the
+  // error response, recovered via `SettleResponseSchema`'s own enum check --
+  // not silently discarded just because some OTHER field was missing.
+  it('recovers a valid network from a body that otherwise fails SettleRequestSchema', async () => {
+    const app = createFacilitatorApp()
+    const res = await request(app)
+      .post('/settle')
+      .send({ paymentPayload: { network: 'base', scheme: 'exact' } })
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: 'base' })
+  })
+
+  // task-8 review round 1, M-a: an attacker-controlled, non-string
+  // `paymentPayload.network` (here, an object) must never be echoed back
+  // verbatim -- only a value that is ITSELF a valid member of
+  // `SettleResponseSchema`'s network enum may ever appear in the response.
+  it('never echoes an attacker-controlled non-string network back in an error response', async () => {
+    const app = createFacilitatorApp()
+    const res = await request(app)
+      .post('/settle')
+      .send({ paymentPayload: { network: { injected: '<script>evil()</script>' } } })
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: 'base-sepolia' })
   })
 })

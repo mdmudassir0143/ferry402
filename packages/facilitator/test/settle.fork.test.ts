@@ -117,6 +117,14 @@ describe('settlePayment', () => {
 
     const balanceAfter = await merchantBalance()
     expect(balanceAfter - balanceBefore).toBe(10_000n)
+
+    // task-8 review round 1, I1: the observed delta (Escrow's own
+    // `PaymentSettled.value`) and its nonce are kept on the in-process
+    // result, not discarded -- a future in-process caller (e.g. an HCS
+    // journal writer) can read them directly instead of re-fetching this
+    // same receipt by hash.
+    expect(result.settledAmount).toBe(10_000n)
+    expect(result.nonce).toBe(auth.nonce)
   })
 
   it('rejects an unverified payload without ever sending a transaction', async () => {
@@ -140,6 +148,33 @@ describe('settlePayment', () => {
     // untouched. A regression that settled BEFORE re-verifying would
     // increment this.
     expect(nonceAfter).toBe(nonceBefore)
+  })
+
+  // task-8 review round 1, C1: `receipt.status === 'success'` proves only
+  // that the CALL didn't revert, not that `Escrow.settleAuthorization`
+  // actually ran. A call to a CODELESS address is a no-op at the EVM level --
+  // it mines cleanly, with `status: 'success'` and no logs at all -- and
+  // moves nothing. `Escrow._safeTransfer` already defends this exact hazard
+  // one layer down for `withdraw`'s token address; this proves `settlePayment`
+  // does not reintroduce it one layer up for a caller-supplied `payTo`.
+  it('never reports success for an authorization sent to a codeless address', async () => {
+    const paymentId = freshPaymentId()
+    const codelessAddress: Address = '0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de'
+    const auth = authFields(paymentId, { to: codelessAddress })
+    const signature = await sign(auth)
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const reqs = requirements(paymentId, { payTo: codelessAddress })
+
+    const result = await settle(payload, reqs)
+
+    expect(result.success).toBe(false)
+    expect(result.errorReason).toBe('unexpected_settle_error')
+    // The transaction really was mined and did NOT revert -- the whole point
+    // is that this alone must never be read as a settled payment.
+    expect(result.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
+    const receipt = await publicClient.getTransactionReceipt({ hash: result.transaction as Hex })
+    expect(receipt.status).toBe('success')
+    expect(receipt.logs.length).toBe(0)
   })
 
   it('reverts MerchantNotBound on-chain for an authorization submitted against the wrong merchant', async () => {
@@ -239,6 +274,10 @@ describe('settlePayment', () => {
     expect(second.success).toBe(false)
     expect(second.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
     expect(second.transaction).not.toBe(first.transaction)
+    // task-8 review round 1: the most common real settle failure (a replay)
+    // must be distinguishable from a generic error -- a caller needs to know
+    // "already settled, release the resource" from "something broke, retry".
+    expect(second.errorReason).toBe('duplicate_settlement')
 
     const receipt = await publicClient.getTransactionReceipt({ hash: second.transaction as Hex })
     expect(receipt.status).toBe('reverted')
@@ -262,6 +301,7 @@ describe('settlePayment', () => {
 
     const second = await settle(payload, reqs)
     expect(second.success).toBe(false)
+    expect(second.errorReason).toBe('duplicate_settlement')
 
     const balanceAfterSecond = await merchantBalance()
     expect(balanceAfterSecond).toBe(balanceAfterFirst)

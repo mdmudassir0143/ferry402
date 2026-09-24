@@ -27,13 +27,20 @@ export const ANVIL_PAYER_ADDRESS: Address = privateKeyToAccount(ANVIL_PAYER_PRIV
  * first-ever contract from the SAME sender key end up with byte-IDENTICAL
  * contract addresses despite being unrelated tokens on unrelated chains. A
  * test file that boots both fixtures (see `server.test.ts`) shares ONE
- * process, and therefore `chains/base.ts`'s process-lifetime `domainCache`
- * (keyed by `(chainId, asset)`, and both fixtures default to the same
- * `BASE_SEPOLIA_CHAIN_ID`): an address collision there is not cosmetic, it
- * silently serves one token's cached EIP-712 domain for the other, and every
- * signature recovered against the wrong domain fails. Using a different
- * default deployer for each fixture avoids this entirely, independent of
- * deployment order or nonce bookkeeping.
+ * process and therefore `chains/base.ts`'s process-lifetime `domainCache` and
+ * `clientCache`.
+ *
+ * This is now a SECONDARY layer of isolation, not the fix: `domainCache` is
+ * keyed by `(chainId, rpcUrl, asset)` (task-8 review round 1, M-c — see that
+ * cache's own doc comment in `chains/base.ts`), so an address collision like
+ * this one no longer leaks one token's domain into another's regardless of
+ * which deployer key any given fixture picks — proven directly in
+ * `verify.chain-config.test.ts`'s "domain cache keyed by rpcUrl" test, which
+ * deliberately reproduces this exact collision with TWO
+ * `startAnvilWithDomainToken` instances (both using account #0) and confirms
+ * each still resolves its own domain correctly. Keeping a distinct default
+ * deployer here regardless costs nothing and adds defense in depth; it must
+ * not be read as the thing preventing the collision.
  */
 export const ANVIL_ESCROW_DEPLOYER_PRIVATE_KEY: Hex = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a'
 
