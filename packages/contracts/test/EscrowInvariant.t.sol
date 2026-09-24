@@ -38,12 +38,17 @@ contract EscrowHandler is Test {
     uint256 public withdrawSuccesses;
     uint256 public mismatchAttempts;
     uint256 public replayAttempts;
+    uint256 public overWithdrawAttempts;
 
     // Second line of defense: if either critical property is ever violated
     // during the campaign, latch it here so the invariant can catch it even
     // if the pool still happens to look solvent afterwards.
     bool public merchantBindingBroken;
     bool public replayProtectionBroken;
+    // Same idea for over-withdrawal: a successful over-withdraw is not
+    // reliably visible through the solvency invariant alone (see the note in
+    // withdraw() below), so it gets its own explicit latch and invariant.
+    bool public overWithdrawSucceeded;
 
     mapping(address => bool) public everCredited;
     uint256 public distinctCreditedActors;
@@ -81,9 +86,20 @@ contract EscrowHandler is Test {
         (uint256 idx, address signedMerchant) = _actor(actorSeed);
         uint256 value = bound(valueSeed, 1, 1_000e6);
 
+        bool mismatched = wrongMerchant && actors.length > 1;
+        address submittedMerchant = mismatched ? actors[(idx + 1) % actors.length] : signedMerchant;
+        if (mismatched) mismatchAttempts++;
+
         bool attemptedReplay = reuseNonce && _hasLastPaymentId[signedMerchant];
         bytes32 paymentId = attemptedReplay ? lastPaymentId[signedMerchant] : bytes32(_nextPaymentId++);
-        if (attemptedReplay) replayAttempts++;
+        // Only count this as an attempt on the TOKEN's nonce-used check when
+        // the call isn't already doomed to revert earlier at
+        // MerchantNotBound: when both booleans are true, the mismatch fires
+        // first and the token's replay guard is never reached, so counting
+        // it here would overstate what the campaign actually exercised
+        // (assertGt(replayAttempts, 0) in afterInvariant would then prove
+        // less than it claims to).
+        if (attemptedReplay && !mismatched) replayAttempts++;
 
         Escrow.Authorization memory auth = Escrow.Authorization({
             from: payer,
@@ -95,28 +111,35 @@ contract EscrowHandler is Test {
         });
         (uint8 v, bytes32 r, bytes32 s) = _sign(auth);
 
-        bool mismatched = wrongMerchant && actors.length > 1;
-        address submittedMerchant = mismatched ? actors[(idx + 1) % actors.length] : signedMerchant;
-        if (mismatched) mismatchAttempts++;
-
-        // NOTE: the delta is measured on the MERCHANT'S OWN LEDGER ROW
-        // (escrow.balanceOf), not on the pool's token balance. Measuring the
-        // pool's token balance instead would make totalCredited a restatement
-        // of the pool's own conservation of tokens -- it would then equal
-        // usdc.balanceOf(escrow) by construction, and the solvency invariant
-        // below would compare a quantity to itself and could never fail. The
-        // whole point of this invariant is to compare the contract's
-        // *ledger* (this delta) against its *actual token holdings*, which
-        // are two independently-tracked quantities inside Escrow.
         uint256 ledgerBefore = escrow.balanceOf(submittedMerchant);
         try escrow.settleAuthorization(submittedMerchant, paymentId, auth, v, r, s) {
             settleSuccesses++;
-            totalCredited += escrow.balanceOf(submittedMerchant) - ledgerBefore;
 
-            // These two branches should be unreachable. If either fires, a
+            // Latch the safety-property flags BEFORE any arithmetic below.
+            // These two branches should be unreachable; if either fires, a
             // core safety property has broken during the campaign.
             if (mismatched) merchantBindingBroken = true;
             if (attemptedReplay) replayProtectionBroken = true;
+
+            // NOTE: the delta is measured on the MERCHANT'S OWN LEDGER ROW
+            // (escrow.balanceOf), not on the pool's token balance. Measuring
+            // the pool's token balance instead would make totalCredited a
+            // restatement of the pool's own conservation of tokens -- it
+            // would then equal usdc.balanceOf(escrow) by construction, and
+            // the solvency invariant below would compare a quantity to
+            // itself and could never fail. The whole point of this
+            // invariant is to compare the contract's *ledger* (this delta)
+            // against its *actual token holdings*, which are two
+            // independently-tracked quantities inside Escrow.
+            //
+            // Clamped rather than a bare subtraction: a ghost update must
+            // never be able to revert, or it silently vetoes the very class
+            // of bug it exists to measure (a Solidity 0.8 underflow panic
+            // here would unwind this whole try body, including the
+            // settleSuccesses++ and the latches above, discarding the
+            // observation instead of recording it).
+            uint256 ledgerAfter = escrow.balanceOf(submittedMerchant);
+            totalCredited += ledgerAfter >= ledgerBefore ? ledgerAfter - ledgerBefore : 0;
 
             if (!everCredited[submittedMerchant]) {
                 everCredited[submittedMerchant] = true;
@@ -134,7 +157,13 @@ contract EscrowHandler is Test {
 
     /// @dev Randomly withdraws. `overWithdraw` deliberately requests more
     /// than the actor's own ledger balance (must revert InsufficientBalance).
-    function withdraw(uint256 actorSeed, uint256 amountSeed, bool overWithdraw) external {
+    /// `toSeed` picks the payout destination from the actor set OR the
+    /// escrow contract itself -- withdrawing to the escrow is the documented
+    /// slack case in Escrow.withdraw's own dev comment (ledger debited, but
+    /// the token physically stays in the pool), which is exactly why the
+    /// solvency invariant below is `>=` rather than `==`; without fuzzing it
+    /// that slack path was never exercised.
+    function withdraw(uint256 actorSeed, uint256 amountSeed, bool overWithdraw, uint256 toSeed) external {
         withdrawAttempts++;
         (, address actor) = _actor(actorSeed);
         uint256 ledgerBalance = escrow.balanceOf(actor);
@@ -142,15 +171,38 @@ contract EscrowHandler is Test {
         uint256 amount = overWithdraw
             ? bound(amountSeed, ledgerBalance + 1, ledgerBalance + 1_000_000e6 + 1)
             : bound(amountSeed, 0, ledgerBalance);
+        if (overWithdraw) overWithdrawAttempts++;
 
-        // Same reasoning as in settle(): measured against the merchant's own
-        // ledger row, not the pool's token balance, so this is an
-        // independent quantity from usdc.balanceOf(escrow) rather than a
-        // restatement of it.
+        uint256 toIdx = bound(toSeed, 0, actors.length);
+        address to = toIdx == actors.length ? address(escrow) : actors[toIdx];
+
         vm.prank(actor);
-        try escrow.withdraw(amount, actor) {
+        try escrow.withdraw(amount, to) {
             withdrawSuccesses++;
-            totalWithdrawn += ledgerBalance - escrow.balanceOf(actor);
+
+            // Latch BEFORE the ghost arithmetic below, for the same reason
+            // as in settle(): a successful over-withdrawal here is the exact
+            // bug class this handler exists to attempt, and it must be
+            // recorded as having happened even if something downstream in
+            // this function were ever to revert.
+            if (overWithdraw) overWithdrawSucceeded = true;
+
+            // Same reasoning as in settle(): measured against the actor's
+            // own ledger row, not the pool's token balance, so this is a
+            // quantity independent of usdc.balanceOf(escrow) rather than a
+            // restatement of it -- and clamped rather than a bare
+            // subtraction, because an unclamped `ledgerBalance -
+            // escrow.balanceOf(actor)` UNDERFLOWS AND PANICS whenever a
+            // withdrawal succeeds for more than `ledgerBalance` (exactly
+            // what `overWithdraw` is designed to attempt): `_balances`
+            // becomes ~2**256 under a broken guard, so
+            // `escrow.balanceOf(actor)` ends up far ABOVE `ledgerBalance`,
+            // not below it. That panic would unwind this entire try body --
+            // including the `overWithdrawSucceeded` latch above -- silently
+            // discarding the very observation this handler exists to make,
+            // deterministically, on every successful over-withdrawal.
+            uint256 ledgerAfter = escrow.balanceOf(actor);
+            totalWithdrawn += ledgerAfter <= ledgerBalance ? ledgerBalance - ledgerAfter : 0;
         } catch {
             // Expected outcome for over-withdrawal attempts.
         }
@@ -234,17 +286,34 @@ contract EscrowInvariantTest is Test {
         assertFalse(handler.replayProtectionBroken());
     }
 
+    /// @notice Third line of defense, and load-bearing on its own: a
+    /// successful over-withdrawal is not reliably visible through
+    /// invariant_escrowHoldsAtLeastSumOfBalances alone. Pooled custody means
+    /// the pool's physical token balance is the SUM of every actor's row, so
+    /// a single actor over-withdrawing by a small margin can still be
+    /// covered by other actors' pooled funds without the aggregate solvency
+    /// check ever dipping below zero -- it is still theft from those other
+    /// actors, just not visible in the aggregate. This invariant is what
+    /// actually proves InsufficientBalance is enforced, independent of
+    /// whatever the aggregate happens to look like.
+    function invariant_overWithdrawNeverSucceeds() public view {
+        assertFalse(handler.overWithdrawSucceeded());
+    }
+
     /// @notice Guards against a vacuous pass: if the handler never actually
-    /// credited or withdrew anything, `0 >= 0` would hold trivially forever.
-    /// Runs once after the fuzzing campaign and asserts genuinely non-trivial
-    /// state was reached: real successes, real attempted attacks, and
-    /// multiple distinct merchants credited.
+    /// credited, withdrew, or attacked anything, these would hold trivially
+    /// forever (e.g. 0 >= 0, or an attempt counter that never got exercised).
+    /// Foundry calls this once PER RUN (not once for the whole campaign), so
+    /// every one of the 256 runs configured in foundry.toml must
+    /// independently reach non-trivial state before the suite passes.
     function afterInvariant() public view {
         assertGt(handler.settleSuccesses(), 0);
         assertGt(handler.withdrawSuccesses(), 0);
         assertGt(handler.totalCredited(), 0);
+        assertGt(handler.totalWithdrawn(), 0);
         assertGt(handler.mismatchAttempts(), 0);
         assertGt(handler.replayAttempts(), 0);
+        assertGt(handler.overWithdrawAttempts(), 0);
         assertGt(handler.distinctCreditedActors(), 1);
     }
 }

@@ -124,6 +124,17 @@ contract EscrowTest is Test {
 
         assertEq(escrow.balanceOf(signedMerchant), 0);
         assertEq(escrow.balanceOf(submittedMerchant), 0);
+
+        // MerchantNotBound fires before signature recovery, the balance
+        // check, and the token call, so the mismatch revert above alone
+        // would still pass even against a broken `_sign` or an unfunded
+        // payer -- it proves nothing about whether the payload was
+        // otherwise valid. Settle the exact same (auth, v, r, s) to the
+        // merchant it was actually signed for and require it to succeed,
+        // so a mutation that broke the fuzzed inputs themselves (rather
+        // than the binding check) can't hide behind this test.
+        escrow.settleAuthorization(signedMerchant, paymentId, auth, v, r, s);
+        assertEq(escrow.balanceOf(signedMerchant), value);
     }
 
     function test_settleAuthorization_revertsOnRecipientMismatch() public {
