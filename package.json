@@ -8,5 +8,10 @@
     "test": "pnpm -r test",
     "build": "pnpm -r build",
     "lint": "pnpm -r lint"
+  },
+  "pnpm": {
+    "overrides": {
+      "zod": "3.25.76"
+    }
   }
 }
