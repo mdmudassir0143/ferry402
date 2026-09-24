@@ -74,7 +74,46 @@ async function sign(authorization: AuthorizationFields): Promise<Hex> {
 }
 
 describe('verifyPayment', () => {
-  // --- check 1: recipient -------------------------------------------------
+  // --- check 1 (task-8 review round 2): trusted-escrow allowlist ----------
+  //
+  // Every OTHER test in this file passes `escrows: DEFAULT_ESCROWS`, whose
+  // one entry happens to match `buildRequirements`'s own default `payTo`
+  // (`ESCROW_ADDRESS`) -- so none of them can tell this check apart from "no
+  // allowlist check exists at all". A reviewer proved exactly that: deleting
+  // `verifyPayment`'s check 1 entirely left all pre-existing tests green,
+  // because `settlePayment`'s own re-check (defense-in-depth, not a
+  // substitute) masks the gap for anything that goes through `/settle`. This
+  // test is the one place `payTo` and the configured allowlist actually
+  // disagree, so it can only pass if check 1 itself rejects the mismatch.
+  it("rejects a payTo that is not the configured trusted escrow, before any other check", async () => {
+    const auth = authFields()
+    const result = await verifyPayment(
+      buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
+      requirements(), // payTo: ESCROW_ADDRESS (buildRequirements' default)
+      // The configured allowlist maps 'base-sepolia' to a DIFFERENT address
+      // than `requirements().payTo` -- a real operator misconfiguration, or
+      // (the actual threat this check defends against) a caller-supplied
+      // `payTo` this facilitator does not operate.
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: { 'base-sepolia': OTHER_ADDRESS } },
+    )
+    expect(result.isValid).toBe(false)
+    expect(result.invalidReason).toBe('invalid_payment_requirements')
+  })
+
+  it('rejects every request for a network with no configured escrow at all (fails closed, not open)', async () => {
+    const auth = authFields()
+    const result = await verifyPayment(
+      buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
+      requirements(),
+      // No `escrows` entry for 'base-sepolia' whatsoever -- must be rejected,
+      // never treated as "no allowlist configured, so trust the caller".
+      { rpcUrl: UNREACHABLE_RPC_URL, escrows: {} },
+    )
+    expect(result.isValid).toBe(false)
+    expect(result.invalidReason).toBe('invalid_payment_requirements')
+  })
+
+  // --- check 2: recipient -------------------------------------------------
   it('rejects an authorization whose recipient is not our escrow', async () => {
     const auth = authFields({ to: OTHER_ADDRESS })
     const result = await verifyPayment(
@@ -86,7 +125,7 @@ describe('verifyPayment', () => {
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_recipient_mismatch')
   })
 
-  // --- check 2: merchant binding (THE critical check) ---------------------
+  // --- check 3: merchant binding (THE critical check) ---------------------
   it('rejects a redirect attempt: a signature whose nonce is not bound to this merchant/paymentId', async () => {
     // Same recipient, same value, same window -- everything an on-chain-only
     // check would see as fine. Only the nonce disagrees with what THIS
@@ -134,7 +173,7 @@ describe('verifyPayment', () => {
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_value')
   })
 
-  // --- check 3: amount -----------------------------------------------------
+  // --- check 4: amount -----------------------------------------------------
   it('rejects an authorization whose value is below maxAmountRequired', async () => {
     const auth = authFields({ value: '999999' })
     const result = await verifyPayment(
@@ -175,7 +214,7 @@ describe('verifyPayment', () => {
     ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_value' })
   })
 
-  // --- check 4: time window -------------------------------------------------
+  // --- check 5: time window -------------------------------------------------
   it('rejects an expired authorization', async () => {
     const auth = authFields({ validBefore: String(Math.floor(Date.now() / 1000) - 10) })
     const result = await verifyPayment(
@@ -223,7 +262,7 @@ describe('verifyPayment', () => {
     ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_before' })
   })
 
-  // --- check 5: signature ----------------------------------------------------
+  // --- check 6: signature ----------------------------------------------------
   it('accepts a well-formed authorization signed by the payer', async () => {
     const auth = authFields()
     const signature = await sign(auth)

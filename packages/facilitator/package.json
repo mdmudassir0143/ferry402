@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@anychain402/sdk": "workspace:*",
+    "@hashgraph/sdk": "2.81.0",
     "express": "^5.2.1",
     "viem": "^2.56.8",
     "x402": "1.2.0"

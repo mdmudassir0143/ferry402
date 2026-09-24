@@ -76,6 +76,36 @@ describe('POST /verify', () => {
     expect(res.body).toEqual({ isValid: true, payer: ANVIL_PAYER_ADDRESS })
   })
 
+  // A reviewer proved `verifyPayment`'s trusted-escrow allowlist check (task-8
+  // review round 2) could be DELETED entirely with the whole suite still
+  // green: no test anywhere exercised `/verify` -- the actual HTTP entry
+  // point an unauthenticated caller reaches -- with a `payTo` outside the
+  // configured allowlist. `/settle`'s equivalent test (below) can only assert
+  // the generic `unexpected_settle_error` fallback, because `SettleResponseSchema`
+  // rejects an empty `transaction` and masks the precise reason; `/verify`'s
+  // response schema carries no such constraint, so this test can assert the
+  // EXACT reason `verifyPayment` itself returns.
+  it('returns invalid_payment_requirements when payTo is not the configured trusted escrow', async () => {
+    const app = createFacilitatorApp({ rpcUrls: { 'base-sepolia': anvil.rpcUrl }, escrows: DEFAULT_ESCROWS })
+    const untrustedPayTo: Address = '0x9999999999999999999999999999999999999999'
+    const auth = authFields({ to: untrustedPayTo })
+    const paymentPayload = buildPayload({
+      network: 'base-sepolia',
+      signature: `0x${'ab'.repeat(65)}`,
+      authorization: auth,
+    })
+    const paymentRequirements = buildRequirements({
+      asset: anvil.tokenAddress,
+      payTo: untrustedPayTo,
+      extra: { merchantEvm: MERCHANT_EVM, paymentId: PAYMENT_ID },
+    })
+
+    const res = await request(app).post('/verify').send({ paymentPayload, paymentRequirements })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ isValid: false, invalidReason: 'invalid_payment_requirements' })
+  })
+
   it('returns 400 with invalid_payload for a body that does not match VerifyRequestSchema', async () => {
     const app = createFacilitatorApp()
     const res = await request(app).post('/verify').send({ nonsense: true })
