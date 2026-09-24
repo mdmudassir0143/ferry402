@@ -64,11 +64,25 @@ async function stopChild(child: ChildProcess): Promise<void> {
   })
 }
 
+/**
+ * Base Sepolia's real, declared chain id (viem's `baseSepolia.id`). Since
+ * task-7 review round 1 (I2), `verifyPayment` builds its signing domain from
+ * this STATIC id for `network: 'base-sepolia'`, never from a live RPC call —
+ * so every test anvil instance must actually report this chain id, or every
+ * signature test would fail on a domain mismatch that has nothing to do
+ * with what's actually under test. This is also what let I2 be tested at
+ * all: a fixture at any OTHER chain id is exactly the "misconfigured RPC"
+ * scenario `verifyPayment` must now refuse outright.
+ */
+export const BASE_SEPOLIA_CHAIN_ID = 84532
+
 export interface AnvilFixture {
   rpcUrl: string
   tokenAddress: Address
-  /** The chain id anvil actually reports over RPC (default 31337). Read
-   *  live rather than assumed, mirroring what `verifyPayment` itself does. */
+  /** The chain id anvil actually reports over RPC — `BASE_SEPOLIA_CHAIN_ID`
+   *  unless a different `chainId` was requested. Read live rather than
+   *  assumed, so a test can tell whether anvil actually honored the
+   *  requested `--chain-id`. */
   chainId: number
   stop: () => Promise<void>
 }
@@ -89,12 +103,25 @@ export interface AnvilFixture {
  * Deploys `DomainToken` with the given (deliberately non-standard, in
  * callers) `name`/`version` — see DomainToken.sol's doc comment for why
  * that specific choice matters for what this proves.
+ *
+ * `chainId` defaults to `BASE_SEPOLIA_CHAIN_ID` (84532) — matching what
+ * `verifyPayment` declares for `network: 'base-sepolia'` — since that's the
+ * network every other test in this suite uses. Pass a different value only
+ * to deliberately construct a chain-id MISMATCH (see the I2 review-fix
+ * tests), which is the one case that needs anything else.
  */
-export async function startAnvilWithDomainToken(params: { name: string; version: string }): Promise<AnvilFixture> {
+export async function startAnvilWithDomainToken(params: {
+  name: string
+  version: string
+  chainId?: number
+}): Promise<AnvilFixture> {
+  const requestedChainId = params.chainId ?? BASE_SEPOLIA_CHAIN_ID
   const port = await getFreePort()
   const rpcUrl = `http://127.0.0.1:${port}`
 
-  const child = spawn('anvil', ['--port', String(port), '--silent'], { stdio: 'ignore' })
+  const child = spawn('anvil', ['--port', String(port), '--chain-id', String(requestedChainId), '--silent'], {
+    stdio: 'ignore',
+  })
   let spawnError: Error | undefined
   child.once('error', (err) => {
     spawnError = err instanceof Error ? err : new Error(String(err))

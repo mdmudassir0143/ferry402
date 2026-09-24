@@ -1,6 +1,15 @@
-import express, { type Express } from 'express'
+import express, { type Express, type NextFunction, type Request, type Response } from 'express'
 import { VerifyRequestSchema, VerifyResponseSchema } from 'x402/types'
 import { verifyPayment } from './chains/base.js'
+
+/**
+ * Request body size cap for `POST /verify`. A well-formed `VerifyRequest` —
+ * two addresses, a signature, a handful of decimal strings, and a small
+ * `extra` record — is well under 1KB; this leaves generous headroom without
+ * leaving the JSON body parser accepting arbitrarily large uploads from an
+ * unauthenticated caller.
+ */
+const MAX_REQUEST_BODY_SIZE = '16kb'
 
 export interface FacilitatorAppOptions {
   /**
@@ -36,7 +45,7 @@ export interface FacilitatorAppOptions {
  */
 export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Express {
   const app = express()
-  app.use(express.json())
+  app.use(express.json({ limit: MAX_REQUEST_BODY_SIZE }))
 
   app.post('/verify', async (req, res) => {
     const parsedRequest = VerifyRequestSchema.safeParse(req.body)
@@ -70,6 +79,26 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
       return
     }
     res.status(200).json(parsedResponse.data)
+  })
+
+  // Error-handling middleware — MUST be registered after every route/other
+  // middleware; Express identifies an error handler specifically by its
+  // 4-argument signature. Without this, a malformed JSON body (or a body
+  // over MAX_REQUEST_BODY_SIZE) reaches Express's own default error
+  // handler, which responds with an HTML page containing a full stack
+  // trace and absolute filesystem paths — never this module's
+  // `{isValid, invalidReason}` shape, and a needless information leak to
+  // an unauthenticated caller.
+  //
+  // The error itself is deliberately never inspected or logged: for a
+  // malformed-JSON body specifically, `body-parser` (which `express.json`
+  // wraps) attaches the raw request body to `err.body` — the same payload
+  // this module's "never log the payload" rule exists to protect — so
+  // logging `err` here would be one line away from violating that rule for
+  // exactly the requests most likely to be probing for issues.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((_err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    res.status(400).json({ isValid: false, invalidReason: 'invalid_payload' })
   })
 
   return app

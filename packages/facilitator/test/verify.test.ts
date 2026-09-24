@@ -195,6 +195,33 @@ describe('verifyPayment', () => {
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_authorization_valid_after')
   })
 
+  it('rejects (rather than crashes on) a validBefore too large for a uint256, reached over the wire', async () => {
+    // Task-7 review round 1, I1: x402 caps `value` at 18 characters, but
+    // puts NO length cap on `validBefore`/`validAfter`, and
+    // Number.isInteger(Number('9'.repeat(100))) is true -- so a 100-digit
+    // validBefore passes VerifyRequestSchema at the HTTP boundary. Unlike an
+    // oversized validAfter (caught incidentally by the "not yet valid"
+    // comparison against any real `now`), an oversized validBefore reaches
+    // no earlier check. Pre-fix, this value would flow unrejected into
+    // hashTypedData's `uint256` encoding and throw IntegerOutOfRangeError --
+    // the one call in verifyPayment that wasn't wrapped in a try/catch --
+    // so this must resolve cleanly, never reject.
+    //
+    // Uses the REAL anvil RPC (not UNREACHABLE_RPC_URL, unlike this file's
+    // other check-3/4 tests): the point is to actually reach the unguarded
+    // hashTypedData call downstream, not merely fail earlier for an
+    // unrelated (network) reason that would mask whether the range guard
+    // itself is doing anything.
+    const auth = authFields({ validBefore: '9'.repeat(100) })
+    await expect(
+      verifyPayment(
+        buildPayload({ network: 'base-sepolia', signature: `0x${'ab'.repeat(65)}`, authorization: auth }),
+        requirements(),
+        { rpcUrl: anvil.rpcUrl },
+      ),
+    ).resolves.toEqual({ isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_before' })
+  })
+
   // --- check 5: signature ----------------------------------------------------
   it('accepts a well-formed authorization signed by the payer', async () => {
     const auth = authFields()
