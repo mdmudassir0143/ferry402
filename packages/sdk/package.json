@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "x402": "1.2.0"
   },
   "peerDependencies": {

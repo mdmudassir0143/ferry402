@@ -3,6 +3,7 @@ import express from 'express'
 import request from 'supertest'
 import type { Server } from 'node:http'
 import { anychain402 } from '../src/index.js'
+import { computeNonce } from '../src/nonce.js'
 import type { Anychain402Config, PaymentRequirements } from '../src/types.js'
 
 // Reused verbatim from Task 5's requirements.test.ts fixture (per the
@@ -62,7 +63,22 @@ function makePayload(network: 'base-sepolia' | 'polygon-amoy', nonce: string) {
   }
 }
 
-const SOME_NONCE = `0x${'11'.repeat(32)}`
+/**
+ * The real nonce a payer would sign for a given issued `PaymentRequirements`
+ * entry: `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)`. The
+ * middleware's challenge store is keyed by exactly this value (not the bare
+ * `paymentId`), so every test that pays against a real challenge must derive
+ * its `X-PAYMENT` nonce this way rather than reusing `extra.paymentId`
+ * directly.
+ */
+function nonceFor(requirement: PaymentRequirements): `0x${string}` {
+  return computeNonce(requirement.extra?.merchantEvm, requirement.extra?.paymentId)
+}
+
+// A well-formed nonce that was never issued by any challenge in the test -
+// i.e. it does not equal computeNonce(merchantEvm, paymentId) for anything
+// anychain402 actually generated.
+const UNKNOWN_NONCE = `0x${'11'.repeat(32)}` as const
 
 function toHeader(payload: unknown): string {
   return Buffer.from(JSON.stringify(payload)).toString('base64')
@@ -72,21 +88,25 @@ function toHeader(payload: unknown): string {
 // brand-new ephemeral port) every single time `request(app)` is called - see
 // supertest's Test constructor. Two sequential `request(app).get(...)` calls
 // against "the same app" therefore hit two DIFFERENT ports, so the request's
-// Host header (and thus `resource`, our challenge cache key) differs between
-// a challenge and its follow-up payment. Real deployments don't have this
-// problem (one process, one host); the fix here is purely a test-fixture
-// concern: listen once per test and reuse that one server/port for every
-// request in the round trip, exactly like a real client would.
+// Host header (and thus `resource`) differs between a challenge and its
+// follow-up payment. Real deployments don't have this problem (one process,
+// one host); the fix here is purely a test-fixture concern: listen once per
+// test and reuse that one server/port for every request in the round trip,
+// exactly like a real client would.
 const servers: Server[] = []
 
-function appWith(verifyResult: unknown): Server {
-  globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(verifyResult), { status: 200 })) as any
+function buildApp(): Server {
   const app = express()
   app.use('/premium', anychain402(config))
   app.get('/premium', (_req, res) => res.json({ ok: true }))
   const server = app.listen(0)
   servers.push(server)
   return server
+}
+
+function appWith(verifyResult: unknown): Server {
+  globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(verifyResult), { status: 200 })) as any
+  return buildApp()
 }
 
 afterEach(() => {
@@ -105,9 +125,8 @@ describe('anychain402 middleware', () => {
   it('serves the route when the facilitator says the payment is valid', async () => {
     const server = appWith({ isValid: true, payer: '0xabc' })
     const challengeRes = await request(server).get('/premium')
-    const network = challengeRes.body.accepts[0].network as 'base-sepolia' | 'polygon-amoy'
-    const nonce = challengeRes.body.accepts[0].extra.paymentId
-    const payload = makePayload(network, nonce)
+    const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+    const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
 
     const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
     expect(res.status).toBe(200)
@@ -117,8 +136,8 @@ describe('anychain402 middleware', () => {
   it('returns 402 with the reason when verification fails', async () => {
     const server = appWith({ isValid: false, invalidReason: 'insufficient_funds' })
     const challengeRes = await request(server).get('/premium')
-    const network = challengeRes.body.accepts[0].network as 'base-sepolia' | 'polygon-amoy'
-    const payload = makePayload(network, challengeRes.body.accepts[0].extra.paymentId)
+    const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+    const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
 
     const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
     expect(res.status).toBe(402)
@@ -130,19 +149,15 @@ describe('anychain402 middleware', () => {
     it('sends the facilitator the SAME paymentId the 402 challenge issued, not a freshly generated one', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
-      const app = express()
-      app.use('/premium', anychain402(config))
-      app.get('/premium', (_req, res) => res.json({ ok: true }))
-      const server = app.listen(0)
-      servers.push(server)
+      const server = buildApp()
 
       const challengeRes = await request(server).get('/premium')
       const issuedRequirements: PaymentRequirements[] = challengeRes.body.accepts
-      const issuedPaymentId = issuedRequirements[0].extra?.paymentId
+      const requirement = issuedRequirements[0]
+      const issuedPaymentId = requirement.extra?.paymentId
       expect(issuedPaymentId).toBeTruthy()
 
-      const network = issuedRequirements[0].network as 'base-sepolia' | 'polygon-amoy'
-      const payload = makePayload(network, issuedPaymentId)
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
       await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
 
       expect(fetchSpy).toHaveBeenCalledTimes(1)
@@ -162,17 +177,14 @@ describe('anychain402 middleware', () => {
       expect(first.body.accepts[0].extra.paymentId).not.toBe(second.body.accepts[0].extra.paymentId)
     })
 
-    it('rejects a payment attempt with no matching prior challenge instead of minting one silently', async () => {
+    it('rejects a payment against a well-formed but never-issued nonce, without calling the facilitator', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
-      const app = express()
-      app.use('/premium', anychain402(config))
-      app.get('/premium', (_req, res) => res.json({ ok: true }))
-      const server = app.listen(0)
-      servers.push(server)
+      const server = buildApp()
 
-      // No prior GET /premium against this server -> no cached challenge exists.
-      const payload = makePayload('base-sepolia', SOME_NONCE)
+      // No prior GET /premium against this server -> UNKNOWN_NONCE cannot be
+      // in the store under any key.
+      const payload = makePayload('base-sepolia', UNKNOWN_NONCE)
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
 
       expect(res.status).toBe(402)
@@ -181,6 +193,78 @@ describe('anychain402 middleware', () => {
       // Must fail closed locally, without ever asking the facilitator to
       // verify a payload that cannot possibly match anything we issued.
       expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('a challenge past its maxTimeoutSeconds is treated as unknown (TTL expiry), not a crash', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      // Fast-forward past the 300s default maxTimeoutSeconds by mocking
+      // Date.now (not vi.useFakeTimers, which would also stub setTimeout and
+      // risk interfering with supertest/Express's own use of real timers).
+      const realNow = Date.now()
+      vi.spyOn(Date, 'now').mockReturnValue(realNow + 301_000)
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('payment_expired')
+      expect(res.body.accepts).toHaveLength(2)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('concurrency (nonce-keyed store, not resource-keyed)', () => {
+    it('honors the FIRST of two outstanding challenges for the same resource when it is the one paid', async () => {
+      // Regression barrier for the resource-keyed design: two challenges for
+      // the identical resource string used to share one cache slot, so the
+      // second challenge silently evicted the first's paymentId. This test
+      // deterministically demonstrates two outstanding challenges for one
+      // resource (issued back to back, both still live) and pays the FIRST
+      // one - the ordinary "two users hit one endpoint" case, not a
+      // contrived race. Confirmed (see the task-6 report) to FAIL against
+      // the prior resource-keyed implementation: paying challenge A there
+      // sends challenge B's paymentId to the facilitator instead of A's.
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeA = await request(server).get('/premium')
+      const challengeB = await request(server).get('/premium')
+      const requirementA = challengeA.body.accepts[0] as PaymentRequirements
+      const requirementB = challengeB.body.accepts[0] as PaymentRequirements
+      expect(requirementA.extra?.paymentId).not.toBe(requirementB.extra?.paymentId)
+
+      const payload = makePayload(requirementA.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirementA))
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ ok: true })
+      const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
+      const sentBody = JSON.parse(init.body as string)
+      expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirementA.extra?.paymentId)
+    })
+
+    it('also honors the SECOND of two outstanding challenges for the same resource, independently of the first', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      await request(server).get('/premium')
+      const challengeB = await request(server).get('/premium')
+      const requirementB = challengeB.body.accepts[0] as PaymentRequirements
+
+      const payload = makePayload(requirementB.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirementB))
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+
+      expect(res.status).toBe(200)
+      const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
+      const sentBody = JSON.parse(init.body as string)
+      expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirementB.extra?.paymentId)
     })
   })
 
@@ -204,12 +288,14 @@ describe('anychain402 middleware', () => {
       expect(res.body.error).toBe('invalid_payload')
     })
 
-    it('returns 402 invalid_network for a schema-valid payload naming an unaccepted network', async () => {
+    it('returns 402 invalid_network when a real nonce is presented with a mismatched outer network', async () => {
       const server = appWith({})
       const challengeRes = await request(server).get('/premium')
-      const paymentId = challengeRes.body.accepts[0].extra.paymentId
-      // 'base' is a real SupportedChain but not in config.accept for this fixture.
-      const payload = { ...makePayload('base-sepolia', paymentId), network: 'base' }
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements // base-sepolia
+      // The nonce is only valid for base-sepolia (it is derived from
+      // base-sepolia's merchantEvm+paymentId); claiming 'base' in the outer
+      // envelope must be rejected even though 'base' is a real SupportedChain.
+      const payload = { ...makePayload('base-sepolia', nonceFor(requirement)), network: 'base' }
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
       expect(res.body.error).toBe('invalid_network')
@@ -221,15 +307,11 @@ describe('anychain402 middleware', () => {
       globalThis.fetch = vi.fn(async () => {
         throw new Error('ECONNREFUSED')
       }) as any
-      const app = express()
-      app.use('/premium', anychain402(config))
-      app.get('/premium', (_req, res) => res.json({ ok: true }))
-      const server = app.listen(0)
-      servers.push(server)
+      const server = buildApp()
 
       const challengeRes = await request(server).get('/premium')
-      const paymentId = challengeRes.body.accepts[0].extra.paymentId
-      const payload = makePayload('base-sepolia', paymentId)
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
 
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
@@ -238,15 +320,11 @@ describe('anychain402 middleware', () => {
 
     it('returns a clean 402 when the facilitator responds with a non-2xx status', async () => {
       globalThis.fetch = vi.fn(async () => new Response('internal error', { status: 500 })) as any
-      const app = express()
-      app.use('/premium', anychain402(config))
-      app.get('/premium', (_req, res) => res.json({ ok: true }))
-      const server = app.listen(0)
-      servers.push(server)
+      const server = buildApp()
 
       const challengeRes = await request(server).get('/premium')
-      const paymentId = challengeRes.body.accepts[0].extra.paymentId
-      const payload = makePayload('base-sepolia', paymentId)
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
 
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
