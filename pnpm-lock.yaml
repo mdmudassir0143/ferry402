@@ -13,7 +13,7 @@ importers:
 
   packages/facilitator:
     dependencies:
-      '@anychain402/sdk':
+      '@ferry402/sdk':
         specifier: workspace:*
         version: link:../sdk
       '@hashgraph/sdk':
