@@ -23,7 +23,7 @@ export interface CachedChallenge {
  * Storage for outstanding 402 challenges, keyed by the exact EIP-3009 nonce
  * a payer signs against (see `computeNonce`).
  *
- * `anychain402` writes one entry per accepted chain every time it issues a
+ * `ferry402` writes one entry per accepted chain every time it issues a
  * challenge — one nonce per chain, since `merchantEvm` differs per chain
  * even though `paymentId` is shared across a single `buildRequirements`
  * call — and reads/consumes a single entry back by nonce when a payment
@@ -36,7 +36,7 @@ export interface CachedChallenge {
  *
  * **Nonce casing:** every `nonce` parameter here MUST already be normalized
  * to lowercase (`normalizeNonce`/`computeNonce` in `nonce.ts`) before it
- * reaches this interface — `anychain402` guarantees this for every call it
+ * reaches this interface — `ferry402` guarantees this for every call it
  * makes. x402's own `PaymentPayloadSchema` accepts mixed/upper-case hex for
  * `authorization.nonce`, but `bytes32` has no casing on-chain, so two
  * differently-cased strings naming the same 32 bytes MUST be treated as the
@@ -46,12 +46,12 @@ export interface CachedChallenge {
  *
  * Every method is async so a real deployment can back this with a shared
  * store (Redis, a database, ...) instead of the in-memory default —
- * `anychain402(config, { store })` accepts any implementation of this
+ * `ferry402(config, { store })` accepts any implementation of this
  * interface without any other code changing. This is the seam for the
  * follow-up work the task-6 report flags: `InMemoryChallengeStore` (the
  * default) does not survive a process restart and is not shared across
  * horizontally-scaled instances behind a load balancer. Swapping the store
- * fixes both without touching `anychain402` or its callers.
+ * fixes both without touching `ferry402` or its callers.
  */
 export interface ChallengeStore {
   /** Returns the challenge issued for `nonce` WITHOUT removing it, or
@@ -64,7 +64,7 @@ export interface ChallengeStore {
    *  concurrent callers can both observe the same still-present entry. */
   get(nonce: `0x${string}`): Promise<CachedChallenge | undefined>
   /** Persists a newly issued challenge under `nonce`, replacing any prior
-   *  entry at that key. Also used by `anychain402` to reinstate a challenge
+   *  entry at that key. Also used by `ferry402` to reinstate a challenge
    *  it `consume`d but then failed to confirm as valid (a facilitator error,
    *  or an explicit `isValid: false`) — see `middleware.ts`. */
   set(nonce: `0x${string}`, entry: CachedChallenge): Promise<void>
@@ -80,7 +80,7 @@ export interface ChallengeStore {
    *  rejection) is expected to `set` the same entry back to reinstate it. */
   consume(nonce: `0x${string}`): Promise<CachedChallenge | undefined>
   /** Removes an entry outright, with no return value — used when a challenge
-   *  should never be reinstated (not currently called by `anychain402`
+   *  should never be reinstated (not currently called by `ferry402`
    *  itself, which always goes through `consume`, but part of the interface
    *  for implementations/consumers that want it, e.g. explicit revocation). */
   delete(nonce: `0x${string}`): Promise<void>
@@ -89,7 +89,7 @@ export interface ChallengeStore {
 const DEFAULT_MAX_ENTRIES = 10_000
 
 /**
- * In-memory `ChallengeStore`, the default `anychain402` uses when no `store`
+ * In-memory `ChallengeStore`, the default `ferry402` uses when no `store`
  * option is supplied. Good enough for a single-process deployment; NOT
  * durable across restarts and NOT shared across horizontally-scaled
  * instances behind a load balancer (a payment routed to a different
@@ -106,7 +106,7 @@ const DEFAULT_MAX_ENTRIES = 10_000
  * Bounded to `maxEntries` (oldest-inserted evicted first) so a client that
  * can cause many distinct challenges to be minted (e.g. varying a resource's
  * query string, or repeatedly sending unparseable `X-PAYMENT` headers, each
- * of which causes `anychain402` to mint and store a fresh challenge) cannot
+ * of which causes `ferry402` to mint and store a fresh challenge) cannot
  * grow this process's memory without bound. Expired entries are pruned
  * lazily on every `set()`, and treated as absent by `get()`/`consume()` even
  * before they're swept.

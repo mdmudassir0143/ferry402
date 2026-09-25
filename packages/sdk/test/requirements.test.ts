@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { buildRequirements, parsePrice } from '../src/requirements.js'
-import type { Anychain402Config } from '../src/types.js'
+import type { Ferry402Config } from '../src/types.js'
 
-const config: Anychain402Config = {
+const config: Ferry402Config = {
   price: '$0.01',
   accept: ['base-sepolia', 'polygon-amoy'],
   settleTo: 'hedera',

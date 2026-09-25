@@ -1,5 +1,5 @@
 {
-  "name": "@anychain402/facilitator",
+  "name": "@ferry402/facilitator",
   "version": "0.1.0",
   "private": false,
   "license": "MIT",
@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@anychain402/sdk": "workspace:*",
+    "@ferry402/sdk": "workspace:*",
     "@hashgraph/sdk": "2.81.0",
     "express": "^5.2.1",
     "viem": "^2.56.8",

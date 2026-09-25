@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import type { Address, Hex } from 'viem'
-import { computeNonce } from '@anychain402/sdk'
+import { computeNonce } from '@ferry402/sdk'
 import { verifyPayment } from '../src/chains/base.js'
 import { startAnvilWithDomainToken, ANVIL_PAYER_PRIVATE_KEY, ANVIL_PAYER_ADDRESS, type AnvilFixture } from './support/anvil.js'
 import { ESCROW_ADDRESS, DEFAULT_ESCROWS, buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'

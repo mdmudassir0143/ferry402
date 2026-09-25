@@ -21,7 +21,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { base, baseSepolia } from 'viem/chains'
 import { ErrorReasons } from 'x402/types'
 import type { PaymentPayload, PaymentRequirements } from 'x402/types'
-import { computeNonce } from '@anychain402/sdk'
+import { computeNonce } from '@ferry402/sdk'
 
 /**
  * The subset of x402's `ErrorReasons` this verifier can actually produce.
@@ -361,7 +361,7 @@ function addressesEqual(a: string, b: string): boolean {
  * is caller-supplied and satisfies checks 1-4 trivially — see I3 in the
  * task-7 review), so a stalled upstream RPC must fail fast rather than hold
  * the request for anywhere near viem's defaults (10s timeout * 3 retries ≈
- * 40s), especially since `anychain402`'s own middleware already gives up on
+ * 40s), especially since `ferry402`'s own middleware already gives up on
  * `/verify` at 5s.
  */
 const VERIFY_TRANSPORT_OPTIONS = { timeout: 2_000, retryCount: 1 } as const
@@ -880,7 +880,7 @@ export async function verifyPayment(
  * Hand-written rather than imported from a build artifact — this facilitator
  * has exactly one contract it ever calls, and hand-writing the handful of
  * entries it actually uses avoids a build-time dependency from
- * `@anychain402/facilitator` on `@anychain402/contracts`' compiled output.
+ * `@ferry402/facilitator` on `@ferry402/contracts`' compiled output.
  * Declaring the errors here (not just the function) matters for more than
  * documentation: viem's own revert decoding (`decodeErrorResult`, used
  * internally by `ContractFunctionRevertedError`) only recognizes a custom

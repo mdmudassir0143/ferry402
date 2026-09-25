@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import request from 'supertest'
 import type { Address, Hex } from 'viem'
-import { computeNonce } from '@anychain402/sdk'
+import { computeNonce } from '@ferry402/sdk'
 import { createFacilitatorApp } from '../src/server.js'
 import {
   startAnvilWithDomainToken,

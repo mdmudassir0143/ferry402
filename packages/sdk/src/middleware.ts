@@ -5,7 +5,7 @@ import { buildRequirements } from './requirements.js'
 import { computeNonce, normalizeNonce } from './nonce.js'
 import { InMemoryChallengeStore } from './challengeStore.js'
 import type { ChallengeStore, CachedChallenge } from './challengeStore.js'
-import type { Anychain402Config, PaymentRequirements } from './types.js'
+import type { Ferry402Config, PaymentRequirements } from './types.js'
 
 const DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -37,7 +37,7 @@ function parseAtomicAmount(value: string): bigint | undefined {
   }
 }
 
-export interface Anychain402Options {
+export interface Ferry402Options {
   /**
    * Storage for outstanding 402 challenges. Defaults to a fresh
    * `InMemoryChallengeStore` — fine for a single process, but see
@@ -153,8 +153,8 @@ export interface Anychain402Options {
  * one immutable token — but that is a secondary observation, not the reason
  * the check is unnecessary; it holds only so long as `config.escrows` and
  * `config.assets` are configured consistently with each other, which
- * `anychain402` does not itself validate — a configuration hazard for the
- * developer wiring up `Anychain402Config`, not something a payer can
+ * `ferry402` does not itself validate — a configuration hazard for the
+ * developer wiring up `Ferry402Config`, not something a payer can
  * exploit.)
  *
  * KNOWN LIMITATIONS (accepted for this task's slice, see the task-6 report):
@@ -163,7 +163,7 @@ export interface Anychain402Options {
  *   instances — a payment routed to a different instance than the one that
  *   issued its challenge is (correctly, if unhelpfully) told its challenge
  *   expired. Pass `{ store }` with a shared implementation (Redis, a
- *   database) to fix this; `anychain402`'s signature does not need to
+ *   database) to fix this; `ferry402`'s signature does not need to
  *   change.
  * - This function only calls `/verify`, never `/settle`. Double-*collection*
  *   protection (the same authorization being settled on-chain twice) is the
@@ -197,7 +197,7 @@ export interface Anychain402Options {
  *   reserving anything before confirmation, which is intentionally NOT
  *   implemented here — it is separately scoped follow-up work.
  */
-export function anychain402(config: Anychain402Config, options: Anychain402Options = {}): RequestHandler {
+export function ferry402(config: Ferry402Config, options: Ferry402Options = {}): RequestHandler {
   const store = options.store ?? new InMemoryChallengeStore()
 
   async function issueChallenge(resource: string): Promise<PaymentRequirements[]> {

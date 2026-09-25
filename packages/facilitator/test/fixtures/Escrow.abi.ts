@@ -3,7 +3,7 @@
 // facilitator tests only need `anvil` at runtime, not `forge` -- see
 // test/support/anvil.ts's startAnvilWithEscrow helper. Mirrors the pattern
 // used by DomainToken.abi.ts in this same directory.
-// Regenerate by recompiling Escrow.sol (`pnpm --filter @anychain402/contracts build`)
+// Regenerate by recompiling Escrow.sol (`pnpm --filter @ferry402/contracts build`)
 // and re-copying its abi/bytecode from
 // packages/contracts/out/Escrow.sol/Escrow.json if Escrow.sol changes.
 export const escrowAbi = [

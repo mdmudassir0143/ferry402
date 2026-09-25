@@ -1,16 +1,16 @@
-# @anychain402/facilitator
+# @ferry402/facilitator
 
 The x402 facilitator: verifies and settles EIP-3009 payments into a per-chain
 `Escrow` on Base, and journals settled payments to a Hedera Consensus Service
 (HCS) topic for reconciliation. See
-`docs/superpowers/specs/2026-09-23-anychain402-design.md` at the repo root for
+`docs/superpowers/specs/2026-09-23-ferry402-design.md` at the repo root for
 the full design (including Amendments 2 and 3, both binding on the shapes
 below).
 
 ## Configuring `createFacilitatorApp`
 
 ```ts
-import { createFacilitatorApp } from '@anychain402/facilitator'
+import { createFacilitatorApp } from '@ferry402/facilitator'
 
 const app = createFacilitatorApp({
   // REQUIRED. See "The escrows option" below.
@@ -66,7 +66,7 @@ ordered, mirror-node-queryable ledger. Typical wiring, after a successful
 `settlePayment` call:
 
 ```ts
-import { journalEntryForSettlement, writeEntry, createHederaTopicSubmitter } from '@anychain402/facilitator'
+import { journalEntryForSettlement, writeEntry, createHederaTopicSubmitter } from '@ferry402/facilitator'
 import { Client } from '@hashgraph/sdk'
 
 const client = Client.forTestnet().setOperator(process.env.HEDERA_ACCOUNT_ID!, process.env.HEDERA_PRIVATE_KEY!)
@@ -117,7 +117,7 @@ returned had it stopped there (`error.cause` carries the underlying
 submitter error):
 
 ```ts
-import { writeEntries, PartialBatchWriteError } from '@anychain402/facilitator'
+import { writeEntries, PartialBatchWriteError } from '@ferry402/facilitator'
 
 try {
   await writeEntries(entries, { topicId, submitter })
@@ -160,7 +160,7 @@ responsible for reading `process.env` and passing values in, as shown above.
 ## Testing
 
 ```
-pnpm --filter @anychain402/facilitator test
+pnpm --filter @ferry402/facilitator test
 ```
 
 Chain-facing tests (`verify.test.ts`, `settle.fork.test.ts`, `server.test.ts`,

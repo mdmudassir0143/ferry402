@@ -10,7 +10,7 @@
 export type { PaymentRequirements } from 'x402/types'
 
 /**
- * Chains anychain402 can advertise as payment options.
+ * Chains ferry402 can advertise as payment options.
  *
  * This is intentionally a subset of upstream x402's `Network` enum, verified
  * against x402@1.2.0's own schema (`PaymentRequirementsSchema.network`):
@@ -20,7 +20,7 @@ export type { PaymentRequirements } from 'x402/types'
  *   "educhain" | "skale-base-sepolia"
  *
  * `base`, `base-sepolia`, `polygon`, and `polygon-amoy` are the only chains
- * anychain402 v1 has an `Escrow` deployment story for. Do not add Arbitrum,
+ * ferry402 v1 has an `Escrow` deployment story for. Do not add Arbitrum,
  * Ethereum, Optimism, or Hedera here: none of those appear in upstream's
  * enum, so a `PaymentRequirements` entry naming them would fail upstream
  * validation.
@@ -31,12 +31,12 @@ export type SupportedChain = 'base' | 'base-sepolia' | 'polygon' | 'polygon-amoy
  * One merchant's multi-chain acceptance config. `buildRequirements` turns
  * this into the array of `PaymentRequirements` a 402 response advertises.
  */
-export type Anychain402Config = {
+export type Ferry402Config = {
   /** Price as a decimal-dollar string, e.g. "$0.01". USDC only in v1. */
   price: string
   /** Chains this merchant is willing to accept payment on. */
   accept: SupportedChain[]
-  /** anychain402 v1 always settles to Hedera. */
+  /** ferry402 v1 always settles to Hedera. */
   settleTo: 'hedera'
   /**
    * Merchant identity on the clearing layer: a Hedera account id (e.g.

@@ -91,7 +91,7 @@ export interface FacilitatorAppOptions {
  * `POST /verify` and `POST /settle` are the facilitator's only routes. Both
  * request bodies are parsed against x402's own schemas (`VerifyRequestSchema`
  * / `SettleRequestSchema`) — not hand-rolled — because this endpoint is a
- * separate trust domain boundary: whoever is running `anychain402`'s
+ * separate trust domain boundary: whoever is running `ferry402`'s
  * middleware is a caller we don't otherwise control, and a malformed or
  * malicious body must never reach `verifyPayment`/`settlePayment` un-typed.
  *
@@ -131,7 +131,7 @@ export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Expre
     // Validate our own outgoing shape against x402's schema before sending —
     // the same "parse, don't hand-roll" discipline applied to the response
     // side, and cheap insurance against a future change to `VerifyResult`
-    // drifting from what `anychain402`'s middleware expects to parse back.
+    // drifting from what `ferry402`'s middleware expects to parse back.
     const parsedResponse = VerifyResponseSchema.safeParse(result)
     if (!parsedResponse.success) {
       res.status(200).json({ isValid: false, invalidReason: 'unexpected_verify_error' })

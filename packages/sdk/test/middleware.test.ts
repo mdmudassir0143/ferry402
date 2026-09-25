@@ -2,15 +2,15 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import type { Server } from 'node:http'
-import { anychain402 } from '../src/index.js'
+import { ferry402 } from '../src/index.js'
 import { computeNonce } from '../src/nonce.js'
 import type { ChallengeStore, CachedChallenge } from '../src/challengeStore.js'
-import type { Anychain402Config, PaymentRequirements } from '../src/types.js'
+import type { Ferry402Config, PaymentRequirements } from '../src/types.js'
 
 // Reused verbatim from Task 5's requirements.test.ts fixture (per the
 // controller's ruling: T6 reuses T5's config fixture rather than inventing a
 // second one), extended with the fields buildRequirements needs.
-const config: Anychain402Config = {
+const config: Ferry402Config = {
   price: '$0.01',
   accept: ['base-sepolia', 'polygon-amoy'],
   settleTo: 'hedera',
@@ -78,7 +78,7 @@ function nonceFor(requirement: PaymentRequirements): `0x${string}` {
 
 // A well-formed nonce that was never issued by any challenge in the test -
 // i.e. it does not equal computeNonce(merchantEvm, paymentId) for anything
-// anychain402 actually generated.
+// ferry402 actually generated.
 const UNKNOWN_NONCE = `0x${'11'.repeat(32)}` as const
 
 function toHeader(payload: unknown): string {
@@ -98,7 +98,7 @@ const servers: Server[] = []
 
 function buildApp(): Server {
   const app = express()
-  app.use('/premium', anychain402(config))
+  app.use('/premium', ferry402(config))
   app.get('/premium', (_req, res) => res.json({ ok: true }))
   const server = app.listen(0)
   servers.push(server)
@@ -114,10 +114,10 @@ function appWith(verifyResult: unknown): Server {
  * The simplest possible `ChallengeStore`: a raw `Map`, keyed on whatever
  * string it is given, with NO casing normalization of its own. This is
  * deliberately naive - it stands in for a third-party store (Redis, a
- * database) that someone plugs into `anychain402(config, { store })` without
+ * database) that someone plugs into `ferry402(config, { store })` without
  * having thought about nonce casing at all, since `ChallengeStore`'s
- * contract puts that burden on the CALLER (`anychain402` itself), not on
- * every implementation. If `anychain402` ever stopped normalizing the
+ * contract puts that burden on the CALLER (`ferry402` itself), not on
+ * every implementation. If `ferry402` ever stopped normalizing the
  * payer's nonce before calling this store, an uppercase-hex nonce (valid
  * per x402's schema; see nonce.test.ts) would silently miss this Map, since
  * nothing here would fold its casing either.
@@ -149,7 +149,7 @@ afterEach(() => {
   for (const server of servers.splice(0)) server.close()
 })
 
-describe('anychain402 middleware', () => {
+describe('ferry402 middleware', () => {
   it('returns 402 with an accepts array when no payment is present', async () => {
     const res = await request(appWith({})).get('/premium')
     expect(res.status).toBe(402)
@@ -430,12 +430,12 @@ describe('anychain402 middleware', () => {
       // via `{ store }` - if it were carrying the real protection here, this
       // test would be meaningless. Using CaseSensitiveMapStore instead of
       // the default proves the protection payers of a CUSTOM store actually
-      // get comes from `anychain402` itself normalizing before it ever calls
+      // get comes from `ferry402` itself normalizing before it ever calls
       // the store, exactly as `ChallengeStore`'s contract requires.
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const app = express()
-      app.use('/premium', anychain402(config, { store: new CaseSensitiveMapStore() }))
+      app.use('/premium', ferry402(config, { store: new CaseSensitiveMapStore() }))
       app.get('/premium', (_req, res) => res.json({ ok: true }))
       const server = app.listen(0)
       servers.push(server)

@@ -28,7 +28,7 @@ vi.mock('viem', async (importOriginal) => {
 const { verifyPayment } = await import('../src/chains/base.js')
 const { startAnvilWithDomainToken } = await import('./support/anvil.js')
 const { ESCROW_ADDRESS, DEFAULT_ESCROWS, buildRequirements, buildPayload } = await import('./support/fixtures.js')
-const { computeNonce } = await import('@anychain402/sdk')
+const { computeNonce } = await import('@ferry402/sdk')
 
 const MERCHANT_EVM: Address = '0x1111111111111111111111111111111111111111'
 const PAYMENT_ID: Hex = '0x00000000000000000000000000000000000000000000000000000000000004d2'

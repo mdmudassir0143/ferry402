@@ -6,7 +6,7 @@ import type { SettleResult } from './chains/base.js'
  *
  * The brief this file was scaffolded from specified a `JournalEntry` schema
  * that predates two spec amendments (see
- * `docs/superpowers/specs/2026-09-23-anychain402-design.md`). Both are
+ * `docs/superpowers/specs/2026-09-23-ferry402-design.md`). Both are
  * load-bearing here, not cosmetic:
  *
  * - **Amendment 3** (merchant identity is two identifiers, not one): the

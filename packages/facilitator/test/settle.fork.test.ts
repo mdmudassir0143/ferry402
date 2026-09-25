@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createPublicClient, createWalletClient, http, BaseError, ContractFunctionRevertedError, type Address, type Hex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { foundry } from 'viem/chains'
-import { computeNonce } from '@anychain402/sdk'
+import { computeNonce } from '@ferry402/sdk'
 import { settlePayment, type SettleOptions } from '../src/chains/base.js'
 import {
   startAnvilWithEscrow,

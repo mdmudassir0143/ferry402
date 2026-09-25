@@ -4,7 +4,7 @@ const HEX_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 const HEX_32_BYTE_RE = /^0x[0-9a-fA-F]{64}$/
 
 /**
- * Computes the EIP-3009 authorization `nonce` an anychain402 payer must sign
+ * Computes the EIP-3009 authorization `nonce` an ferry402 payer must sign
  * for a given `(merchantEvm, paymentId)` pair:
  *
  * ```
@@ -15,7 +15,7 @@ const HEX_32_BYTE_RE = /^0x[0-9a-fA-F]{64}$/
  * (`packages/contracts/src/Escrow.sol`) — the contract recomputes this exact
  * hash on-chain and reverts `MerchantNotBound` if the payer's signed nonce
  * doesn't match it. A facilitator's `/verify` is expected to recompute the
- * same hash off-chain before settling, and `anychain402`'s middleware
+ * same hash off-chain before settling, and `ferry402`'s middleware
  * recomputes it to index its challenge store by the nonce a payer will
  * actually sign. All three call sites must agree byte-for-byte, which is why
  * this is one implementation exported from the SDK rather than three

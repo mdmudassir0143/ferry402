@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import type { Anychain402Config, PaymentRequirements, SupportedChain } from './types.js'
+import type { Ferry402Config, PaymentRequirements, SupportedChain } from './types.js'
 
 const USDC_DECIMALS = 6
 const PAYMENT_ID_RE = /^0x[0-9a-fA-F]{64}$/
@@ -82,7 +82,7 @@ export interface BuildRequirementsOptions {
  * `paymentId` — nothing here is looked up or awaited.
  */
 export function buildRequirements(
-  config: Anychain402Config,
+  config: Ferry402Config,
   resource: string,
   options: BuildRequirementsOptions = {},
 ): PaymentRequirements[] {

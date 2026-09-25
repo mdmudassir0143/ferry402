@@ -1,4 +1,4 @@
-# anychain402 — Plan 1: Base Vertical Slice
+# ferry402 — Plan 1: Base Vertical Slice
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Foundry (Solidity 0.8.24), TypeScript 5.x, pnpm workspaces, Express, viem, `@hashgraph/sdk`, Vitest.
 
-**Spec:** `docs/superpowers/specs/2026-09-23-anychain402-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-23-ferry402-design.md`
 
 ## Global Constraints
 
@@ -61,7 +61,7 @@ packages/
     src/index.ts              public exports
     src/middleware.ts         Express middleware; emits multi-entry accepts
     src/requirements.ts       builds PaymentRequirements[] from config
-    src/types.ts              Anychain402Config and friends
+    src/types.ts              Ferry402Config and friends
     test/*.test.ts
   facilitator/
     src/server.ts             Express app: /verify, /settle
@@ -101,7 +101,7 @@ EOF
 
 ```json
 {
-  "name": "anychain402",
+  "name": "ferry402",
   "private": true,
   "license": "MIT",
   "engines": { "node": ">=20.18.3" },
@@ -453,9 +453,9 @@ git add packages/contracts && git commit -m "test(contracts): replay fuzzing and
 **Interfaces:**
 - Consumes: nothing from earlier tasks
 - Produces:
-  - `type Anychain402Config = { price: string; accept: SupportedChain[]; settleTo: 'hedera'; merchant: string; facilitator: string; escrows: Record<SupportedChain, \`0x${string}\`>; assets: Record<SupportedChain, \`0x${string}\`> }`
+  - `type Ferry402Config = { price: string; accept: SupportedChain[]; settleTo: 'hedera'; merchant: string; facilitator: string; escrows: Record<SupportedChain, \`0x${string}\`>; assets: Record<SupportedChain, \`0x${string}\`> }`
   - `type SupportedChain = 'base' | 'base-sepolia' | 'polygon' | 'polygon-amoy'`
-  - `buildRequirements(config: Anychain402Config, resource: string): PaymentRequirements[]`
+  - `buildRequirements(config: Ferry402Config, resource: string): PaymentRequirements[]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -501,13 +501,13 @@ describe('buildRequirements', () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement `requirements.ts`**
 
 ```ts
-import type { Anychain402Config, PaymentRequirements } from './types'
+import type { Ferry402Config, PaymentRequirements } from './types'
 
 const USDC_DECIMALS = 6
 
@@ -520,7 +520,7 @@ export function parsePrice(price: string): string {
 }
 
 export function buildRequirements(
-  config: Anychain402Config,
+  config: Ferry402Config,
   resource: string,
 ): PaymentRequirements[] {
   const maxAmountRequired = parsePrice(config.price)
@@ -541,7 +541,7 @@ export function buildRequirements(
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Verify the testnet USDC addresses before relying on them**
@@ -570,8 +570,8 @@ git add packages/sdk && git commit -m "feat(sdk): build multi-chain PaymentRequi
 - Test: `packages/sdk/test/middleware.test.ts`
 
 **Interfaces:**
-- Consumes: `buildRequirements`, `Anychain402Config` from Task 5
-- Produces: `anychain402(config: Anychain402Config): RequestHandler`
+- Consumes: `buildRequirements`, `Ferry402Config` from Task 5
+- Produces: `ferry402(config: Ferry402Config): RequestHandler`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -579,13 +579,13 @@ git add packages/sdk && git commit -m "feat(sdk): build multi-chain PaymentRequi
 import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
-import { anychain402 } from '../src'
+import { ferry402 } from '../src'
 
 function appWith(verifyResult: any) {
   globalThis.fetch = vi.fn(async () =>
     new Response(JSON.stringify(verifyResult), { status: 200 })) as any
   const app = express()
-  app.use('/premium', anychain402(config as any))
+  app.use('/premium', ferry402(config as any))
   app.get('/premium', (_req, res) => res.json({ ok: true }))
   return app
 }
@@ -614,17 +614,17 @@ it('returns 402 with the reason when verification fails', async () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/sdk test`
-Expected: FAIL — `anychain402` not exported.
+Run: `pnpm --filter @ferry402/sdk test`
+Expected: FAIL — `ferry402` not exported.
 
 - [ ] **Step 3: Implement the middleware**
 
 ```ts
 import type { Request, Response, NextFunction, RequestHandler } from 'express'
 import { buildRequirements } from './requirements'
-import type { Anychain402Config } from './types'
+import type { Ferry402Config } from './types'
 
-export function anychain402(config: Anychain402Config): RequestHandler {
+export function ferry402(config: Ferry402Config): RequestHandler {
   return async (req: Request, res: Response, next: NextFunction) => {
     const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`
     const accepts = buildRequirements(config, resource)
@@ -669,7 +669,7 @@ export function anychain402(config: Anychain402Config): RequestHandler {
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Commit**
@@ -723,7 +723,7 @@ it('accepts a well-formed authorization signed by the payer', async () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test`
+Run: `pnpm --filter @ferry402/facilitator test`
 Expected: FAIL — `verifyPayment` not defined.
 
 - [ ] **Step 3: Implement verification**
@@ -738,7 +738,7 @@ enum on the first failure.
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test`
+Run: `pnpm --filter @ferry402/facilitator test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Commit**
@@ -782,7 +782,7 @@ Run this against an anvil fork: `anvil --fork-url https://sepolia.base.org`.
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test settle`
+Run: `pnpm --filter @ferry402/facilitator test settle`
 Expected: FAIL — `settlePayment` not defined.
 
 - [ ] **Step 3: Implement settlement**
@@ -794,7 +794,7 @@ funded from `FACILITATOR_PRIVATE_KEY`, wait for the receipt, and return the
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test settle`
+Run: `pnpm --filter @ferry402/facilitator test settle`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -834,7 +834,7 @@ it('rejects an entry missing its originating txHash', () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test journal`
+Run: `pnpm --filter @ferry402/facilitator test journal`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the writer**
@@ -846,7 +846,7 @@ from `@hashgraph/sdk`, using a client built from `HEDERA_ACCOUNT_ID` and
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test journal`
+Run: `pnpm --filter @ferry402/facilitator test journal`
 Expected: PASS, 2 tests.
 
 - [ ] **Step 5: Commit**
@@ -882,13 +882,13 @@ Record the address in `.env.example` as a comment, not as a secret.
 - [ ] **Step 2: Create the HCS topic**
 
 ```bash
-pnpm --filter @anychain402/facilitator exec tsx scripts/create-topic.ts
+pnpm --filter @ferry402/facilitator exec tsx scripts/create-topic.ts
 ```
 Expected: prints a topic id like `0.0.xxxxxxx`. Record it.
 
 - [ ] **Step 3: Write the end-to-end test**
 
-Start the facilitator, start a demo Express app using `anychain402`, then:
+Start the facilitator, start a demo Express app using `ferry402`, then:
 request without payment and assert 402 with two `accepts` entries; sign a real
 EIP-3009 authorization with a funded Base Sepolia key; retry with `X-PAYMENT`;
 assert 200. Then assert `escrow.balanceOf(merchant)` increased and that the HCS
@@ -896,7 +896,7 @@ topic gained a message whose `txHash` matches the settlement transaction.
 
 - [ ] **Step 4: Run it**
 
-Run: `pnpm --filter @anychain402/facilitator test e2e`
+Run: `pnpm --filter @ferry402/facilitator test e2e`
 Expected: PASS. Capture the settlement tx hash and the Hashscan topic URL.
 
 - [ ] **Step 5: Write the README**
@@ -928,7 +928,7 @@ network enum. Options: contribute the network upstream, fork the schema, or drop
 Arbitrum from v1. Decide before Plan 3 begins, not during it.
 
 **Type consistency.** `Authorization` is spelled identically in Tasks 2, 3, 4, 7
-and 8. `buildRequirements` and `Anychain402Config` from Task 5 are used unchanged
+and 8. `buildRequirements` and `Ferry402Config` from Task 5 are used unchanged
 in Task 6. `SettleResponse` field names in Task 8 match the upstream schema
 verified above.
 
