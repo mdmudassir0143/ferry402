@@ -515,24 +515,71 @@ describe('ferry402 middleware', () => {
     })
   })
 
-  describe('misconfigured merchantEvm (carry-forward from Task 12 review): fail loudly, never publish a placeholder', () => {
-    it('throws rather than publishing an all-zero paymentId when a network in config.accept has no merchantEvm entry', async () => {
-      // `types.ts`'s `Ferry402Config.merchantEvm` is `Record<SupportedChain,
-      // ...>` and is not partial, so this can only happen via a config that
-      // bypasses the type system (e.g. built from untyped JSON/env vars) -
-      // exactly the case worth defending against, since TypeScript itself
-      // will not catch it. The old behavior here was `continue`, which left
-      // `extra.paymentId` at `buildRequirements`' internal all-zero
-      // placeholder and published THAT in the 402 body - indistinguishable
-      // from a real (if wrong) derived value. This must fail loudly instead.
-      const brokenConfig = {
-        ...config,
-        merchantEvm: { ...config.merchantEvm, 'base-sepolia': undefined },
-      } as unknown as Ferry402Config
+  describe('misconfigured merchantEvm (carry-forward from Task 12 review, round 1: fail loudly WITHOUT crashing the process)', () => {
+    // `types.ts`'s `Ferry402Config.merchantEvm` is `Record<SupportedChain,
+    // ...>` and is not partial, so this can only happen via a config that
+    // bypasses the type system (e.g. built from untyped JSON/env vars) -
+    // exactly the case worth defending against, since TypeScript itself will
+    // not catch it. The pre-Task-13 behavior here was `continue`, which left
+    // `extra.paymentId` at `buildRequirements`' internal all-zero placeholder
+    // and published THAT in the 402 body - indistinguishable from a real (if
+    // wrong) derived value. `issueChallenge` now throws instead - but the
+    // returned handler is `async`, so an uncaught throw there rejects the
+    // HANDLER'S OWN returned promise, not just some inner one.
+    const brokenConfig = {
+      ...config,
+      merchantEvm: { ...config.merchantEvm, 'base-sepolia': undefined },
+    } as unknown as Ferry402Config
+
+    it('the handler itself NEVER rejects - it catches the throw and forwards it via next(err) instead', async () => {
+      // THIS is the property that actually matters for Express 4 safety, and
+      // the one this test pins directly rather than through an HTTP round
+      // trip (see the sibling "through a real Express app" test below for
+      // why that one, on its own, cannot tell fixed from broken here):
+      // Express 5 forwards a REJECTED middleware promise to `next(err)`
+      // automatically; Express 4 (still an accepted peer dependency,
+      // `^4.18.0 || ^5.0.0`) does not - it neither awaits nor attaches a
+      // `.catch()` to what a middleware function returns, so a rejection
+      // there becomes an unhandled rejection on Node's own event loop and,
+      // under Node's default `--unhandled-rejections=throw` (since Node 15),
+      // crashes the WHOLE process. A handler whose promise always RESOLVES
+      // cannot trigger that, regardless of which Express major is dispatching
+      // it - which is exactly why this assertion is Express-version-agnostic.
       const handler = ferry402(brokenConfig)
       const req = fakeGetReq('https://api.test/premium')
       const res = fakeRes()
-      await expect(handler(req, res, (() => {}) as NextFunction)).rejects.toThrow(/merchantEvm/i)
+      const next = vi.fn()
+      await expect(handler(req, res, next as unknown as NextFunction)).resolves.toBeUndefined()
+      expect(next).toHaveBeenCalledTimes(1)
+      const [err] = next.mock.calls[0] as [unknown]
+      expect(err).toBeInstanceOf(Error)
+      expect((err as Error).message).toMatch(/merchantEvm/i)
+    })
+
+    it('through a REAL Express app: the request fails cleanly (an error response, no hang) and the server keeps serving other requests afterward', async () => {
+      // This exercises the real dispatch path end to end (a real `express()`
+      // app, a real listening server, a real `supertest` HTTP round trip),
+      // which the direct-call test above does not. Caveat, stated plainly:
+      // this package's installed `express` devDependency is v5, and Express
+      // 5's OWN auto-catch would still turn an uncaught throw into a clean
+      // error response here even WITHOUT this task's `try`/`catch` fix - so
+      // on its own, under the currently-installed Express major, this test
+      // cannot distinguish "fixed" from "relying on Express 5 to save us"
+      // (that is precisely the gap Express 4 does not cover). It is kept
+      // because it proves the real, practical, end-to-end behavior people
+      // actually depend on; the sibling test above is what is actually
+      // mutation-sensitive to the fix, and is Express-version-independent by
+      // construction. Together they cover both "does it work" and "why it
+      // works regardless of which Express major is installed."
+      const server = buildApp(brokenConfig)
+      const brokenRes = await request(server).get('/premium')
+      expect(brokenRes.status).toBeGreaterThanOrEqual(500)
+
+      // The process (and this very server) must still be alive and able to
+      // serve OTHER requests afterward - a crashed process could not.
+      const healthyServer = buildApp()
+      const okRes = await request(healthyServer).get('/premium')
+      expect(okRes.status).toBe(402)
     })
   })
 

@@ -244,166 +244,195 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
   }
 
   return async (req: Request, res: Response, next: NextFunction) => {
-    const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`
-    // Computed unconditionally, once, for every request: unlike the old
-    // store-backed `issueChallenge`, this costs nothing but a few HMAC
-    // computations — no I/O, no allocation proportional to request volume.
-    const requirements = issueChallenge(resource)
-    const header = req.header('X-PAYMENT')
-
-    if (!header) {
-      send402(res, requirements)
-      return
-    }
-
-    // Decode + parse are wrapped together: Buffer's base64 decoder does not
-    // throw on malformed input (it just decodes whatever it can), so the
-    // realistic failure here is JSON.parse throwing on the resulting bytes —
-    // but both are guarded regardless, since neither is a case this
-    // middleware should ever let escape as an unhandled exception.
-    let decoded: unknown
     try {
-      decoded = JSON.parse(Buffer.from(header, 'base64').toString('utf8'))
-    } catch {
-      send402(res, requirements, 'invalid_payload')
-      return
-    }
+      const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`
+      // Computed unconditionally, once, for every request: unlike the old
+      // store-backed `issueChallenge`, this costs nothing but a few HMAC
+      // computations — no I/O, no allocation proportional to request volume.
+      const requirements = issueChallenge(resource)
+      const header = req.header('X-PAYMENT')
 
-    // Parsed against x402's own PaymentPayloadSchema, not a hand-rolled
-    // shape check — see the task-6 corrections this implements.
-    const parsed = PaymentPayloadSchema.safeParse(decoded)
-    if (!parsed.success) {
-      send402(res, requirements, 'invalid_payload')
-      return
-    }
-    const paymentPayload = parsed.data
+      if (!header) {
+        send402(res, requirements)
+        return
+      }
 
-    if (!('authorization' in paymentPayload.payload)) {
-      // The schema's other branch is the exact-svm variant ({ transaction }),
-      // which carries no `nonce` at all. v1 is EVM-only (USDC on
-      // base/base-sepolia/polygon/polygon-amoy).
-      send402(res, requirements, 'invalid_payload')
-      return
-    }
-    const authorization = paymentPayload.payload.authorization
-    const presentedNonce = normalizeNonce(authorization.nonce)
-    // Task 12 round-1 review fix: replay defense is keyed on the PAIR, not
-    // the nonce alone — see ConsumedNonceStore's doc comment for why (the
-    // derivation has no payer term, so two different payers of the same
-    // resource in the same window derive the identical nonce; real USDC
-    // itself keys authorization-used state as `_authorizationStates[from]
-    // [nonce]` for exactly this reason).
-    const presentedFrom = normalizeAddress(authorization.from)
+      // Decode + parse are wrapped together: Buffer's base64 decoder does not
+      // throw on malformed input (it just decodes whatever it can), so the
+      // realistic failure here is JSON.parse throwing on the resulting bytes —
+      // but both are guarded regardless, since neither is a case this
+      // middleware should ever let escape as an unhandled exception.
+      let decoded: unknown
+      try {
+        decoded = JSON.parse(Buffer.from(header, 'base64').toString('utf8'))
+      } catch {
+        send402(res, requirements, 'invalid_payload')
+        return
+      }
 
-    const selected = requirements.find((r) => r.network === paymentPayload.network)
-    if (!selected) {
-      // The claimed network isn't one this merchant accepts at all — cheap,
-      // pre-derivation rejection; no HMAC needed to know this is wrong.
-      send402(res, requirements, 'invalid_network')
-      return
-    }
+      // Parsed against x402's own PaymentPayloadSchema, not a hand-rolled
+      // shape check — see the task-6 corrections this implements.
+      const parsed = PaymentPayloadSchema.safeParse(decoded)
+      if (!parsed.success) {
+        send402(res, requirements, 'invalid_payload')
+        return
+      }
+      const paymentPayload = parsed.data
 
-    const merchantEvm = selected.extra?.merchantEvm as `0x${string}`
-    // THE structural check: resource binding and TTL both fall out of this
-    // single recomputation (see challengeDerivation.ts's doc comment) rather
-    // than being separate lookups. A nonce for a different resource, a
-    // different merchant address, or more than one bucket in the past can
-    // never equal either candidate, by construction of the HMAC preimage —
-    // there is no store here to consult either way.
-    const matched = matchChallenge(config.secret, merchantEvm, resource, presentedNonce)
-    if (!matched) {
-      send402(res, requirements, 'payment_expired')
-      return
-    }
+      if (!('authorization' in paymentPayload.payload)) {
+        // The schema's other branch is the exact-svm variant ({ transaction }),
+        // which carries no `nonce` at all. v1 is EVM-only (USDC on
+        // base/base-sepolia/polygon/polygon-amoy).
+        send402(res, requirements, 'invalid_payload')
+        return
+      }
+      const authorization = paymentPayload.payload.authorization
+      const presentedNonce = normalizeNonce(authorization.nonce)
+      // Task 12 round-1 review fix: replay defense is keyed on the PAIR, not
+      // the nonce alone — see ConsumedNonceStore's doc comment for why (the
+      // derivation has no payer term, so two different payers of the same
+      // resource in the same window derive the identical nonce; real USDC
+      // itself keys authorization-used state as `_authorizationStates[from]
+      // [nonce]` for exactly this reason).
+      const presentedFrom = normalizeAddress(authorization.from)
 
-    // Local floor checks - cheap, and every input is already in hand. A
-    // facilitator is a separate trust domain reachable over the network;
-    // there is no reason to ask it to reject what we can already reject.
-    // `selected`'s static fields (maxAmountRequired, payTo) do not depend on
-    // which bucket matched, so they can be read straight off it.
-    //
-    // `value` is parsed via `parseAtomicAmount`, NOT a bare `BigInt(...)`:
-    // x402's own validator for this field is
-    // `Number.isInteger(Number(v)) && Number(v) >= 0`, which operates on the
-    // `Number()` coercion rather than the string's shape and so admits JS
-    // exponent notation - `"1e30"` passes (an integer, and only 4 characters,
-    // nowhere near the 18-char length cap) but `BigInt("1e30")` throws a
-    // SyntaxError. Reaching this line needs no valid payment at all: the 402
-    // challenge body itself publishes `extra.merchantEvm`, and the
-    // derivation is public knowledge of the request's own resource, so
-    // anyone can derive a matching nonce and reach here with a crafted
-    // `value` alone (review round 3's Critical finding, task 6).
-    const authorizedValue = parseAtomicAmount(authorization.value)
-    const requiredValue = parseAtomicAmount(selected.maxAmountRequired)
-    if (authorizedValue === undefined || requiredValue === undefined || authorizedValue < requiredValue) {
-      send402(res, requirements, 'invalid_exact_evm_payload_authorization_value')
-      return
-    }
-    if (authorization.to.toLowerCase() !== selected.payTo.toLowerCase()) {
-      send402(res, requirements, 'invalid_exact_evm_payload_recipient_mismatch')
-      return
-    }
-    const nowSeconds = Math.floor(Date.now() / 1000)
-    if (Number(authorization.validAfter) > nowSeconds) {
-      send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_after')
-      return
-    }
-    if (Number(authorization.validBefore) <= nowSeconds) {
-      send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_before')
-      return
-    }
+      const selected = requirements.find((r) => r.network === paymentPayload.network)
+      if (!selected) {
+        // The claimed network isn't one this merchant accepts at all — cheap,
+        // pre-derivation rejection; no HMAC needed to know this is wrong.
+        send402(res, requirements, 'invalid_network')
+        return
+      }
 
-    // The payer may have signed against the PREVIOUS bucket (see
-    // matchChallenge) rather than the CURRENT one `requirements`/`selected`
-    // were just built with — substitute `matched.paymentId` so what we hand
-    // the facilitator (and, downstream, on-chain settlement) is
-    // byte-for-byte what the payer actually signed.
-    const requirementForVerify: PaymentRequirements = {
-      ...selected,
-      extra: { ...selected.extra, paymentId: matched.paymentId },
-    }
+      const merchantEvm = selected.extra?.merchantEvm as `0x${string}`
+      // THE structural check: resource binding and TTL both fall out of this
+      // single recomputation (see challengeDerivation.ts's doc comment) rather
+      // than being separate lookups. A nonce for a different resource, a
+      // different merchant address, or more than one bucket in the past can
+      // never equal either candidate, by construction of the HMAC preimage —
+      // there is no store here to consult either way.
+      const matched = matchChallenge(config.secret, merchantEvm, resource, presentedNonce)
+      if (!matched) {
+        send402(res, requirements, 'payment_expired')
+        return
+      }
 
-    // Every check above was read-only. Only now, immediately before the
-    // facilitator call, do we actually consume the nonce — atomically, so
-    // concurrent replays of the identical X-PAYMENT header race safely (see
-    // ConsumedNonceStore's doc comment for why this must be a single
-    // check-and-set, not a read followed by a write after an await).
-    const expiresAt = Date.now() + 2 * TIME_BUCKET_SECONDS * 1000
-    let firstConsume: boolean
-    try {
-      firstConsume = await consumedNonceStore.consumeIfAbsent(presentedFrom, presentedNonce, expiresAt)
-    } catch {
-      send402(res, requirements, 'unexpected_verify_error')
-      return
-    }
-    if (!firstConsume) {
-      // Already consumed by a prior (or concurrently racing) request with
-      // the identical (from, nonce) pair — a genuine replay BY THE SAME
-      // PAYER. A different payer presenting the same nonce is a different
-      // pair and is never rejected here (see ConsumedNonceStore's doc
-      // comment). Rejected locally; the facilitator is never called a
-      // second time for it.
-      send402(res, requirements, 'payment_expired')
-      return
-    }
+      // Local floor checks - cheap, and every input is already in hand. A
+      // facilitator is a separate trust domain reachable over the network;
+      // there is no reason to ask it to reject what we can already reject.
+      // `selected`'s static fields (maxAmountRequired, payTo) do not depend on
+      // which bucket matched, so they can be read straight off it.
+      //
+      // `value` is parsed via `parseAtomicAmount`, NOT a bare `BigInt(...)`:
+      // x402's own validator for this field is
+      // `Number.isInteger(Number(v)) && Number(v) >= 0`, which operates on the
+      // `Number()` coercion rather than the string's shape and so admits JS
+      // exponent notation - `"1e30"` passes (an integer, and only 4 characters,
+      // nowhere near the 18-char length cap) but `BigInt("1e30")` throws a
+      // SyntaxError. Reaching this line needs no valid payment at all: the 402
+      // challenge body itself publishes `extra.merchantEvm`, and the
+      // derivation is public knowledge of the request's own resource, so
+      // anyone can derive a matching nonce and reach here with a crafted
+      // `value` alone (review round 3's Critical finding, task 6).
+      const authorizedValue = parseAtomicAmount(authorization.value)
+      const requiredValue = parseAtomicAmount(selected.maxAmountRequired)
+      if (authorizedValue === undefined || requiredValue === undefined || authorizedValue < requiredValue) {
+        send402(res, requirements, 'invalid_exact_evm_payload_authorization_value')
+        return
+      }
+      if (authorization.to.toLowerCase() !== selected.payTo.toLowerCase()) {
+        send402(res, requirements, 'invalid_exact_evm_payload_recipient_mismatch')
+        return
+      }
+      const nowSeconds = Math.floor(Date.now() / 1000)
+      if (Number(authorization.validAfter) > nowSeconds) {
+        send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_after')
+        return
+      }
+      if (Number(authorization.validBefore) <= nowSeconds) {
+        send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_before')
+        return
+      }
 
-    const verdict = await callVerify(paymentPayload, requirementForVerify)
-    if ('networkError' in verdict) {
-      await release(presentedFrom, presentedNonce)
-      send402(res, requirements, 'unexpected_verify_error')
-      return
-    }
+      // The payer may have signed against the PREVIOUS bucket (see
+      // matchChallenge) rather than the CURRENT one `requirements`/`selected`
+      // were just built with — substitute `matched.paymentId` so what we hand
+      // the facilitator (and, downstream, on-chain settlement) is
+      // byte-for-byte what the payer actually signed.
+      const requirementForVerify: PaymentRequirements = {
+        ...selected,
+        extra: { ...selected.extra, paymentId: matched.paymentId },
+      }
 
-    if (!verdict.isValid) {
-      await release(presentedFrom, presentedNonce)
-      send402(res, requirements, verdict.invalidReason ?? 'invalid_payment')
-      return
-    }
+      // Every check above was read-only. Only now, immediately before the
+      // facilitator call, do we actually consume the nonce — atomically, so
+      // concurrent replays of the identical X-PAYMENT header race safely (see
+      // ConsumedNonceStore's doc comment for why this must be a single
+      // check-and-set, not a read followed by a write after an await).
+      const expiresAt = Date.now() + 2 * TIME_BUCKET_SECONDS * 1000
+      let firstConsume: boolean
+      try {
+        firstConsume = await consumedNonceStore.consumeIfAbsent(presentedFrom, presentedNonce, expiresAt)
+      } catch {
+        send402(res, requirements, 'unexpected_verify_error')
+        return
+      }
+      if (!firstConsume) {
+        // Already consumed by a prior (or concurrently racing) request with
+        // the identical (from, nonce) pair — a genuine replay BY THE SAME
+        // PAYER. A different payer presenting the same nonce is a different
+        // pair and is never rejected here (see ConsumedNonceStore's doc
+        // comment). Rejected locally; the facilitator is never called a
+        // second time for it.
+        send402(res, requirements, 'payment_expired')
+        return
+      }
 
-    // Never log `paymentPayload` (carries the payer's signature) or the raw
-    // X-PAYMENT header anywhere on this path — see the task-6 judgement
-    // notes. res.locals is request-scoped app state, not a log sink.
-    res.locals.x402 = { payload: paymentPayload, requirements: requirementForVerify, payer: verdict.payer }
-    next()
+      const verdict = await callVerify(paymentPayload, requirementForVerify)
+      if ('networkError' in verdict) {
+        await release(presentedFrom, presentedNonce)
+        send402(res, requirements, 'unexpected_verify_error')
+        return
+      }
+
+      if (!verdict.isValid) {
+        await release(presentedFrom, presentedNonce)
+        send402(res, requirements, verdict.invalidReason ?? 'invalid_payment')
+        return
+      }
+
+      // Never log `paymentPayload` (carries the payer's signature) or the raw
+      // X-PAYMENT header anywhere on this path — see the task-6 judgement
+      // notes. res.locals is request-scoped app state, not a log sink.
+      res.locals.x402 = { payload: paymentPayload, requirements: requirementForVerify, payer: verdict.payer }
+      next()
+    } catch (err) {
+      // This handler's own returned promise must never reject — Express 5
+      // forwards a rejected middleware promise to `next(err)` automatically,
+      // but Express 4 (still an accepted peer dependency, see
+      // `package.json`'s `^4.18.0 || ^5.0.0`) does NOT: it neither awaits
+      // nor attaches a `.catch()` to whatever an async middleware function
+      // returns, so an uncaught throw here would surface as an unhandled
+      // rejection on Node's own event loop, independent of this request's
+      // response cycle. Under Node's default `--unhandled-rejections=throw`
+      // (since Node 15), that CRASHES THE WHOLE PROCESS — every in-flight
+      // request, not just the one that triggered it.
+      //
+      // The realistic trigger is `issueChallenge` throwing on a
+      // misconfigured `merchantEvm` (Task 13 carry-forward 3 — see its doc
+      // comment: a config assembled from untyped JSON/env vars, which is how
+      // production config is usually built, is not caught by
+      // `Ferry402Config`'s TS types alone). This `try`/`catch` applies, to
+      // every throw in this handler, the exact rule `callVerify` above
+      // already states for itself: "Never let this reject the request
+      // handler — a down facilitator must fail the payment cleanly, not
+      // crash the route." `next(err)` is core Express API, identical on
+      // both majors, so this is safe regardless of which peer version is
+      // installed. See `middleware.test.ts`'s "misconfigured merchantEvm"
+      // tests — including one driven through a real Express app via
+      // `supertest`, not just a direct call — for the mutation-checked
+      // proof.
+      next(err)
+    }
   }
 }
