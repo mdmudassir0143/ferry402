@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {LossyMockUSDC} from "./mocks/EscrowSecurityDoubles.t.sol";
+import {Secp256k1TestHelper} from "./helpers/Secp256k1TestHelper.sol";
 
 /// @notice Invariant handler that hammers Escrow with a mix of legitimate and
 /// deliberately bad operations across several actors: over-withdrawals,
@@ -15,7 +16,7 @@ import {LossyMockUSDC} from "./mocks/EscrowSecurityDoubles.t.sol";
 /// merchant's own ledger row (escrow.balanceOf) rather than requested
 /// amounts -- or, just as importantly, rather than the pool's own token
 /// balance (see the note in settle() below on why that distinction matters).
-contract EscrowHandler is Test {
+contract EscrowHandler is Test, Secp256k1TestHelper {
     Escrow public immutable escrow;
     LossyMockUSDC public immutable usdc;
 
@@ -217,16 +218,6 @@ contract EscrowHandler is Test {
         bytes32 digest = usdc.receiveAuthorizationDigest(a.from, a.to, a.value, a.validAfter, a.validBefore, a.nonce);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(PAYER_KEY, digest);
         return _toLowS(v, r, s);
-    }
-
-    uint256 private constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
-    uint256 private constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
-
-    function _toLowS(uint8 v, bytes32 r, bytes32 s) internal pure returns (uint8, bytes32, bytes32) {
-        if (uint256(s) > SECP256K1N_HALF) {
-            return (v == 27 ? 28 : 27, r, bytes32(SECP256K1N - uint256(s)));
-        }
-        return (v, r, s);
     }
 }
 

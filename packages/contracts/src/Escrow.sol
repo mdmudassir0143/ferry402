@@ -59,9 +59,7 @@ contract Escrow {
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
-        if (merchant == address(0)) revert ZeroMerchant();
-        if (auth.to != address(this)) revert RecipientMismatch();
-        if (auth.nonce != keccak256(abi.encode(merchant, paymentId))) revert MerchantNotBound();
+        _checkBinding(merchant, paymentId, auth);
 
         uint256 before = token.balanceOf(address(this));
         token.receiveWithAuthorization(
@@ -71,6 +69,42 @@ contract Escrow {
 
         _balances[merchant] += received;
         emit PaymentSettled(merchant, auth.from, received, auth.nonce);
+    }
+
+    /// @notice Identical to `settleAuthorization` (same merchant-nonce
+    /// binding, `nonReentrant`, observed-balance-delta crediting) except it
+    /// redeems via the token's `bytes signature` overload instead of a plain
+    /// `(v, r, s)` tuple — see `IEIP3009`'s doc comment. This is what lets a
+    /// payer whose `from` is a smart-contract wallet (EIP-1271) pay through
+    /// this escrow at all: such a wallet holds no ECDSA private key, so a
+    /// `(v, r, s)` tuple has no meaning for it, and it can only ever produce
+    /// an arbitrary-length signature blob for the token to verify on its own
+    /// terms via `isValidSignature`.
+    function settleAuthorizationWithSignature(
+        address merchant,
+        bytes32 paymentId,
+        Authorization calldata auth,
+        bytes calldata signature
+    ) external nonReentrant {
+        _checkBinding(merchant, paymentId, auth);
+
+        uint256 before = token.balanceOf(address(this));
+        token.receiveWithAuthorization(
+            auth.from, auth.to, auth.value, auth.validAfter, auth.validBefore, auth.nonce, signature
+        );
+        uint256 received = token.balanceOf(address(this)) - before;
+
+        _balances[merchant] += received;
+        emit PaymentSettled(merchant, auth.from, received, auth.nonce);
+    }
+
+    /// @notice Shared pre-flight checks for both `settleAuthorization*`
+    /// entry points — see `settleAuthorization`'s own doc comment for why
+    /// each check exists and is ordered this way.
+    function _checkBinding(address merchant, bytes32 paymentId, Authorization calldata auth) private view {
+        if (merchant == address(0)) revert ZeroMerchant();
+        if (auth.to != address(this)) revert RecipientMismatch();
+        if (auth.nonce != keccak256(abi.encode(merchant, paymentId))) revert MerchantNotBound();
     }
 
     /// @notice Withdraws from the caller's own merchant balance. There is no

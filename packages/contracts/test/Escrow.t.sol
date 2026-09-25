@@ -4,21 +4,14 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {Secp256k1TestHelper} from "./helpers/Secp256k1TestHelper.sol";
 
-contract EscrowTest is Test {
+contract EscrowTest is Test, Secp256k1TestHelper {
     Escrow escrow;
     MockUSDC usdc;
     address merchant = address(0xBEEF);
     uint256 payerKey = 0xA11CE;
     address payer;
-
-    // secp256k1 curve order / 2. vm.sign does not canonicalize its output, so
-    // roughly half of all signed digests come back high-s; a real wallet SDK
-    // (ethers, viem, ...) normalizes to low-s (EIP-2) before returning a
-    // signature, so the test helper must do the same to produce signatures
-    // MockUSDC (which rejects high-s, like real USDC) will actually accept.
-    uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
-    uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
     // Counter used only to derive unique paymentIds for _payMerchant calls
     // within a single test; it is NOT the nonce itself. The nonce is
@@ -288,12 +281,5 @@ contract EscrowTest is Test {
         bytes32 digest = usdc.receiveAuthorizationDigest(a.from, a.to, a.value, a.validAfter, a.validBefore, a.nonce);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(payerKey, digest);
         return _toLowS(v, r, s);
-    }
-
-    function _toLowS(uint8 v, bytes32 r, bytes32 s) internal pure returns (uint8, bytes32, bytes32) {
-        if (uint256(s) > SECP256K1N_HALF) {
-            return (v == 27 ? 28 : 27, r, bytes32(SECP256K1N - uint256(s)));
-        }
-        return (v, r, s);
     }
 }

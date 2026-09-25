@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Escrow} from "../../src/Escrow.sol";
 import {IEIP3009} from "../../src/interfaces/IEIP3009.sol";
 import {MockUSDC} from "./MockUSDC.sol";
+import {Secp256k1TestHelper} from "../helpers/Secp256k1TestHelper.sol";
 
 /// @notice Fee-on-transfer variant of MockUSDC: skims a fixed `fee` on every
 /// transfer, so the recipient receives strictly less than the amount debited
@@ -79,6 +80,15 @@ contract ReentrantMockUSDC is IEIP3009 {
         });
         escrow.settleAuthorization(address(0xF00D), bytes32(uint256(777)), nested, v, r, s);
     }
+
+    /// @dev Interface-conformance stub only: no test in this suite exercises
+    /// the `bytes signature` overload against this double.
+    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
+        external
+        pure
+    {
+        revert("ReentrantMockUSDC: bytes-signature overload unused");
+    }
 }
 
 /// @notice Malicious token whose transfer() reenters Escrow.withdraw before
@@ -140,6 +150,15 @@ contract ReentrantWithdrawMockUSDC is IEIP3009 {
         _bal[from] -= value;
         _bal[to] += value;
     }
+
+    /// @dev Interface-conformance stub only: no test in this suite exercises
+    /// the `bytes signature` overload against this double.
+    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
+        external
+        pure
+    {
+        revert("ReentrantWithdrawMockUSDC: bytes-signature overload unused");
+    }
 }
 
 /// @notice USDT-style token whose transfer() returns no data at all --
@@ -185,6 +204,15 @@ contract NoReturnDataMockUSDC is IEIP3009 {
         _bal[from] -= value;
         _bal[to] += value;
     }
+
+    /// @dev Interface-conformance stub only: no test in this suite exercises
+    /// the `bytes signature` overload against this double.
+    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
+        external
+        pure
+    {
+        revert("NoReturnDataMockUSDC: bytes-signature overload unused");
+    }
 }
 
 /// @notice Token whose transfer() returns an explicit `false`, the ERC20
@@ -220,19 +248,18 @@ contract FalseReturningMockUSDC is IEIP3009 {
         _bal[from] -= value;
         _bal[to] += value;
     }
+
+    /// @dev Interface-conformance stub only: no test in this suite exercises
+    /// the `bytes signature` overload against this double.
+    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
+        external
+        pure
+    {
+        revert("FalseReturningMockUSDC: bytes-signature overload unused");
+    }
 }
 
-contract EscrowSecurityDoublesTest is Test {
-    uint256 constant SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
-    uint256 constant SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
-
-    function _toLowS(uint8 v, bytes32 r, bytes32 s) internal pure returns (uint8, bytes32, bytes32) {
-        if (uint256(s) > SECP256K1N_HALF) {
-            return (v == 27 ? 28 : 27, r, bytes32(SECP256K1N - uint256(s)));
-        }
-        return (v, r, s);
-    }
-
+contract EscrowSecurityDoublesTest is Test, Secp256k1TestHelper {
     function _authFor(address payer, address escrowAddr, address merchant, bytes32 paymentId, uint256 value)
         internal
         view
