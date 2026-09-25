@@ -30,7 +30,11 @@ contract StringRevertToken {
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
     );
 
-    uint256 private constant _SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+    // secp256k1's curve order (task-11 review round 1, item (e)): derived
+    // as ORDER / 2 rather than a separately hand-written half literal -- see
+    // SettleToken.sol's identical constant for the full rationale.
+    uint256 private constant _SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 private constant _SECP256K1N_HALF = _SECP256K1N / 2;
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 

@@ -81,13 +81,35 @@ contract ReentrantMockUSDC is IEIP3009 {
         escrow.settleAuthorization(address(0xF00D), bytes32(uint256(777)), nested, v, r, s);
     }
 
-    /// @dev Interface-conformance stub only: no test in this suite exercises
-    /// the `bytes signature` overload against this double.
-    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
-        external
-        pure
-    {
-        revert("ReentrantMockUSDC: bytes-signature overload unused");
+    /// @notice Task-11 review round 1: this used to be a `revert(...)` stub
+    /// ("no test exercises the bytes overload against this double"), which
+    /// is exactly what made a reentrancy hole through
+    /// `settleAuthorizationWithSignature` invisible to this suite. Mirrors
+    /// the `(v, r, s)` overload above exactly, but attacks the NEW entry
+    /// point: attempts a nested `settleAuthorizationWithSignature` call
+    /// under a different (merchant, paymentId) before the outer call
+    /// unwinds.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32, /* nonce */
+        bytes calldata signature
+    ) external {
+        _bal[from] -= value;
+        _bal[to] += value;
+
+        Escrow.Authorization memory nested = Escrow.Authorization({
+            from: from,
+            to: to,
+            value: value,
+            validAfter: validAfter,
+            validBefore: validBefore,
+            nonce: keccak256(abi.encode(address(0xF00D), bytes32(uint256(778))))
+        });
+        escrow.settleAuthorizationWithSignature(address(0xF00D), bytes32(uint256(778)), nested, signature);
     }
 }
 
@@ -151,13 +173,21 @@ contract ReentrantWithdrawMockUSDC is IEIP3009 {
         _bal[to] += value;
     }
 
-    /// @dev Interface-conformance stub only: no test in this suite exercises
-    /// the `bytes signature` overload against this double.
-    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
-        external
-        pure
-    {
-        revert("ReentrantWithdrawMockUSDC: bytes-signature overload unused");
+    /// @notice Mirrors the `(v, r, s)` overload above -- this double's
+    /// attack surface is `transfer()`/`withdraw()`, not which
+    /// `receiveWithAuthorization` overload funded the merchant, so this
+    /// needs no special logic of its own.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256, /* validAfter */
+        uint256, /* validBefore */
+        bytes32, /* nonce */
+        bytes calldata /* signature */
+    ) external {
+        _bal[from] -= value;
+        _bal[to] += value;
     }
 }
 
@@ -205,13 +235,20 @@ contract NoReturnDataMockUSDC is IEIP3009 {
         _bal[to] += value;
     }
 
-    /// @dev Interface-conformance stub only: no test in this suite exercises
-    /// the `bytes signature` overload against this double.
-    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
-        external
-        pure
-    {
-        revert("NoReturnDataMockUSDC: bytes-signature overload unused");
+    /// @notice Mirrors the `(v, r, s)` overload above -- this double's
+    /// attack surface is `transfer()`'s no-return-data behavior, not which
+    /// `receiveWithAuthorization` overload funded the merchant.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256, /* validAfter */
+        uint256, /* validBefore */
+        bytes32, /* nonce */
+        bytes calldata /* signature */
+    ) external {
+        _bal[from] -= value;
+        _bal[to] += value;
     }
 }
 
@@ -249,13 +286,20 @@ contract FalseReturningMockUSDC is IEIP3009 {
         _bal[to] += value;
     }
 
-    /// @dev Interface-conformance stub only: no test in this suite exercises
-    /// the `bytes signature` overload against this double.
-    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, bytes calldata)
-        external
-        pure
-    {
-        revert("FalseReturningMockUSDC: bytes-signature overload unused");
+    /// @notice Mirrors the `(v, r, s)` overload above -- this double's
+    /// attack surface is `transfer()`'s explicit `false` return, not which
+    /// `receiveWithAuthorization` overload funded the merchant.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256, /* validAfter */
+        uint256, /* validBefore */
+        bytes32, /* nonce */
+        bytes calldata /* signature */
+    ) external {
+        _bal[from] -= value;
+        _bal[to] += value;
     }
 }
 
@@ -312,6 +356,41 @@ contract EscrowSecurityDoublesTest is Test, Secp256k1TestHelper {
         assertEq(usdc.balanceOf(address(escrow)), expected);
     }
 
+    /// @notice Task-11 review round 1: the SAME observed-delta property as
+    /// `test_settleAuthorization_creditsObservedDelta_notRequestedValue`
+    /// above, through the NEW `settleAuthorizationWithSignature` entry
+    /// point. `LossyMockUSDC` already inherits the real bytes-signature
+    /// overload from `MockUSDC` (it only overrides `_transfer`), so this
+    /// needed no new token double -- only a test that actually calls the new
+    /// entry point. The reviewer mutated `settleAuthorizationWithSignature`
+    /// to credit `auth.value` directly (bypassing the observed-delta
+    /// computation) and got 33/33 passing, because nothing settled a
+    /// fee-skimming token through this specific entry point.
+    function test_settleAuthorizationWithSignature_creditsObservedDelta_notRequestedValue() public {
+        uint256 payerKey = 0xA11CE;
+        address payer = vm.addr(payerKey);
+        address merchant = address(0xBEEF);
+        uint256 fee = 1e6;
+        uint256 expected = 10e6 - fee;
+
+        LossyMockUSDC usdc = new LossyMockUSDC(fee);
+        Escrow escrow = new Escrow(address(usdc));
+        usdc.mint(payer, 1_000e6);
+
+        bytes32 paymentId = bytes32(uint256(2));
+        Escrow.Authorization memory auth = _authFor(payer, address(escrow), merchant, paymentId, 10e6);
+        (uint8 v, bytes32 r, bytes32 s) = _signFor(usdc, payerKey, auth);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Escrow.PaymentSettled(merchant, payer, expected, auth.nonce);
+
+        escrow.settleAuthorizationWithSignature(merchant, paymentId, auth, signature);
+
+        assertEq(escrow.balanceOf(merchant), expected);
+        assertEq(usdc.balanceOf(address(escrow)), expected);
+    }
+
     /// @notice I2/I5 regression: a token that reenters settleAuthorization
     /// mid-call must be blocked by the nonReentrant guard.
     function test_nonReentrant_blocksNestedSettle() public {
@@ -331,6 +410,35 @@ contract EscrowSecurityDoublesTest is Test, Secp256k1TestHelper {
 
         vm.expectRevert(Escrow.Reentrancy.selector);
         escrow.settleAuthorization(address(0xBEEF), bytes32(uint256(1)), auth, 27, bytes32(0), bytes32(0));
+    }
+
+    /// @notice Task-11 review round 1: the SAME nonReentrant property as
+    /// `test_nonReentrant_blocksNestedSettle` above, but through the NEW
+    /// `settleAuthorizationWithSignature` entry point specifically. The
+    /// reviewer mutated `settleAuthorizationWithSignature` directly (dropped
+    /// `nonReentrant` AND changed the credit to `auth.value`) and got
+    /// 33/33 passing, because nothing exercised this entry point's own
+    /// reentrancy guard -- the earlier `ReentrantMockUSDC` bytes-overload
+    /// stub just reverted, never attempting the nested call at all. This is
+    /// the first test in this suite to mutate `Escrow.sol` itself, not only
+    /// its collaborators.
+    function test_nonReentrant_blocksNestedSettleWithSignature() public {
+        ReentrantMockUSDC token = new ReentrantMockUSDC();
+        Escrow escrow = new Escrow(address(token));
+        token.setEscrow(address(escrow));
+        token.mint(address(0xA11CE), 1_000e6);
+
+        Escrow.Authorization memory auth = Escrow.Authorization({
+            from: address(0xA11CE),
+            to: address(escrow),
+            value: 10e6,
+            validAfter: 0,
+            validBefore: block.timestamp + 3600,
+            nonce: keccak256(abi.encode(address(0xBEEF), bytes32(uint256(1))))
+        });
+
+        vm.expectRevert(Escrow.Reentrancy.selector);
+        escrow.settleAuthorizationWithSignature(address(0xBEEF), bytes32(uint256(1)), auth, hex"deadbeef");
     }
 
     /// @notice Task 3 hard gate: withdraw must carry nonReentrant. A token

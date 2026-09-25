@@ -246,4 +246,55 @@ describe('EIP-1271 smart-contract wallet signatures', () => {
     const after = await merchantBalance()
     expect(after - before).toBe(10000n)
   }, 20_000)
+
+  // Task 11 review round 1: the gap a length-based dispatch rule left
+  // uncovered anywhere -- a 65-byte signature whose `from` HAS code must
+  // still take the EIP-1271 path (real USDC's own `SignatureChecker`
+  // dispatches on `from`'s code, not signature shape; both
+  // `receiveWithAuthorization` overloads collapse onto it).
+  it('a smart wallet with an incidentally-65-byte signature still uses EIP-1271, not ECDSA', async () => {
+    const wallet = await deploySmartWallet(true)
+    const paymentId = freshPaymentId()
+    const auth = authFields(wallet, paymentId)
+    // Exactly 65 bytes -- shaped like a plain ECDSA (r, s, v) blob -- but
+    // SmartWallet ignores its content entirely. A length-based dispatch
+    // would `ecrecover` this and fail to match `wallet` (a contract holds
+    // no private key), even though the wallet's own `isValidSignature`
+    // accepts.
+    const signature: Hex = `0x${'11'.repeat(32)}${'22'.repeat(32)}1b`
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
+    const reqs = requirements(paymentId)
+
+    const verifyResult = await verify(payload, reqs)
+    expect(verifyResult.isValid).toBe(true)
+    expect(verifyResult.payer).toBe(wallet)
+
+    const before = await merchantBalance()
+    const result = await settle(payload, reqs)
+    expect(result.success).toBe(true)
+    const after = await merchantBalance()
+    expect(after - before).toBe(10000n)
+  }, 20_000)
+
+  // Task 11 review round 1, "Vector B": a wallet returning the correct
+  // 4-byte magic value followed by non-zero padding must be rejected --
+  // confirmed directly against viem, which decodes a `bytes4`-typed
+  // `readContract` result by taking only the leading 4 bytes and does NOT
+  // validate the rest is zero. `verifyEip1271Signature` compares the FULL
+  // raw 32-byte return word instead (`EIP1271_MAGIC_VALUE_WORD`) for
+  // exactly this reason.
+  it('a smart wallet returning the magic value with dirty (non-zero) padding is rejected', async () => {
+    const wallet = await deployDirtyPaddingWallet()
+    const paymentId = freshPaymentId()
+    const auth = authFields(wallet, paymentId)
+    const payload = buildPayload({ network: 'base-sepolia', signature: ARBITRARY_SIGNATURE, authorization: auth })
+    const reqs = requirements(paymentId)
+
+    const verifyResult = await verify(payload, reqs)
+    expect(verifyResult.isValid).toBe(false)
+    expect(verifyResult.invalidReason).toBe('invalid_exact_evm_payload_signature')
+
+    const result = await settle(payload, reqs)
+    expect(result.success).toBe(false)
+  }, 20_000)
 })

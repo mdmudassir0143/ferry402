@@ -68,10 +68,16 @@ contract SettleToken {
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
     );
 
-    // secp256k1 curve order / 2 -- the same bound OpenZeppelin's ECDSA
-    // library (and real USDC) enforces, rejecting the malleable "other"
-    // valid signature for a given message.
-    uint256 private constant _SECP256K1N_HALF = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+    // secp256k1's curve order (task-11 review round 1, item (e)): derived
+    // as ORDER / 2 rather than a separately hand-written half literal --
+    // the half is the mistypeable direction (see MockUSDC.sol's
+    // Secp256k1TestHelper for the full history: this exact literal has
+    // already been mistyped twice in this project). This fixture stays
+    // self-contained (no cross-package import of that shared helper) by
+    // keeping its own copy of the well-known, easily-eyeballed full order
+    // and deriving the half from it in-file instead.
+    uint256 private constant _SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 private constant _SECP256K1N_HALF = _SECP256K1N / 2;
 
     bytes32 public immutable DOMAIN_SEPARATOR;
 

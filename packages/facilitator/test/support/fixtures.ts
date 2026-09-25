@@ -1,6 +1,7 @@
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Address, Hex } from 'viem'
 import type { PaymentPayload, PaymentRequirements } from 'x402/types'
+import { SECP256K1N } from '../../src/chains/base.js'
 
 /** Nothing listens here. Passed as `rpcUrl` for tests that must prove a
  *  check fails WITHOUT ever making a chain call — if the implementation
@@ -114,7 +115,6 @@ export async function signAuthorization(params: {
  * `v' = 55 - v` (27<->28).
  */
 export function flipToMalleable(signature: Hex): Hex {
-  const SECP256K1N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
   const r = signature.slice(2, 66)
   const s = BigInt(`0x${signature.slice(66, 130)}`)
   const v = Number.parseInt(signature.slice(130, 132), 16)
