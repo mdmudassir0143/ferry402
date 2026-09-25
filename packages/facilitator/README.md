@@ -98,10 +98,10 @@ await writeEntry(entry, { topicId: process.env.HCS_TOPIC_ID!, submitter })
   is what makes the validation/batching logic testable without a live Hedera
   account. `createHederaTopicSubmitter(client)` is the real,
   `@hashgraph/sdk`-backed implementation; provide your own fake in tests.
-- Live topic creation and an end-to-end submit against Hedera testnet are
-  Task 10's job — this package validates, encodes, batches, and defines the
-  submission seam, but has no Hedera credentials to prove a real submit
-  against.
+- Live topic creation (`scripts/create-topic.ts`) and an end-to-end submit
+  against Hedera testnet were proven for real in Task 10 — see
+  `test/e2e.test.ts` and the root README's "Live end-to-end run" section for
+  the live topic id, transaction hash, and Hashscan link.
 
 ### Partial-batch failure semantics
 
@@ -171,6 +171,21 @@ against a fake `TopicSubmitter` that records calls instead of touching
 Hedera. `journal.hedera-adapter.test.ts` is the one file that mocks
 `@hashgraph/sdk` itself (`vi.mock`), to exercise
 `createHederaTopicSubmitter`'s one pure conditional
-(`topicSequenceNumber === null`) without a live account; its actual
-network-calling path is untested here by design (see that function's doc
-comment) — proving it end to end is Task 10's job.
+(`topicSequenceNumber === null`) without a live account.
+
+### Live end-to-end test (`test/e2e.test.ts`)
+
+```
+RUN_E2E=1 pnpm --filter @ferry402/facilitator test:e2e
+```
+
+The one test file in this package that touches real networks: a real
+deployed `Escrow` on Base Sepolia, a real payer-signed EIP-3009 authorization
+over real testnet USDC, a real settlement transaction, and a real HCS journal
+entry read back from the Hedera testnet mirror node. Gated behind
+`RUN_E2E=1` and excluded from the default `pnpm test`/`vitest run` (it spends
+real testnet funds on every run) — without it, the file is still collected
+(shows as **skipped**, not silently absent) but does no network I/O and needs
+no credentials, so importing it is safe with no `.env` present at all. See
+the root README's "Live end-to-end run" section for the most recent proof
+(transaction hash, Hashscan link, measured `gasUsed`).
