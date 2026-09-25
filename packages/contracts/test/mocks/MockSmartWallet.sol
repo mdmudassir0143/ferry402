@@ -54,9 +54,17 @@ contract MockSmartWallet is IERC1271 {
 ///         validates the FULL 32-byte return word (as real USDC's
 ///         `SignatureChecker.sol` does, and as `MockUSDC._checkEip1271`
 ///         mirrors) rather than decoding through a `bytes4`-typed
-///         `try {...} returns (bytes4)`, which extracts only the leading 4
-///         bytes and does not itself validate that the rest is zero
-///         (task-11 review round 1, "Vector B").
+///         `try {...} returns (bytes4)` (task-11 review round 1, "Vector
+///         B"). NOTE: on this Solidity version, a typed decode does NOT
+///         silently accept this dirty padding the way viem's `bytes4` ABI
+///         decode does — confirmed by mutating `_checkEip1271` back to a
+///         typed decode and re-running this double against it: it produces
+///         an UNCAUGHT low-level revert instead (bypassing even the typed
+///         decode's own `catch` clause), not a silent accept. See
+///         `MockUSDC._checkEip1271`'s own doc comment for the full finding;
+///         the viem-side equivalent (`verifyEip1271Signature` in
+///         `chains/base.ts`) is where this exact return shape genuinely IS
+///         silently accepted by a naive typed decode.
 contract DirtyPaddingWallet {
     function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
         assembly {

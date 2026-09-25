@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { createPublicClient, createWalletClient, http, type Address, type Hex } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
+import { createPublicClient, createTestClient, createWalletClient, http, type Address, type Hex } from 'viem'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { foundry } from 'viem/chains'
 import { computeNonce } from '@anychain402/sdk'
 import { verifyPayment, settlePayment, type SettleOptions } from '../src/chains/base.js'
@@ -33,12 +33,14 @@ const TOKEN_VERSION = '1'
 let anvil: EscrowAnvilFixture
 let publicClient: ReturnType<typeof createPublicClient>
 let walletClient: ReturnType<typeof createWalletClient>
+let testClient: ReturnType<typeof createTestClient>
 let nextPaymentIdSeed = 1
 
 beforeAll(async () => {
   anvil = await startAnvilWithEscrow()
   publicClient = createPublicClient({ chain: foundry, transport: http(anvil.rpcUrl) })
   walletClient = createWalletClient({ account: privateKeyToAccount(FACILITATOR_PRIVATE_KEY), chain: foundry, transport: http(anvil.rpcUrl) })
+  testClient = createTestClient({ mode: 'anvil', chain: foundry, transport: http(anvil.rpcUrl) })
 }, 30_000)
 
 afterAll(async () => {
@@ -288,6 +290,62 @@ describe('EIP-1271 smart-contract wallet signatures', () => {
     const paymentId = freshPaymentId()
     const auth = authFields(wallet, paymentId)
     const payload = buildPayload({ network: 'base-sepolia', signature: ARBITRARY_SIGNATURE, authorization: auth })
+    const reqs = requirements(paymentId)
+
+    const verifyResult = await verify(payload, reqs)
+    expect(verifyResult.isValid).toBe(false)
+    expect(verifyResult.invalidReason).toBe('invalid_exact_evm_payload_signature')
+
+    const result = await settle(payload, reqs)
+    expect(result.success).toBe(false)
+  }, 20_000)
+
+  // Task 11 review round 2 (Critical): the reviewer reverted `recoverSigner`
+  // to the ECDSA-first-with-EIP-1271-fallback design rejected in round 1 and
+  // found all 7 tests above still passed -- the suite pinned "not
+  // length-exclusive dispatch" but never pinned "code-first" against that
+  // SPECIFIC fallback variant. The two designs diverge in exactly one case:
+  // an EIP-7702-delegated EOA signing with its OWN key -- an address that
+  // has BOTH on-chain code AND a private key whose raw ECDSA signature
+  // recovers to it. Under ECDSA-first-with-fallback, that recovery succeeds
+  // and matches `from`, so the EIP-1271 fallback never triggers -- an
+  // ACCEPT. Real USDC's `SignatureChecker.isValidSignatureNow` routes this
+  // address to EIP-1271 unconditionally, purely because it has code, and
+  // rejects it there (this double has no working `isValidSignature`).
+  //
+  // Constructed on the real anvil instance via `anvil_setCode`
+  // (`testClient.setCode`): a private key is generated and its address
+  // computed as usual, then contract code is etched onto that SAME
+  // address -- exactly the shape of a 7702 delegation (code present, key
+  // still held and usable for ordinary ECDSA signing).
+  it('an EIP-7702-shaped account (code + a held private key) is routed to EIP-1271, not ECDSA, and rejected', async () => {
+    const delegatedKey = generatePrivateKey()
+    const delegatedAddress = privateKeyToAccount(delegatedKey).address
+
+    // Any non-empty bytecode establishes "has code" for eth_getCode; a bare
+    // STOP is enough -- it halts on any call with no return data, which is
+    // neither a revert nor the ERC-1271 magic value, modeling the common
+    // case of a 7702 delegate with no isValidSignature implementation at
+    // all (most real delegate implementations are account-abstraction
+    // wallets, not bare pass-through EOAs).
+    await testClient.setCode({ address: delegatedAddress, bytecode: '0x00' })
+    expect(await publicClient.getCode({ address: delegatedAddress })).not.toBe('0x')
+
+    const paymentId = freshPaymentId()
+    const auth = authFields(delegatedAddress, paymentId)
+    // A genuine, non-malleable 65-byte ECDSA signature by the address's OWN
+    // key -- this WOULD recover to `delegatedAddress` if ECDSA recovery
+    // were ever attempted against it, which is exactly what makes this
+    // test discriminate the two dispatch designs.
+    const signature = await signAuthorization({
+      privateKey: delegatedKey,
+      tokenAddress: anvil.tokenAddress,
+      tokenName: TOKEN_NAME,
+      tokenVersion: TOKEN_VERSION,
+      chainId: anvil.chainId,
+      authorization: auth,
+    })
+    const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
     const reqs = requirements(paymentId)
 
     const verifyResult = await verify(payload, reqs)
