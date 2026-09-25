@@ -3,6 +3,7 @@ import {
   ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
+  encodeFunctionData,
   getAddress,
   hashTypedData,
   http,
@@ -177,12 +178,50 @@ const HEX_BYTES_RE = /^0x([0-9a-fA-F]{2})*$/
 
 /**
  * The ERC-1271 magic value a smart-contract wallet's `isValidSignature` must
- * return, byte-for-byte, to have its signature accepted —
- * `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`. Any OTHER return
- * value is a rejection; this module never treats "didn't revert" as "valid"
- * on its own (see `verifyEip1271Signature`'s doc comment).
+ * return — `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`. Kept as
+ * the bare 4-byte selector for readability at call sites; the comparison
+ * this module actually performs is against the FULL returned 32-byte word
+ * (`EIP1271_MAGIC_VALUE_WORD` below), never a `bytes4`-typed ABI decode of
+ * it — see that constant's doc comment for why the difference matters.
  */
 const EIP1271_MAGIC_VALUE: Hex = '0x1626ba7e'
+
+/**
+ * `EIP1271_MAGIC_VALUE`, right-zero-padded to a full 32-byte word — the
+ * EXACT raw return data `isValidSignature` must produce, compared
+ * byte-for-byte against the wallet's raw `eth_call` return in
+ * `verifyEip1271Signature`.
+ *
+ * Deliberately NOT implemented as `client.readContract` with an ABI
+ * declaring `outputs: [{ type: 'bytes4' }]` (task-11 review round 1,
+ * confirmed directly against viem 2.56.8): a `bytes4`-typed ABI decode
+ * takes only the LEADING 4 bytes of the returned 32-byte word and does NOT
+ * validate that the trailing 28 are zero. A wallet whose `isValidSignature`
+ * returns `0x1626ba7e` followed by 28 bytes of `0xff` (garbage padding, not
+ * proper zero-padding) decodes to the correct-LOOKING `bytes4` and passes a
+ * naive `readContract`-based comparison here — while real USDC's
+ * `SignatureChecker.isValidERC1271SignatureNow` requires the full word:
+ * `result.length == 32 && abi.decode(result, (bytes32)) == bytes32(selector)`.
+ * A wallet exploiting this gap would pass `/verify` and then have its
+ * settlement revert at the token (which enforces the strict comparison) —
+ * and since `packages/sdk/src/middleware.ts` serves the resource right
+ * after a passing `/verify`, before ever calling `/settle`, that's a free,
+ * repeatable resource with a fresh `paymentId` each time, not merely a
+ * confusing error. Matching the full-word comparison exactly is what
+ * closes that.
+ *
+ * NOTE this is specifically a viem/TypeScript-side gap, confirmed by direct
+ * probe — it is NOT the same on the Solidity side: `MockUSDC.sol`'s own
+ * equivalent mutation test found that Solidity's typed `bytes4` decode does
+ * NOT silently accept dirty padding the way viem's does; it instead
+ * produces an uncatchable low-level revert (see `MockUSDC._checkEip1271`'s
+ * doc comment). The raw-`staticcall` form is used on both sides for the
+ * SAME reason — mirroring `SignatureChecker.sol` exactly and producing one
+ * uniform, well-defined rejection — but only on this (viem) side does it
+ * close an actual silent-acceptance hole rather than merely cleaning up an
+ * already-safe-but-ugly failure mode.
+ */
+const EIP1271_MAGIC_VALUE_WORD: Hex = `${EIP1271_MAGIC_VALUE}${'0'.repeat(56)}` as Hex
 
 /**
  * The one function this module ever calls on a claimed smart-contract
@@ -192,6 +231,10 @@ const EIP1271_MAGIC_VALUE: Hex = '0x1626ba7e'
  * an address this facilitator does NOT control or trust — see
  * `verifyEip1271Signature`'s doc comment for why its return value, a revert,
  * and a codeless address are all handled explicitly rather than assumed.
+ * Used only to ABI-ENCODE the call via `encodeFunctionData` — the response
+ * is read as raw bytes (`client.call`), never decoded through this ABI's
+ * `outputs`, so declaring `bytes4` here is just documentation of the
+ * interface, not a claim about how the return value is actually checked.
  */
 const ERC1271_ABI = [
   {
@@ -497,24 +540,30 @@ async function recoverEcdsaSigner(signature: Hex, digest: Hex): Promise<Address 
 
 /**
  * Verifies `signature` against `digest` for claimed smart-contract-wallet
- * signer `from`, per EIP-1271: `from.isValidSignature(digest, signature)`
- * must return EXACTLY `EIP1271_MAGIC_VALUE`. Three failure modes are folded
- * into the same `false` result, deliberately never distinguished by this
- * module beyond that (matching how a malformed/malleable ECDSA signature is
- * a single undifferentiated rejection too):
+ * signer `from` — ASSUMES the caller (`recoverSigner`) has already confirmed
+ * `from` has on-chain code; this function only performs the `isValidSignature`
+ * call and its verdict, per EIP-1271: `from.isValidSignature(digest,
+ * signature)` must return EXACTLY the full 32-byte word
+ * `EIP1271_MAGIC_VALUE_WORD`. Two failure modes are folded into the same
+ * `false` result, deliberately never distinguished by this module beyond
+ * that (matching how a malformed/malleable ECDSA signature is a single
+ * undifferentiated rejection too):
  *
- * 1. `from` has no code at all — a codeless address can never legitimately
- *    implement EIP-1271, and this is checked BEFORE making the call at all
- *    (not merely relying on the call itself to fail) so the rejection reason
- *    is uniform regardless of what a codeless address's call happens to do
- *    at the EVM level.
- * 2. The call reverts for any reason — a paused wallet, an out-of-gas
+ * 1. The call reverts for any reason — a paused wallet, an out-of-gas
  *    guard, a threshold check that legitimately throws rather than
  *    returning a sentinel. A revert is a rejection, never an unhandled
  *    error that could crash `/verify`.
- * 3. The call succeeds but returns anything other than the exact magic
- *    value — including a plausible-looking-but-wrong 4 bytes. There is no
- *    "close enough"; the ERC-1271 magic value is an exact-match protocol.
+ * 2. The call succeeds but the raw return data is anything other than
+ *    EXACTLY the 32-byte word `EIP1271_MAGIC_VALUE_WORD` — including a
+ *    plausible-looking-but-wrong length, or the correct leading 4 bytes
+ *    followed by non-zero padding (see `EIP1271_MAGIC_VALUE_WORD`'s doc
+ *    comment for why that specific case matters and why this deliberately
+ *    does NOT decode the response through a `bytes4`-typed ABI output).
+ *
+ * Reads the raw return via `client.call` (never `client.readContract` with
+ * a `bytes4` output) for exactly that reason: a typed decode would silently
+ * accept dirty padding a real token's own `SignatureChecker`-style check
+ * rejects.
  */
 async function verifyEip1271Signature(
   client: ReturnType<typeof createChainClient>,
@@ -522,31 +571,16 @@ async function verifyEip1271Signature(
   digest: Hex,
   signature: Hex,
 ): Promise<boolean> {
-  let code: Hex | undefined
+  let result: { data?: Hex }
   try {
-    code = await client.getCode({ address: from })
-  } catch {
-    // Can't confirm `from` has code at all — fail closed rather than risk
-    // treating an RPC hiccup as "definitely codeless, so definitely
-    // rejected" OR "definitely a contract, so try the call anyway"; either
-    // guess could be wrong in a way that matters. Either way this is a
-    // rejection, so the distinction is moot for the caller.
-    return false
-  }
-  if (code === undefined || code === '0x') return false
-
-  let magicValue: Hex
-  try {
-    magicValue = await client.readContract({
-      address: from,
-      abi: ERC1271_ABI,
-      functionName: 'isValidSignature',
-      args: [digest, signature],
+    result = await client.call({
+      to: from,
+      data: encodeFunctionData({ abi: ERC1271_ABI, functionName: 'isValidSignature', args: [digest, signature] }),
     })
   } catch {
     return false
   }
-  return magicValue === EIP1271_MAGIC_VALUE
+  return result.data !== undefined && result.data.toLowerCase() === EIP1271_MAGIC_VALUE_WORD.toLowerCase()
 }
 
 /** Which signature scheme a verified payload actually used — see
@@ -560,35 +594,31 @@ export type SignatureKind = 'ecdsa' | 'eip1271'
 
 /**
  * Verifies `signature` over `digest` for the claimed signer
- * `authorization.from`, trying the ECDSA path first and falling back to
- * EIP-1271 only when ECDSA doesn't produce a match (Task 11):
+ * `authorization.from`, branching on `from`'s on-chain code exactly like
+ * real USDC's own `SignatureChecker.isValidSignatureNow` does (Task 11
+ * review round 1): `if (!isContract(signer)) { ECRecover } else {
+ * EIP-1271 }`. This is deliberately CODE-first, not signature-shape-first —
+ * a round 1 draft of this function tried ECDSA first and fell back to
+ * EIP-1271 only on a mismatch, reasoned to be behaviorally equivalent while
+ * cheaper (no `eth_getCode` call on the ordinary EOA happy path); that
+ * reasoning didn't survive review. Real USDC's actual EIP-3009
+ * implementation collapses BOTH `receiveWithAuthorization` overloads onto
+ * the same code-check-first `SignatureChecker` call — the rule isn't a
+ * preference this module could reasonably choose between, it's the rule the
+ * token enforces at settlement. A verifier that decided differently would,
+ * in the exact case that matters most (a 1-of-1 smart-contract wallet
+ * producing an incidentally-65-byte signature blob for its own `from`),
+ * accept at `/verify` and then have the token revert at `/settle` — and
+ * since `packages/sdk/src/middleware.ts` serves the resource straight after
+ * a passing `/verify`, before ever calling `/settle`, that gap is a free,
+ * repeatable resource with a fresh `paymentId` each time, not merely a
+ * confusing error.
  *
- * 1. If `signature` is 65 bytes, attempt `recoverEcdsaSigner` — completely
- *    unchanged from before this task, including its malleability rejection
- *    (deliberately NOT applied on the EIP-1271 branch below: an EIP-1271
- *    signature has no `s`/`v` component of its own to normalize, and
- *    applying an ECDSA-specific rule to it would reject legitimate wallet
- *    signatures for a property that doesn't apply to them). If that
- *    recovers an address equal to `from`, this IS a plain ECDSA-signing EOA
- *    — return immediately, with NO RPC call made at all beyond whatever
- *    `verifyPayment` already needed for the domain (pure local ECDSA math).
- * 2. Otherwise — the signature isn't 65 bytes, or recovery failed
- *    (malformed/malleable), or recovery succeeded but didn't match `from` —
- *    fall back to `verifyEip1271Signature`.
- *
- * Falling back on "recovered but didn't match" (rather than deciding the
- * branch upfront from `from`'s on-chain code) is what makes this route a
- * genuine smart-contract wallet correctly: a contract can never itself hold
- * the private key a raw ECDSA recovery implies (no cryptographic
- * coincidence changes that — forging a match is exactly as infeasible as
- * stealing an EOA's key), so a smart wallet's 65-byte-shaped signature
- * ALWAYS fails step 1's equality check and falls through to EIP-1271 —
- * identical dispatch outcome to checking `from`'s code upfront, but without
- * paying an `eth_getCode` round trip on every ordinary EOA payment. This is
- * also why `verifyPayment`'s domain-cache tests still see zero RPC calls on
- * a warm cache for a valid EOA signature: the extra round trip this task
- * adds is paid only on the paths that actually need it (a non-ECDSA-shaped
- * signature, or one that fails to recover to its claimed signer).
+ * `from`'s code is checked HERE (once, up front), unconditionally — not
+ * behind a `HEX_SIGNATURE_RE.test` shape gate — because a codeless EOA
+ * with a non-65-byte "signature" must still take the ECDSA branch (and fail
+ * there on shape, cheaply, with no RPC) rather than be routed to EIP-1271
+ * where it could never pass anyway.
  */
 async function recoverSigner(
   client: ReturnType<typeof createChainClient>,
@@ -596,11 +626,27 @@ async function recoverSigner(
   digest: Hex,
   from: Address,
 ): Promise<{ signer: Address; kind: SignatureKind } | undefined> {
-  if (HEX_SIGNATURE_RE.test(signature)) {
+  let code: Hex | undefined
+  try {
+    code = await client.getCode({ address: from })
+  } catch {
+    // Can't confirm whether `from` has code at all — fail closed. Guessing
+    // either way could be wrong in the direction that matters (treating a
+    // genuine smart wallet as an EOA routes it to `ecrecover`, which can
+    // never validate it, but also can never legitimately CONFIRM it invalid
+    // the way EIP-1271 does; treating a genuine EOA as a contract routes a
+    // valid signature to a call that will simply fail against a codeless
+    // address). Either way this is a rejection, so the distinction is moot
+    // for the caller.
+    return undefined
+  }
+  const hasCode = code !== undefined && code !== '0x'
+
+  if (!hasCode) {
+    if (!HEX_SIGNATURE_RE.test(signature)) return undefined
     const recovered = await recoverEcdsaSigner(signature, digest)
-    if (recovered && isAddressEqual(recovered, from)) {
-      return { signer: recovered, kind: 'ecdsa' }
-    }
+    if (!recovered || !isAddressEqual(recovered, from)) return undefined
+    return { signer: recovered, kind: 'ecdsa' }
   }
 
   const verified = await verifyEip1271Signature(client, from, digest, signature)
@@ -742,16 +788,20 @@ export async function verifyPayment(
 
   // 6. Signature — recovered over the EIP-712 `ReceiveWithAuthorization`
   // struct, using a domain read live from the token contract. Two signature
-  // schemes are supported (Task 11), decided by `recoverSigner` below: a
-  // 65-byte signature whose claimed signer (`from`) has no on-chain code is
-  // ECDSA, rejected outright if malleable even before recovery is attempted
-  // — the EVM's `ecrecover` precompile (and viem's recovery, which uses the
-  // same math) does NOT itself reject a high-`s`/wrong-`v` signature the way
-  // OpenZeppelin's `ECDSA.recover` (which real USDC uses) does, and a
-  // verifier that skipped this would accept signatures the token itself
-  // would refuse at settlement. Everything else — any other length, or a
-  // 65-byte signature whose `from` DOES have code — is EIP-1271, which has
-  // no malleability concept of its own and is never subjected to that check.
+  // schemes are supported (Task 11), decided by `recoverSigner` below on
+  // `from`'s on-chain code — mirroring real USDC's own
+  // `SignatureChecker.isValidSignatureNow`, which both `receiveWithAuthorization`
+  // overloads collapse onto: a codeless `from` takes the ECDSA path,
+  // rejected outright if malleable — the EVM's `ecrecover` precompile (and
+  // viem's recovery, which uses the same math) does NOT itself reject a
+  // high-`s`/wrong-`v` signature the way OpenZeppelin's `ECDSA.recover`
+  // (which real USDC uses) does, and a verifier that skipped this would
+  // accept signatures the token itself would refuse at settlement. A `from`
+  // that DOES have code always takes EIP-1271 instead, REGARDLESS of the
+  // signature's length — even a coincidentally-65-byte blob — which has no
+  // malleability concept of its own and is never subjected to that check.
+  // See `recoverSigner`'s doc comment for why this must be code-first, not
+  // signature-shape-first: the latter was tried and rejected in review.
   if (!HEX_ADDRESS_RE.test(authorization.from) || !HEX_ADDRESS_RE.test(authorization.to)) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }

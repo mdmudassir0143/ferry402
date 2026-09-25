@@ -7,7 +7,7 @@ import { verifyPayment, settlePayment, type SettleOptions } from '../src/chains/
 import { startAnvilWithEscrow, ANVIL_DEPLOYER_PRIVATE_KEY, ANVIL_PAYER_PRIVATE_KEY, ANVIL_PAYER_ADDRESS, type EscrowAnvilFixture } from './support/anvil.js'
 import { escrowAbi } from './fixtures/Escrow.abi.js'
 import { settleTokenAbi } from './fixtures/SettleToken.abi.js'
-import { smartWalletAbi, smartWalletBytecode } from './fixtures/SmartWallet.abi.js'
+import { smartWalletAbi, smartWalletBytecode, dirtyPaddingWalletAbi, dirtyPaddingWalletBytecode } from './fixtures/SmartWallet.abi.js'
 import { buildRequirements, buildPayload, signAuthorization, type AuthorizationFields } from './support/fixtures.js'
 
 /**
@@ -97,6 +97,23 @@ async function deploySmartWallet(accepts: boolean): Promise<Address> {
   })
   const receipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
   if (!receipt.contractAddress) throw new Error('SmartWallet deployment produced no contract address')
+  await mintTo(receipt.contractAddress, 1_000_000n)
+  return receipt.contractAddress
+}
+
+/** Deploys a fresh `DirtyPaddingWallet` — always returns the correct 4-byte
+ *  magic value with non-zero (garbage) padding, only reachable via raw
+ *  assembly. See its own doc comment. */
+async function deployDirtyPaddingWallet(): Promise<Address> {
+  const deployHash = await walletClient.deployContract({
+    abi: dirtyPaddingWalletAbi,
+    bytecode: dirtyPaddingWalletBytecode,
+    args: [],
+    chain: foundry,
+    account: walletClient.account!,
+  })
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
+  if (!receipt.contractAddress) throw new Error('DirtyPaddingWallet deployment produced no contract address')
   await mintTo(receipt.contractAddress, 1_000_000n)
   return receipt.contractAddress
 }

@@ -35,12 +35,23 @@ pragma solidity ^0.8.24;
 ///         changes.
 ///
 ///         Task 11 adds the `bytes signature` overload (mirroring
-///         `MockUSDC.sol`'s own addition): a 65-byte signature takes the
-///         identical ECDSA path as the `(v, r, s)` overload above; any other
-///         length is an EIP-1271 smart-contract-wallet signature, verified by
-///         calling `from.isValidSignature(digest, signature)` and requiring
-///         exactly the ERC-1271 magic value. `IERC1271` is declared inline
-///         (not imported) to keep this fixture self-contained.
+///         `MockUSDC.sol`'s own addition, after task-11 review round 1):
+///         branches on `from`'s on-chain code, NOT `signature.length` --
+///         real USDC v2.2's own `SignatureChecker.isValidSignatureNow`
+///         dispatches this way, and both `receiveWithAuthorization`
+///         overloads collapse onto it. A codeless `from` takes the identical
+///         ECDSA path as the `(v, r, s)` overload above and REQUIRES exactly
+///         65 bytes; a `from` with code always takes EIP-1271 regardless of
+///         length, verified via a raw `staticcall` requiring the FULL
+///         32-byte return word to equal `bytes32(IERC1271.isValidSignature.selector)`
+///         -- not a `bytes4`-typed decode, matching real USDC's own
+///         `SignatureChecker.sol` and `packages/contracts/test/mocks/MockUSDC.sol`
+///         exactly (see that file's `_checkEip1271` doc comment for what a
+///         typed decode does instead on this Solidity version -- an opaque,
+///         uncaught revert rather than the silent acceptance the equivalent
+///         naive check has on the TypeScript/viem side of this facilitator).
+///         `IERC1271` is declared inline (not imported) to keep this
+///         fixture self-contained.
 interface IERC1271 {
     function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4 magicValue);
 }
@@ -160,7 +171,8 @@ contract SettleToken {
     ) external {
         bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
 
-        if (signature.length == 65) {
+        if (from.code.length == 0) {
+            if (signature.length != 65) revert InvalidSignature();
             bytes32 r = abi.decode(signature[0:32], (bytes32));
             bytes32 s = abi.decode(signature[32:64], (bytes32));
             uint8 v = uint8(signature[64]);
@@ -169,15 +181,19 @@ contract SettleToken {
             address signer = ecrecover(digest, v, r, s);
             if (signer == address(0) || signer != from) revert InvalidSignature();
         } else {
-            if (from.code.length == 0) revert InvalidSignature();
-            try IERC1271(from).isValidSignature(digest, signature) returns (bytes4 magicValue) {
-                if (magicValue != IERC1271.isValidSignature.selector) revert InvalidSignature();
-            } catch {
-                revert InvalidSignature();
-            }
+            if (!_checkEip1271(from, digest, signature)) revert InvalidSignature();
         }
 
         _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    /// @notice Raw `staticcall` + full-word comparison -- see this contract's
+    ///         doc comment above for why a typed `bytes4` decode isn't safe
+    ///         here.
+    function _checkEip1271(address from, bytes32 digest, bytes calldata signature) private view returns (bool) {
+        (bool success, bytes memory result) =
+            from.staticcall(abi.encodeCall(IERC1271.isValidSignature, (digest, signature)));
+        return success && result.length == 32 && abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector);
     }
 
     function _checkAuthorization(

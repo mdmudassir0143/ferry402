@@ -43,3 +43,25 @@ contract MockSmartWallet is IERC1271 {
         return accepts ? MAGIC_VALUE : INVALID_VALUE;
     }
 }
+
+/// @title DirtyPaddingWallet
+/// @notice Returns the CORRECT 4-byte ERC-1271 magic value in the leading
+///         bytes of its return word, but followed by non-zero (`0xff`)
+///         padding instead of the zero padding Solidity's own ABI encoding
+///         of a `bytes4` return value would normally produce — only
+///         reachable at all via raw assembly, since no ordinary Solidity
+///         `return` statement can produce it. Exists to prove a caller
+///         validates the FULL 32-byte return word (as real USDC's
+///         `SignatureChecker.sol` does, and as `MockUSDC._checkEip1271`
+///         mirrors) rather than decoding through a `bytes4`-typed
+///         `try {...} returns (bytes4)`, which extracts only the leading 4
+///         bytes and does not itself validate that the rest is zero
+///         (task-11 review round 1, "Vector B").
+contract DirtyPaddingWallet {
+    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
+        assembly {
+            mstore(0x00, 0x1626ba7effffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+            return(0x00, 0x20)
+        }
+    }
+}

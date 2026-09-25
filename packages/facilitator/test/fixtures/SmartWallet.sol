@@ -47,3 +47,23 @@ contract SmartWallet {
         return accepts ? MAGIC_VALUE : INVALID_VALUE;
     }
 }
+
+/// @title DirtyPaddingWallet
+/// @notice Returns the CORRECT 4-byte ERC-1271 magic value in the leading
+///         bytes of its return word, but followed by non-zero (`0xff`)
+///         padding instead of proper zero-padding -- only reachable via raw
+///         assembly, since no ordinary Solidity `return` statement can
+///         produce it. Used by `eip1271.test.ts` to prove
+///         `verifyEip1271Signature` in `chains/base.ts` validates the FULL
+///         32-byte return word (task-11 review round 1, "Vector B") rather
+///         than decoding through a `bytes4`-typed `readContract`, which
+///         viem itself confirms silently accepts this — see that
+///         function's own doc comment.
+contract DirtyPaddingWallet {
+    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
+        assembly {
+            mstore(0x00, 0x1626ba7effffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+            return(0x00, 0x20)
+        }
+    }
+}

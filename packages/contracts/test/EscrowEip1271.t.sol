@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
-import {MockSmartWallet} from "./mocks/MockSmartWallet.sol";
+import {MockSmartWallet, DirtyPaddingWallet} from "./mocks/MockSmartWallet.sol";
 import {Secp256k1TestHelper} from "./helpers/Secp256k1TestHelper.sol";
 
 /// @title EscrowEip1271Test
@@ -146,6 +146,60 @@ contract EscrowEip1271Test is Test, Secp256k1TestHelper {
 
         assertEq(escrow.balanceOf(merchant), 10e6);
         assertEq(usdc.balanceOf(payer), 1_000e6 - 10e6);
+    }
+
+    /// @notice A 65-byte signature whose `from` HAS code must still take the
+    /// EIP-1271 path — never be misrouted to `ecrecover` just because its
+    /// length happens to match a plain ECDSA blob. This is the exact gap
+    /// task-11 review round 1 found in a length-based dispatch rule: a
+    /// 1-of-1 smart-contract wallet whose owner signs the raw digest
+    /// produces exactly this shape (65 bytes), and length-based dispatch
+    /// would `ecrecover` it to the OWNER's address — never the wallet's own
+    /// (a contract holds no private key, so it can never BE the recovered
+    /// address) — and revert, even though the wallet's own
+    /// `isValidSignature` would have accepted it. Real USDC's own
+    /// `SignatureChecker.isValidSignatureNow` dispatches on `from`'s code,
+    /// not signature shape, for exactly this reason.
+    function test_settleAuthorizationWithSignature_smartWalletWith65ByteSignature_stillUsesEip1271() public {
+        MockSmartWallet wallet = new MockSmartWallet(true);
+        usdc.mint(address(wallet), 1_000e6);
+
+        bytes32 paymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory auth = _auth(address(wallet), paymentId, 10e6);
+        // Exactly 65 bytes -- shaped like a plain ECDSA (r, s, v) blob -- but
+        // means nothing as ECDSA data; MockSmartWallet ignores it entirely
+        // (see its doc comment). Low-s and v=27 so this would even survive
+        // the ECDSA path's OWN shape checks if it were (wrongly) routed
+        // there, making this a genuine dispatch-rule test, not merely a
+        // malformed-signature test in disguise.
+        bytes memory signature = abi.encodePacked(bytes32(uint256(1)), bytes32(uint256(2)), uint8(27));
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Escrow.PaymentSettled(merchant, address(wallet), 10e6, auth.nonce);
+
+        escrow.settleAuthorizationWithSignature(merchant, paymentId, auth, signature);
+
+        assertEq(escrow.balanceOf(merchant), 10e6);
+    }
+
+    /// @notice A wallet returning the correct 4-byte magic value followed by
+    /// non-zero padding (not a proper zero-padded 32-byte word) must be
+    /// rejected — task-11 review round 1's "Vector B". `DirtyPaddingWallet`
+    /// can only produce this via raw assembly; no ordinary Solidity `return`
+    /// can. Proves `MockUSDC._checkEip1271` validates the full return word,
+    /// not just its leading 4 bytes.
+    function test_settleAuthorizationWithSignature_dirtyMagicValuePadding_rejects() public {
+        DirtyPaddingWallet wallet = new DirtyPaddingWallet();
+        usdc.mint(address(wallet), 1_000e6);
+
+        bytes32 paymentId = bytes32(_nextPaymentId++);
+        Escrow.Authorization memory auth = _auth(address(wallet), paymentId, 10e6);
+        bytes memory signature = hex"deadbeef";
+
+        vm.expectRevert(MockUSDC.InvalidSignature.selector);
+        escrow.settleAuthorizationWithSignature(merchant, paymentId, auth, signature);
+
+        assertEq(escrow.balanceOf(merchant), 0);
     }
 
     /// @notice Same merchant-nonce binding as `settleAuthorization` — a

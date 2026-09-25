@@ -128,16 +128,25 @@ contract MockUSDC is IEIP3009, Secp256k1TestHelper {
         _finalizeAuthorization(from, to, value, nonce);
     }
 
-    /// @notice The `bytes signature` overload (Task 11). A 65-byte signature
-    ///         is a plain ECDSA `(r, s, v)` blob, verified with the identical
-    ///         non-malleable ecrecover check as the `(v, r, s)` overload
-    ///         above. Any other length is treated as an EIP-1271
-    ///         smart-contract-wallet signature: `from` MUST have code and
-    ///         MUST return exactly `0x1626ba7e` from `isValidSignature` — a
-    ///         codeless `from`, a wrong return value, or a revert all reject.
-    ///         This mirrors what real USDC v2.2 does, and is what lets a
-    ///         smart-contract-wallet payer (which holds no ECDSA private key)
-    ///         redeem an authorization at all.
+    /// @notice The `bytes signature` overload (Task 11). Branches on `from`'s
+    ///         on-chain code — mirroring real USDC v2.2's own
+    ///         `SignatureChecker.isValidSignatureNow`, which both
+    ///         `receiveWithAuthorization` overloads collapse onto — NOT on
+    ///         `signature.length` (task-11 review round 1: length-based
+    ///         dispatch misroutes a 1-of-1 smart-contract wallet's
+    ///         incidentally-65-byte owner signature to `ecrecover`, which
+    ///         recovers the OWNER's address, not the wallet's, and reverts,
+    ///         even though the wallet's own `isValidSignature` would have
+    ///         accepted it). A codeless `from` takes the identical
+    ///         non-malleable ECDSA check as the `(v, r, s)` overload above,
+    ///         and REQUIRES exactly 65 bytes (any other length rejects
+    ///         outright, with no external call attempted — a codeless
+    ///         address can never implement EIP-1271). A `from` with code
+    ///         ALWAYS takes EIP-1271, regardless of length: `isValidSignature`
+    ///         must return exactly `0x1626ba7e` as the FULL 32-byte word (see
+    ///         `_checkEip1271`'s doc comment for why this is a raw `staticcall`
+    ///         rather than a typed `try/catch` decode) — a wrong value, dirty
+    ///         padding, or a revert all reject.
     function receiveWithAuthorization(
         address from,
         address to,
@@ -149,7 +158,8 @@ contract MockUSDC is IEIP3009, Secp256k1TestHelper {
     ) external {
         bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
 
-        if (signature.length == 65) {
+        if (from.code.length == 0) {
+            if (signature.length != 65) revert InvalidSignature();
             bytes32 r = abi.decode(signature[0:32], (bytes32));
             bytes32 s = abi.decode(signature[32:64], (bytes32));
             uint8 v = uint8(signature[64]);
@@ -158,15 +168,48 @@ contract MockUSDC is IEIP3009, Secp256k1TestHelper {
             address signer = ecrecover(digest, v, r, s);
             if (signer == address(0) || signer != from) revert InvalidSignature();
         } else {
-            if (from.code.length == 0) revert InvalidSignature();
-            try IERC1271(from).isValidSignature(digest, signature) returns (bytes4 magicValue) {
-                if (magicValue != IERC1271.isValidSignature.selector) revert InvalidSignature();
-            } catch {
-                revert InvalidSignature();
-            }
+            if (!_checkEip1271(from, digest, signature)) revert InvalidSignature();
         }
 
         _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    /// @notice Verifies an EIP-1271 signature via a raw `staticcall`,
+    ///         requiring the FULL 32-byte return word to equal
+    ///         `bytes32(IERC1271.isValidSignature.selector)` — deliberately
+    ///         NOT a `try { ... } returns (bytes4 magicValue)` typed decode,
+    ///         mirroring real USDC's own `SignatureChecker.sol` exactly
+    ///         (a raw call plus a full-word `abi.decode(result, (bytes32))`
+    ///         comparison, not a typed `bytes4` return).
+    ///
+    ///         Verified directly (`test_settleAuthorizationWithSignature_dirtyMagicValuePadding_rejects`,
+    ///         mutated back to a typed decode and re-run): on THIS Solidity
+    ///         version, a wallet returning `0x1626ba7e` followed by non-zero
+    ///         padding does NOT cause a typed decode to silently accept it —
+    ///         Solidity's own ABI-decoding of `bytes4` rejects the dirty
+    ///         padding, but as an UNCAUGHT low-level revert that bypasses
+    ///         this function's own `catch` clause entirely (it happens
+    ///         during the caller's decoding of an otherwise-successful
+    ///         call, not as a failure of the call itself), surfacing as an
+    ///         opaque, unlabeled revert instead of this contract's own
+    ///         `InvalidSignature()`. So the raw-`staticcall` form here isn't
+    ///         closing a silent-acceptance hole on the Solidity side (there
+    ///         isn't one) — it's what keeps this rejection reason uniform
+    ///         and catchable, the same discipline `_safeTransfer` already
+    ///         applies to a codeless/non-conforming token. The TypeScript
+    ///         side (`verifyEip1271Signature` in `chains/base.ts`) is where
+    ///         this exact shape of return value genuinely IS silently
+    ///         accepted by a naive typed decode (confirmed directly against
+    ///         viem) — see that function's doc comment.
+    ///
+    ///         `result.length == 32` additionally rejects a short/long/empty
+    ///         return (including a revert, which yields empty `result` and
+    ///         `success == false`) in the same expression, so a revert, a
+    ///         wrong value, and dirty padding are all a uniform `false`.
+    function _checkEip1271(address from, bytes32 digest, bytes calldata signature) private view returns (bool) {
+        (bool success, bytes memory result) =
+            from.staticcall(abi.encodeCall(IERC1271.isValidSignature, (digest, signature)));
+        return success && result.length == 32 && abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector);
     }
 
     /// @notice Shared guardrails for both `receiveWithAuthorization`

@@ -88,7 +88,27 @@ describe('verifyPayment — client/domain caching (I3)', () => {
     anvil = await startAnvilWithDomainToken({ name: TOKEN_NAME, version: TOKEN_VERSION })
   }, 30_000)
 
-  it('keeps verifying successfully against a cached client/domain after the RPC becomes unreachable', async () => {
+  // Task 11 review round 1: this test used to assert the second call
+  // SUCCEEDED after the RPC died, as proof that the client/domain cache
+  // meant no further RPC traffic was needed at all. That's no longer true,
+  // and can't be made true again without weakening `recoverSigner`:
+  // dispatching ECDSA vs EIP-1271 correctly requires knowing whether `from`
+  // has on-chain code (see `recoverSigner`'s doc comment for why this must
+  // be checked up front, not skipped or inferred), which is a live
+  // `eth_getCode` call EVERY verify now legitimately needs, cache or no
+  // cache. EIP-1271 support genuinely invalidates the old "zero RPC calls
+  // once warm" claim; this isn't something to design around.
+  //
+  // What the cache STILL buys, and what this test now actually proves:
+  // execution reaches all the way to that NEW code-check step instead of
+  // failing earlier at a stale/uncached domain read. If `getTokenDomain`'s
+  // cache entry from the warm-up call below were NOT being reused, this
+  // second call would fail at the domain read itself and report
+  // `unexpected_verify_error` (see check 6's `getTokenDomain` guard) --
+  // instead it fails specifically at the signature-dispatch step, reported
+  // as `invalid_exact_evm_payload_signature`, which is only reachable AFTER
+  // the (cached) domain was already resolved successfully.
+  it('reuses the cached client/domain after the RPC becomes unreachable, failing only at the (now unavoidable) live code check', async () => {
     // Warm-up call: real RPC traffic (client construction + chain-id check +
     // name()/version() reads) all happen here.
     const auth1 = authFields()
@@ -107,11 +127,7 @@ describe('verifyPayment — client/domain caching (I3)', () => {
     )
     expect(warmup.isValid).toBe(true)
 
-    // Kill the RPC entirely. If the second call below needed a fresh
-    // eth_chainId or name()/version() read -- rather than reusing the
-    // memoized client-verification result and token domain from the
-    // warm-up call -- it would now fail (connection refused), not merely
-    // run slowly.
+    // Kill the RPC entirely.
     await anvil.stop()
 
     const auth2 = authFields({ value: '2000000' })
@@ -128,8 +144,11 @@ describe('verifyPayment — client/domain caching (I3)', () => {
       requirementsFor(anvil.tokenAddress),
       { rpcUrl: anvil.rpcUrl, escrows: DEFAULT_ESCROWS },
     )
-    expect(afterRpcDied.isValid).toBe(true)
-    expect(afterRpcDied.payer).toBe(ANVIL_PAYER_ADDRESS)
+    expect(afterRpcDied.isValid).toBe(false)
+    // NOT 'unexpected_verify_error' -- that would mean the domain read
+    // itself failed, i.e. the cache from the warm-up call above was NOT
+    // reused.
+    expect(afterRpcDied.invalidReason).toBe('invalid_exact_evm_payload_signature')
   })
 })
 
