@@ -2,7 +2,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express'
 import { PaymentPayloadSchema, VerifyResponseSchema } from 'x402/types'
 import type { PaymentPayload, VerifyResponse } from 'x402/types'
 import { buildRequirements } from './requirements.js'
-import { normalizeNonce } from './nonce.js'
+import { normalizeAddress, normalizeNonce } from './nonce.js'
 import { assertValidSecret, deriveChallenge, matchChallenge, TIME_BUCKET_SECONDS } from './challengeDerivation.js'
 import { InMemoryConsumedNonceStore } from './challengeStore.js'
 import type { ConsumedNonceStore } from './challengeStore.js'
@@ -115,28 +115,28 @@ export interface Ferry402Options {
  * settlement) is built from `matched.paymentId` specifically, never from a
  * freshly-`issueChallenge`d one.
  *
- * ## A structural trade-off, stated explicitly (not silently dropped)
+ * ## Many payers, one derived challenge: keyed by `(from, nonce)`, not `nonce`
  *
  * Because `paymentId` depends only on `(merchantEvm, resource, timeBucket)`
  * — never on WHO is asking — every anonymous requester of the SAME resource
- * within the SAME bucket sees the SAME challenge, and `ConsumedNonceStore`
- * is keyed purely by `nonce` (matching this task's spec literally). Two
- * DIFFERENT payers racing to pay the identical resource in the identical
- * window are therefore racing for ONE shared slot: whichever one's payment
- * the facilitator confirms first consumes the nonce, and the other is
- * indistinguishable from a replay and is rejected — even though on-chain
- * EIP-3009 nonce tracking is scoped per-`from` and would not itself have
- * conflicted. This is a genuine behavior change from Task 6, whose
- * per-request random `paymentId` gave concurrent payers of the same
- * resource independent slots (see the task-6 report's "concurrency
- * (nonce-keyed store, not resource-keyed)" tests, now superseded — a
- * challenge cannot be minted unique-per-payer before the payer has said
- * anything, without storing something, which is exactly what this task
- * removes). A route that needs independent concurrent slots can still get
- * one per caller by folding a caller-supplied unique token into its own
- * URL/query string (which becomes part of `resource`, and therefore of the
- * HMAC preimage) — a route-design choice, not something this middleware
- * does on the caller's behalf.
+ * within the SAME bucket sees the SAME challenge, hence the SAME nonce. A
+ * `ConsumedNonceStore` keyed by `nonce` alone would therefore treat a SECOND,
+ * genuinely different, independently-signed payer's payment as a replay of
+ * the FIRST payer's — one paying customer per resource per window, which for
+ * a metered API is a worse regression than the availability bug this task
+ * fixes (that one needed an attacker; this happens between two honest
+ * customers). Round 1 review caught this. Fixed by keying
+ * `ConsumedNonceStore` on the PAIR — `authorization.from` alongside the
+ * nonce — matching how real USDC itself keys authorization-used state
+ * (`_authorizationStates[from][nonce]`, per-authorizer, not global): a store
+ * keyed by nonce alone was STRICTER than the token, rejecting payments the
+ * chain would have accepted, which is the mirror image of the discipline
+ * Task 11 enforced the other way (never MORE PERMISSIVE than the token).
+ * Two different payers of the same resource in the same window now both
+ * succeed; the SAME payer replaying the SAME nonce is still rejected —
+ * keying on the pair adds a dimension, it does not remove one. See
+ * `challengeStore.ts` for the full rationale and `middleware.test.ts`'s
+ * "multiple payers" tests for the mutation-checked proof.
  *
  * ## Local floor checks
  *
@@ -152,7 +152,6 @@ export interface Ferry402Options {
  * - This function only calls `/verify`, never `/settle` — double-collection
  *   protection (the same authorization redeemed twice on-chain) is
  *   `Escrow`'s own single-use nonce tracking, out of scope here.
- * - The concurrent-different-payers trade-off above.
  */
 export function ferry402(config: Ferry402Config, options: Ferry402Options = {}): RequestHandler {
   assertValidSecret(config.secret)
@@ -161,16 +160,18 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
   /**
    * Builds the `accepts` array for `resource` RIGHT NOW: one
    * `PaymentRequirements` entry per accepted chain, each carrying the
-   * CURRENT bucket's derived `paymentId` in place of `buildRequirements`'s
-   * own random default (which is generated and then immediately discarded
-   * here — see this function's doc comment for why the random value must
-   * never be the one actually published). Pure and synchronous: no store of
-   * any kind is touched, for any request — this is the core of Task 12's
-   * fix. Calling this for the same `resource` twice inside the same time
-   * bucket returns byte-for-byte identical `paymentId`s, by design.
+   * CURRENT bucket's derived `paymentId`. Passes
+   * `skipPaymentIdGeneration: true` to `buildRequirements` — every entry's
+   * placeholder `paymentId` is overwritten below before this function
+   * returns, so there is no reason to spend a `crypto.randomBytes(32)` draw
+   * generating one first, on every single request (see that option's doc
+   * comment in `requirements.ts`). Pure and synchronous: no store of any
+   * kind is touched, for any request — this is the core of Task 12's fix.
+   * Calling this for the same `resource` twice inside the same time bucket
+   * returns byte-for-byte identical `paymentId`s, by design.
    */
   function issueChallenge(resource: string): PaymentRequirements[] {
-    const requirements = buildRequirements(config, resource)
+    const requirements = buildRequirements(config, resource, { skipPaymentIdGeneration: true })
     for (const requirement of requirements) {
       const merchantEvm = requirement.extra?.merchantEvm as `0x${string}` | undefined
       if (!merchantEvm) continue // defensive; buildRequirements always sets this
@@ -215,9 +216,9 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     }
   }
 
-  async function release(nonce: `0x${string}`): Promise<void> {
+  async function release(from: `0x${string}`, nonce: `0x${string}`): Promise<void> {
     try {
-      await consumedNonceStore.release(nonce)
+      await consumedNonceStore.release(from, nonce)
     } catch {
       // Best effort — see ConsumedNonceStore.release's doc comment. A failed
       // release just means the payer sees `payment_expired` on retry rather
@@ -269,6 +270,13 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     }
     const authorization = paymentPayload.payload.authorization
     const presentedNonce = normalizeNonce(authorization.nonce)
+    // Task 12 round-1 review fix: replay defense is keyed on the PAIR, not
+    // the nonce alone — see ConsumedNonceStore's doc comment for why (the
+    // derivation has no payer term, so two different payers of the same
+    // resource in the same window derive the identical nonce; real USDC
+    // itself keys authorization-used state as `_authorizationStates[from]
+    // [nonce]` for exactly this reason).
+    const presentedFrom = normalizeAddress(authorization.from)
 
     const selected = requirements.find((r) => r.network === paymentPayload.network)
     if (!selected) {
@@ -346,28 +354,31 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     const expiresAt = Date.now() + 2 * TIME_BUCKET_SECONDS * 1000
     let firstConsume: boolean
     try {
-      firstConsume = await consumedNonceStore.consumeIfAbsent(presentedNonce, expiresAt)
+      firstConsume = await consumedNonceStore.consumeIfAbsent(presentedFrom, presentedNonce, expiresAt)
     } catch {
       send402(res, requirements, 'unexpected_verify_error')
       return
     }
     if (!firstConsume) {
       // Already consumed by a prior (or concurrently racing) request with
-      // the identical nonce — a genuine replay. Rejected locally; the
-      // facilitator is never called a second time for it.
+      // the identical (from, nonce) pair — a genuine replay BY THE SAME
+      // PAYER. A different payer presenting the same nonce is a different
+      // pair and is never rejected here (see ConsumedNonceStore's doc
+      // comment). Rejected locally; the facilitator is never called a
+      // second time for it.
       send402(res, requirements, 'payment_expired')
       return
     }
 
     const verdict = await callVerify(paymentPayload, requirementForVerify)
     if ('networkError' in verdict) {
-      await release(presentedNonce)
+      await release(presentedFrom, presentedNonce)
       send402(res, requirements, 'unexpected_verify_error')
       return
     }
 
     if (!verdict.isValid) {
-      await release(presentedNonce)
+      await release(presentedFrom, presentedNonce)
       send402(res, requirements, verdict.invalidReason ?? 'invalid_payment')
       return
     }

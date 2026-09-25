@@ -52,7 +52,9 @@ const config: Ferry402Config = {
  *   - nonce: /^0x[0-9a-fA-F]{64}$/
  *   - signature: /^0x[0-9a-fA-F]+$/
  */
-function makePayload(network: 'base-sepolia' | 'polygon-amoy', nonce: string) {
+const DEFAULT_PAYER = '0xCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc'
+
+function makePayload(network: 'base-sepolia' | 'polygon-amoy', nonce: string, from: string = DEFAULT_PAYER) {
   return {
     x402Version: 1,
     scheme: 'exact' as const,
@@ -60,7 +62,7 @@ function makePayload(network: 'base-sepolia' | 'polygon-amoy', nonce: string) {
     payload: {
       signature: `0x${'ab'.repeat(65)}`,
       authorization: {
-        from: '0xCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc',
+        from,
         to: config.escrows[network],
         value: '10000',
         validAfter: '0',
@@ -157,21 +159,27 @@ function fakeRes(): Response & FakeRes {
 /**
  * The naive third-party `ConsumedNonceStore` an integrator might plug in via
  * `ferry402(config, { consumedNonceStore })` without having thought about
- * nonce casing at all — no internal lowercasing, unlike the default. Stands
+ * casing at all - no internal lowercasing of EITHER `from` or `nonce`,
+ * unlike the default, and no composite-key normalization of its own. Stands
  * in for the OLD `CaseSensitiveMapStore` extension-point test, retargeted at
  * Task 12's replacement seam.
  */
 class CaseSensitiveMapConsumedNonceStore implements ConsumedNonceStore {
   private readonly entries = new Map<string, number>()
 
-  async consumeIfAbsent(nonce: `0x${string}`, expiresAt: number): Promise<boolean> {
-    if (this.entries.has(nonce)) return false
-    this.entries.set(nonce, expiresAt)
+  private key(from: `0x${string}`, nonce: `0x${string}`): string {
+    return `${from}:${nonce}` // deliberately NOT lowercased - see class doc comment
+  }
+
+  async consumeIfAbsent(from: `0x${string}`, nonce: `0x${string}`, expiresAt: number): Promise<boolean> {
+    const key = this.key(from, nonce)
+    if (this.entries.has(key)) return false
+    this.entries.set(key, expiresAt)
     return true
   }
 
-  async release(nonce: `0x${string}`): Promise<void> {
-    this.entries.delete(nonce)
+  async release(from: `0x${string}`, nonce: `0x${string}`): Promise<void> {
+    this.entries.delete(this.key(from, nonce))
   }
 }
 
@@ -255,13 +263,13 @@ describe('ferry402 middleware', () => {
       let consumeCalls = 0
       let releaseCalls = 0
       const spyStore: ConsumedNonceStore = {
-        consumeIfAbsent: async (nonce, expiresAt) => {
+        consumeIfAbsent: async (from, nonce, expiresAt) => {
           consumeCalls++
-          return store.consumeIfAbsent(nonce, expiresAt)
+          return store.consumeIfAbsent(from, nonce, expiresAt)
         },
-        release: async (nonce) => {
+        release: async (from, nonce) => {
           releaseCalls++
-          return store.release(nonce)
+          return store.release(from, nonce)
         },
       }
       const fetchSpy = vi.fn()
@@ -286,11 +294,11 @@ describe('ferry402 middleware', () => {
       const store = new InMemoryConsumedNonceStore()
       let consumeCalls = 0
       const spyStore: ConsumedNonceStore = {
-        consumeIfAbsent: async (nonce, expiresAt) => {
+        consumeIfAbsent: async (from, nonce, expiresAt) => {
           consumeCalls++
-          return store.consumeIfAbsent(nonce, expiresAt)
+          return store.consumeIfAbsent(from, nonce, expiresAt)
         },
-        release: async (nonce) => store.release(nonce),
+        release: async (from, nonce) => store.release(from, nonce),
       }
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
@@ -397,6 +405,100 @@ describe('ferry402 middleware', () => {
       const res = await request(appWith({})).get('/premium')
       const [baseSepolia, polygonAmoy] = res.body.accepts as PaymentRequirements[]
       expect(baseSepolia.extra?.paymentId).not.toBe(polygonAmoy.extra?.paymentId)
+    })
+
+    describe('multiple payers of the SAME resource in the SAME window (round 1 review fix: keyed by (from, nonce), not nonce alone)', () => {
+      const PAYER_A = DEFAULT_PAYER
+      const PAYER_B = '0xDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDd'
+
+      it('two DIFFERENT payers paying the identical derived challenge both succeed', async () => {
+        const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+        globalThis.fetch = fetchSpy as any
+        const server = buildApp()
+
+        const challengeRes = await request(server).get('/premium')
+        const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+        const nonce = nonceFor(requirement)
+        const network = requirement.network as 'base-sepolia' | 'polygon-amoy'
+
+        const payloadA = makePayload(network, nonce, PAYER_A)
+        const payloadB = makePayload(network, nonce, PAYER_B)
+
+        const resA = await request(server).get('/premium').set('X-PAYMENT', toHeader(payloadA))
+        const resB = await request(server).get('/premium').set('X-PAYMENT', toHeader(payloadB))
+
+        expect(resA.status).toBe(200)
+        expect(resB.status).toBe(200)
+        // Each payer's own payment genuinely reached the facilitator - not
+        // one payment silently reused for both.
+        expect(fetchSpy).toHaveBeenCalledTimes(2)
+      })
+
+      it('this also holds for two CONCURRENT different payers, not just sequential ones', async () => {
+        const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+        globalThis.fetch = fetchSpy as any
+        const server = buildApp()
+
+        const challengeRes = await request(server).get('/premium')
+        const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+        const nonce = nonceFor(requirement)
+        const network = requirement.network as 'base-sepolia' | 'polygon-amoy'
+
+        const [resA, resB] = await Promise.all([
+          request(server).get('/premium').set('X-PAYMENT', toHeader(makePayload(network, nonce, PAYER_A))),
+          request(server).get('/premium').set('X-PAYMENT', toHeader(makePayload(network, nonce, PAYER_B))),
+        ])
+
+        expect(resA.status).toBe(200)
+        expect(resB.status).toBe(200)
+        expect(fetchSpy).toHaveBeenCalledTimes(2)
+      })
+
+      it('but the SAME payer replaying the SAME nonce is still rejected - keying on the pair adds a dimension, it does not remove one', async () => {
+        const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+        globalThis.fetch = fetchSpy as any
+        const server = buildApp()
+
+        const challengeRes = await request(server).get('/premium')
+        const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+        const nonce = nonceFor(requirement)
+        const network = requirement.network as 'base-sepolia' | 'polygon-amoy'
+        const header = toHeader(makePayload(network, nonce, PAYER_A))
+
+        const first = await request(server).get('/premium').set('X-PAYMENT', header)
+        expect(first.status).toBe(200)
+
+        const replay = await request(server).get('/premium').set('X-PAYMENT', header)
+        expect(replay.status).toBe(402)
+        expect(replay.body.error).toBe('payment_expired')
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      })
+
+      it('a checksummed (mixed-case) authorization.from does not defeat replay defense - same address, same key', async () => {
+        const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+        globalThis.fetch = fetchSpy as any
+        const server = buildApp()
+
+        const challengeRes = await request(server).get('/premium')
+        const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+        const nonce = nonceFor(requirement)
+        const network = requirement.network as 'base-sepolia' | 'polygon-amoy'
+
+        const lowercaseFrom = PAYER_A.toLowerCase()
+        const uppercaseFrom = `0x${PAYER_A.slice(2).toUpperCase()}`
+
+        const first = await request(server)
+          .get('/premium')
+          .set('X-PAYMENT', toHeader(makePayload(network, nonce, lowercaseFrom)))
+        expect(first.status).toBe(200)
+
+        const replayDifferentCasing = await request(server)
+          .get('/premium')
+          .set('X-PAYMENT', toHeader(makePayload(network, nonce, uppercaseFrom)))
+        expect(replayDifferentCasing.status).toBe(402)
+        expect(replayDifferentCasing.body.error).toBe('payment_expired')
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      })
     })
   })
 

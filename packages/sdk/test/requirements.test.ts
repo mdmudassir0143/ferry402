@@ -110,6 +110,36 @@ describe('buildRequirements', () => {
     ).toThrow(/paymentId/)
   })
 
+  describe('skipPaymentIdGeneration (Task 12 round 1: avoid a wasted CSPRNG draw for callers that overwrite paymentId themselves)', () => {
+    it('fills every entry with the fixed zero placeholder instead of a random id', () => {
+      const reqs = buildRequirements(config, 'https://api.test/premium', { skipPaymentIdGeneration: true })
+      for (const r of reqs) {
+        expect(r.extra?.paymentId).toBe(`0x${'0'.repeat(64)}`)
+      }
+    })
+
+    it('is identical across repeated calls, unlike the CSPRNG default - proving no randomness is drawn', () => {
+      // vitest/ESM cannot spy on node:crypto's named export directly
+      // (module namespace properties are non-configurable in ESM), so this
+      // asserts the OBSERVABLE consequence of skipping the CSPRNG draw
+      // instead: the default path never repeats (see "generates a fresh
+      // paymentId on every call" above), while this path always returns the
+      // same fixed placeholder.
+      const first = buildRequirements(config, 'https://api.test/premium', { skipPaymentIdGeneration: true })[0]
+      const second = buildRequirements(config, 'https://api.test/premium', { skipPaymentIdGeneration: true })[0]
+      expect(first.extra?.paymentId).toBe(second.extra?.paymentId)
+    })
+
+    it('unsafePaymentIdForTesting still wins if both options are supplied', () => {
+      const injected = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as const
+      const [req] = buildRequirements(config, 'https://api.test/premium', {
+        skipPaymentIdGeneration: true,
+        unsafePaymentIdForTesting: injected,
+      })
+      expect(req.extra?.paymentId).toBe(injected)
+    })
+  })
+
   it('only ever emits networks from the supported set', () => {
     const reqs = buildRequirements(config, 'https://api.test/premium')
     const allowed = new Set(['base', 'base-sepolia', 'polygon', 'polygon-amoy'])

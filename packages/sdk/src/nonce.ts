@@ -60,12 +60,37 @@ export function computeNonce(merchantEvm: `0x${string}`, paymentId: `0x${string}
  * keyed on the raw, un-normalized string would silently miss a perfectly
  * valid uppercase-hex nonce (the exact bug class the `computeNonce` golden
  * vectors — including the EIP-55 checksummed-address one — exist to catch,
- * one level lower in the same computation). Every nonce a `ChallengeStore`
- * is asked to `get`/`set`/`consume` MUST pass through this function first.
+ * one level lower in the same computation). Every nonce a `ConsumedNonceStore`
+ * (`challengeStore.ts`, Task 12) is asked to `consumeIfAbsent`/`release` MUST
+ * pass through this function first.
  */
 export function normalizeNonce(nonce: string): `0x${string}` {
   if (!HEX_32_BYTE_RE.test(nonce)) {
     throw new Error(`normalizeNonce: invalid nonce, expected a 32-byte 0x value, got ${nonce}`)
   }
   return nonce.toLowerCase() as `0x${string}`
+}
+
+/**
+ * Normalizes a payer-supplied EIP-3009 `authorization.from` address to
+ * lowercase, for the identical reason `normalizeNonce` exists: an `address`
+ * has no casing on-chain (EIP-55 checksum casing is a display convention
+ * layered on top, derived from the address's own hash), but x402's
+ * `PaymentPayloadSchema` validates `from` against a plain
+ * `/^0x[0-9a-fA-F]{40}$/`, which accepts mixed/upper case.
+ *
+ * Task 12's `ConsumedNonceStore` is keyed by `(from, nonce)` — see
+ * `challengeStore.ts` for why nonce alone is insufficient (real USDC keys
+ * `_authorizationStates[from][nonce]` per-authorizer; a store keyed by nonce
+ * alone would reject a second, genuinely different payer's valid payment for
+ * the same resource/window as a "replay" of the first). Every `from` a
+ * `ConsumedNonceStore` is asked to `consumeIfAbsent`/`release` MUST pass
+ * through this function first, so a checksummed and an all-lowercase
+ * spelling of the identical address are always treated as the same key.
+ */
+export function normalizeAddress(address: string): `0x${string}` {
+  if (!HEX_ADDRESS_RE.test(address)) {
+    throw new Error(`normalizeAddress: invalid address, expected a 20-byte 0x address, got ${address}`)
+  }
+  return address.toLowerCase() as `0x${string}`
 }

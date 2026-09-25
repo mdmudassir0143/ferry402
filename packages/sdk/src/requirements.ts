@@ -64,7 +64,35 @@ export interface BuildRequirementsOptions {
    * be a `0x`-prefixed 32-byte (64 hex char) value.
    */
   unsafePaymentIdForTesting?: `0x${string}`
+
+  /**
+   * Skips generating a random `paymentId` entirely and fills every entry's
+   * `extra.paymentId` with a fixed all-zero placeholder instead — for a
+   * caller that immediately overwrites EVERY entry's `extra.paymentId`
+   * itself right after this call returns and would otherwise pay for a
+   * `randomBytes(32)` draw whose output is computed and then thrown away,
+   * unread, on every single call.
+   *
+   * As of this writing the only such caller is `ferry402`'s stateless
+   * challenge derivation (Task 12, `middleware.ts`'s `issueChallenge`):
+   * since Task 12, `paymentId` is DERIVED
+   * (`HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)`,
+   * `challengeDerivation.ts`) rather than randomly minted, so the default
+   * CSPRNG path here is dead weight on that call site specifically — a
+   * `crypto.randomBytes` draw is not free, and it runs on every single HTTP
+   * request `ferry402` handles, discarded immediately.
+   *
+   * NEVER combine this with relying on the RETURNED `paymentId` being real:
+   * a caller that sets this and then does NOT overwrite every entry
+   * publishes an all-zero, trivially-guessable paymentId. Ignored if
+   * `unsafePaymentIdForTesting` is also supplied (that one wins).
+   */
+  skipPaymentIdGeneration?: boolean
 }
+
+/** The fixed placeholder `skipPaymentIdGeneration` fills every entry with.
+ *  Never meant to reach a real 402 response — see that option's doc comment. */
+const ZERO_PAYMENT_ID_PLACEHOLDER: `0x${string}` = `0x${'0'.repeat(64)}`
 
 /**
  * Builds one `PaymentRequirements` entry per chain in `config.accept`, all
@@ -87,7 +115,9 @@ export function buildRequirements(
   options: BuildRequirementsOptions = {},
 ): PaymentRequirements[] {
   const maxAmountRequired = parsePrice(config.price)
-  const paymentId = options.unsafePaymentIdForTesting ?? generatePaymentId()
+  const paymentId =
+    options.unsafePaymentIdForTesting ??
+    (options.skipPaymentIdGeneration ? ZERO_PAYMENT_ID_PLACEHOLDER : generatePaymentId())
   if (!PAYMENT_ID_RE.test(paymentId)) {
     throw new Error(`invalid paymentId: expected 0x-prefixed 32-byte hex, got ${paymentId}`)
   }

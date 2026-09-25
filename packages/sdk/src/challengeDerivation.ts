@@ -63,28 +63,25 @@ import { computeNonce } from './nonce.js'
  * store costs a real signed, on-chain-payable authorization. That is the
  * asymmetry the old design was missing.
  *
- * ## A structural consequence worth naming explicitly
+ * ## Many payers, one derived nonce — keyed by `(from, nonce)` (round 1 fix)
  *
  * Because `paymentId` depends only on `(merchantEvm, resource, timeBucket)`
  * — never on WHO is asking — every anonymous requester of the SAME resource
- * within the SAME bucket sees the SAME challenge. Two DIFFERENT payers
- * racing to pay the identical resource in the identical window are, at the
- * SDK layer, racing for one shared nonce slot: `ConsumedNonceStore` is keyed
- * purely by `nonce` (matching this task's spec literally), so the first
- * valid, facilitator-approved payment consumes it and a second, independently
- * signed payment against the SAME nonce is indistinguishable from a replay
- * and is rejected, even though on-chain EIP-3009 nonce tracking is scoped
- * per-`from` and would not itself have conflicted. This is a real behavior
- * change from Task 6 (whose per-request random `paymentId` gave concurrent
- * payers of the same resource independent slots — see the now-removed
- * "concurrency (nonce-keyed store, not resource-keyed)" tests) and is an
- * inherent trade-off of true statelessness, not an oversight: a challenge
- * cannot be minted unique-per-payer before the payer has said anything,
- * without storing something. A resource that needs independent concurrent
- * slots can still get one per caller by including a caller-supplied unique
- * token in its own URL/query string (which becomes part of `resource` and
- * therefore of the HMAC preimage) — that is a route-design choice, not
- * something this middleware can or should do on the caller's behalf.
+ * within the SAME bucket sees the SAME challenge, hence the SAME nonce. An
+ * earlier version of this design keyed `ConsumedNonceStore` purely by
+ * `nonce`, which made two DIFFERENT, independently-signed payers of the same
+ * resource in the same window collide: the first valid payment consumed the
+ * nonce and the second was indistinguishable from a replay and rejected —
+ * even though on-chain EIP-3009 nonce tracking is scoped per-`from` and
+ * would not itself have conflicted (real USDC keys its own
+ * authorization-used state as `_authorizationStates[from][nonce]`, exactly
+ * for this reason). One paying customer per resource per window is a worse
+ * regression for a metered API than the availability bug this task fixes.
+ * `ConsumedNonceStore` (`challengeStore.ts`) is now keyed on the PAIR —
+ * `authorization.from` alongside the nonce — so multiple genuinely different
+ * payers of the identical derived challenge all succeed, while the SAME
+ * payer replaying the SAME nonce is still rejected; keying on the pair adds
+ * a dimension, it does not remove one.
  */
 
 /** Minimum byte length `ferry402` requires of `config.secret`. */
