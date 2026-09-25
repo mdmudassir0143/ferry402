@@ -33,6 +33,18 @@ pragma solidity ^0.8.24;
 ///           solc --optimize --combined-json abi,bin test/fixtures/SettleToken.sol
 ///         Regenerate `SettleToken.abi.ts` from that output if this file
 ///         changes.
+///
+///         Task 11 adds the `bytes signature` overload (mirroring
+///         `MockUSDC.sol`'s own addition): a 65-byte signature takes the
+///         identical ECDSA path as the `(v, r, s)` overload above; any other
+///         length is an EIP-1271 smart-contract-wallet signature, verified by
+///         calling `from.isValidSignature(digest, signature)` and requiring
+///         exactly the ERC-1271 magic value. `IERC1271` is declared inline
+///         (not imported) to keep this fixture self-contained.
+interface IERC1271 {
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4 magicValue);
+}
+
 contract SettleToken {
     string public constant name = "SettleToken";
     string public constant version = "1";
@@ -125,20 +137,67 @@ contract SettleToken {
         bytes32 r,
         bytes32 s
     ) external {
+        bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
+        if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
+        if (v != 27 && v != 28) revert InvalidSignatureVValue();
+
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0) || signer != from) revert InvalidSignature();
+
+        _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    /// @notice Task 11: the `bytes signature` overload -- see this contract's
+    ///         doc comment above for the branch rule.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes calldata signature
+    ) external {
+        bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
+
+        if (signature.length == 65) {
+            bytes32 r = abi.decode(signature[0:32], (bytes32));
+            bytes32 s = abi.decode(signature[32:64], (bytes32));
+            uint8 v = uint8(signature[64]);
+            if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
+            if (v != 27 && v != 28) revert InvalidSignatureVValue();
+            address signer = ecrecover(digest, v, r, s);
+            if (signer == address(0) || signer != from) revert InvalidSignature();
+        } else {
+            if (from.code.length == 0) revert InvalidSignature();
+            try IERC1271(from).isValidSignature(digest, signature) returns (bytes4 magicValue) {
+                if (magicValue != IERC1271.isValidSignature.selector) revert InvalidSignature();
+            } catch {
+                revert InvalidSignature();
+            }
+        }
+
+        _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    function _checkAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce
+    ) private view returns (bytes32 digest) {
         if (msg.sender != to) revert CallerNotPayee();
         if (block.timestamp <= validAfter) revert AuthorizationNotYetValid();
         if (block.timestamp >= validBefore) revert AuthorizationExpired();
         if (_authorizationStates[from][nonce]) revert AuthorizationAlreadyUsed();
-        if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
-        if (v != 27 && v != 28) revert InvalidSignatureVValue();
+        digest = receiveAuthorizationDigest(from, to, value, validAfter, validBefore, nonce);
+    }
 
-        bytes32 digest = receiveAuthorizationDigest(from, to, value, validAfter, validBefore, nonce);
-        address signer = ecrecover(digest, v, r, s);
-        if (signer == address(0) || signer != from) revert InvalidSignature();
-
+    function _finalizeAuthorization(address from, address to, uint256 value, bytes32 nonce) private {
         _authorizationStates[from][nonce] = true;
         emit AuthorizationUsed(from, nonce);
-
         _transfer(from, to, value);
     }
 

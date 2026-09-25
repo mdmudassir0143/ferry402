@@ -66,6 +66,10 @@ export interface VerifyResult {
   isValid: boolean
   invalidReason?: VerifyInvalidReason
   payer?: string
+  /** Which signature scheme actually verified — see `SignatureKind`'s doc
+   *  comment. Present only when `isValid` is true; internal-only, stripped
+   *  from the HTTP response by `VerifyResponseSchema`. */
+  signatureKind?: SignatureKind
 }
 
 export interface VerifyOptions {
@@ -161,6 +165,46 @@ type Task7Network = keyof typeof SUPPORTED_CHAINS
 const DECIMAL_STRING_RE = /^\d+$/
 const HEX_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 const HEX_SIGNATURE_RE = /^0x[0-9a-fA-F]{130}$/
+/**
+ * Any well-formed `0x`-prefixed hex byte string of ANY length (even number of
+ * hex digits) — the shape check for an EIP-1271 signature blob, which real
+ * smart-contract wallets produce in wildly varying lengths (a raw ECDSA
+ * signature re-wrapped by a 1-of-1 Safe, a WebAuthn passkey assertion, a
+ * threshold-signature aggregate, ...). `HEX_SIGNATURE_RE` above stays the
+ * exact-65-byte shape check for the ECDSA branch specifically.
+ */
+const HEX_BYTES_RE = /^0x([0-9a-fA-F]{2})*$/
+
+/**
+ * The ERC-1271 magic value a smart-contract wallet's `isValidSignature` must
+ * return, byte-for-byte, to have its signature accepted —
+ * `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`. Any OTHER return
+ * value is a rejection; this module never treats "didn't revert" as "valid"
+ * on its own (see `verifyEip1271Signature`'s doc comment).
+ */
+const EIP1271_MAGIC_VALUE: Hex = '0x1626ba7e'
+
+/**
+ * The one function this module ever calls on a claimed smart-contract
+ * wallet. Hand-written (not imported from a build artifact) for the same
+ * reason as `ESCROW_SETTLE_ABI` below: this facilitator has exactly one
+ * external call it ever makes here, and the caller (`authorization.from`) is
+ * an address this facilitator does NOT control or trust — see
+ * `verifyEip1271Signature`'s doc comment for why its return value, a revert,
+ * and a codeless address are all handled explicitly rather than assumed.
+ */
+const ERC1271_ABI = [
+  {
+    type: 'function',
+    name: 'isValidSignature',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'hash', type: 'bytes32' },
+      { name: 'signature', type: 'bytes' },
+    ],
+    outputs: [{ name: 'magicValue', type: 'bytes4' }],
+  },
+] as const
 
 /**
  * Parses a decimal-digits-only string to a `bigint` no larger than a
@@ -427,12 +471,10 @@ function splitEcdsaSignature(signature: string): { r: Hex; s: Hex; v: number } |
  * `undefined` if the signature is malformed, malleable, or recovers to the
  * zero address.
  *
- * Deliberately isolated from `verifyPayment`'s signature-length branch
- * (currently the only branch: every non-65-byte signature is rejected
- * before this is ever called) so a future smart-contract-wallet signature
- * path (EIP-1271 `isValidSignature`, a separate task) can be added as a
- * sibling branch keyed on signature shape, without restructuring this
- * function or the ECDSA checks it performs.
+ * Deliberately isolated from `verifyPayment`'s signature-length branch (see
+ * `recoverSigner` below, the sibling EIP-1271 branch keyed on signature
+ * shape/`from` codeness added for Task 11) so this function and the ECDSA
+ * checks it performs never needed restructuring to add that branch.
  */
 async function recoverEcdsaSigner(signature: Hex, digest: Hex): Promise<Address | undefined> {
   const split = splitEcdsaSignature(signature)
@@ -451,6 +493,119 @@ async function recoverEcdsaSigner(signature: Hex, digest: Hex): Promise<Address 
   // throwing) be treated as a valid signer.
   if (isAddressEqual(recovered, zeroAddress)) return undefined
   return recovered
+}
+
+/**
+ * Verifies `signature` against `digest` for claimed smart-contract-wallet
+ * signer `from`, per EIP-1271: `from.isValidSignature(digest, signature)`
+ * must return EXACTLY `EIP1271_MAGIC_VALUE`. Three failure modes are folded
+ * into the same `false` result, deliberately never distinguished by this
+ * module beyond that (matching how a malformed/malleable ECDSA signature is
+ * a single undifferentiated rejection too):
+ *
+ * 1. `from` has no code at all — a codeless address can never legitimately
+ *    implement EIP-1271, and this is checked BEFORE making the call at all
+ *    (not merely relying on the call itself to fail) so the rejection reason
+ *    is uniform regardless of what a codeless address's call happens to do
+ *    at the EVM level.
+ * 2. The call reverts for any reason — a paused wallet, an out-of-gas
+ *    guard, a threshold check that legitimately throws rather than
+ *    returning a sentinel. A revert is a rejection, never an unhandled
+ *    error that could crash `/verify`.
+ * 3. The call succeeds but returns anything other than the exact magic
+ *    value — including a plausible-looking-but-wrong 4 bytes. There is no
+ *    "close enough"; the ERC-1271 magic value is an exact-match protocol.
+ */
+async function verifyEip1271Signature(
+  client: ReturnType<typeof createChainClient>,
+  from: Address,
+  digest: Hex,
+  signature: Hex,
+): Promise<boolean> {
+  let code: Hex | undefined
+  try {
+    code = await client.getCode({ address: from })
+  } catch {
+    // Can't confirm `from` has code at all — fail closed rather than risk
+    // treating an RPC hiccup as "definitely codeless, so definitely
+    // rejected" OR "definitely a contract, so try the call anyway"; either
+    // guess could be wrong in a way that matters. Either way this is a
+    // rejection, so the distinction is moot for the caller.
+    return false
+  }
+  if (code === undefined || code === '0x') return false
+
+  let magicValue: Hex
+  try {
+    magicValue = await client.readContract({
+      address: from,
+      abi: ERC1271_ABI,
+      functionName: 'isValidSignature',
+      args: [digest, signature],
+    })
+  } catch {
+    return false
+  }
+  return magicValue === EIP1271_MAGIC_VALUE
+}
+
+/** Which signature scheme a verified payload actually used — see
+ *  `recoverSigner`'s doc comment. Internal-only: never part of the x402 wire
+ *  contract (`VerifyResponseSchema`/`SettleResponseSchema` strip it, same as
+ *  `SettleResult.settledAmount`/`nonce` — see those fields' doc comments),
+ *  but `settlePayment` reads it off the `VerifyResult` it already computed to
+ *  decide which `Escrow` entry point to call, instead of re-deriving it via a
+ *  second round of RPC calls. */
+export type SignatureKind = 'ecdsa' | 'eip1271'
+
+/**
+ * Verifies `signature` over `digest` for the claimed signer
+ * `authorization.from`, trying the ECDSA path first and falling back to
+ * EIP-1271 only when ECDSA doesn't produce a match (Task 11):
+ *
+ * 1. If `signature` is 65 bytes, attempt `recoverEcdsaSigner` — completely
+ *    unchanged from before this task, including its malleability rejection
+ *    (deliberately NOT applied on the EIP-1271 branch below: an EIP-1271
+ *    signature has no `s`/`v` component of its own to normalize, and
+ *    applying an ECDSA-specific rule to it would reject legitimate wallet
+ *    signatures for a property that doesn't apply to them). If that
+ *    recovers an address equal to `from`, this IS a plain ECDSA-signing EOA
+ *    — return immediately, with NO RPC call made at all beyond whatever
+ *    `verifyPayment` already needed for the domain (pure local ECDSA math).
+ * 2. Otherwise — the signature isn't 65 bytes, or recovery failed
+ *    (malformed/malleable), or recovery succeeded but didn't match `from` —
+ *    fall back to `verifyEip1271Signature`.
+ *
+ * Falling back on "recovered but didn't match" (rather than deciding the
+ * branch upfront from `from`'s on-chain code) is what makes this route a
+ * genuine smart-contract wallet correctly: a contract can never itself hold
+ * the private key a raw ECDSA recovery implies (no cryptographic
+ * coincidence changes that — forging a match is exactly as infeasible as
+ * stealing an EOA's key), so a smart wallet's 65-byte-shaped signature
+ * ALWAYS fails step 1's equality check and falls through to EIP-1271 —
+ * identical dispatch outcome to checking `from`'s code upfront, but without
+ * paying an `eth_getCode` round trip on every ordinary EOA payment. This is
+ * also why `verifyPayment`'s domain-cache tests still see zero RPC calls on
+ * a warm cache for a valid EOA signature: the extra round trip this task
+ * adds is paid only on the paths that actually need it (a non-ECDSA-shaped
+ * signature, or one that fails to recover to its claimed signer).
+ */
+async function recoverSigner(
+  client: ReturnType<typeof createChainClient>,
+  signature: Hex,
+  digest: Hex,
+  from: Address,
+): Promise<{ signer: Address; kind: SignatureKind } | undefined> {
+  if (HEX_SIGNATURE_RE.test(signature)) {
+    const recovered = await recoverEcdsaSigner(signature, digest)
+    if (recovered && isAddressEqual(recovered, from)) {
+      return { signer: recovered, kind: 'ecdsa' }
+    }
+  }
+
+  const verified = await verifyEip1271Signature(client, from, digest, signature)
+  if (!verified) return undefined
+  return { signer: from, kind: 'eip1271' }
 }
 
 /**
@@ -586,19 +741,17 @@ export async function verifyPayment(
   }
 
   // 6. Signature — recovered over the EIP-712 `ReceiveWithAuthorization`
-  // struct, using a domain read live from the token contract, and rejected
-  // outright if malleable even before recovery is attempted: the EVM's
-  // `ecrecover` precompile (and viem's recovery, which uses the same math)
-  // does NOT itself reject a high-`s`/wrong-`v` signature the way
-  // OpenZeppelin's `ECDSA.recover` (which real USDC uses) does. A verifier
-  // that skipped this would accept signatures the token itself would
-  // refuse at settlement.
-  //
-  // The signature's byte length is the branch point for WHICH signature
-  // scheme this is: 65 bytes is a plain ECDSA signature (the only scheme
-  // implemented here); anything else is reserved for a future EIP-1271
-  // smart-contract-wallet path (`isValidSignature`, out of scope for this
-  // task) rather than being a malformed-ECDSA-signature error as such.
+  // struct, using a domain read live from the token contract. Two signature
+  // schemes are supported (Task 11), decided by `recoverSigner` below: a
+  // 65-byte signature whose claimed signer (`from`) has no on-chain code is
+  // ECDSA, rejected outright if malleable even before recovery is attempted
+  // — the EVM's `ecrecover` precompile (and viem's recovery, which uses the
+  // same math) does NOT itself reject a high-`s`/wrong-`v` signature the way
+  // OpenZeppelin's `ECDSA.recover` (which real USDC uses) does, and a
+  // verifier that skipped this would accept signatures the token itself
+  // would refuse at settlement. Everything else — any other length, or a
+  // 65-byte signature whose `from` DOES have code — is EIP-1271, which has
+  // no malleability concept of its own and is never subjected to that check.
   if (!HEX_ADDRESS_RE.test(authorization.from) || !HEX_ADDRESS_RE.test(authorization.to)) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }
@@ -610,8 +763,12 @@ export async function verifyPayment(
   // all-lowercase or all-uppercase (see the strict:false note above), and
   // this value is used as a cache key and as `verifyingContract` below.
   const assetAddress: Address = getAddress(requirements.asset)
-  if (!HEX_SIGNATURE_RE.test(payload.payload.signature)) {
-    // Not a 65-byte ECDSA signature. (Reserved: EIP-1271 branch goes here.)
+  if (typeof payload.payload.signature !== 'string' || !HEX_BYTES_RE.test(payload.payload.signature)) {
+    // Not even a well-formed hex byte string of any length — x402's own
+    // schema only requires `signature` to be a string (see this module's
+    // `AssertSubtype` discipline note: x402 puts no shape constraint on it
+    // at all), so this is the ONE shape check every signature — ECDSA or
+    // EIP-1271 — must pass before either scheme is even attempted.
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }
 
@@ -651,15 +808,15 @@ export async function verifyPayment(
       nonce: authorization.nonce as Hex,
     },
   })
-  const recovered = await recoverEcdsaSigner(payload.payload.signature as Hex, digest)
+  const recovered = await recoverSigner(client, payload.payload.signature as Hex, digest, authorization.from as Address)
   if (!recovered) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }
-  if (!addressesEqual(recovered, authorization.from)) {
+  if (!addressesEqual(recovered.signer, authorization.from)) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
   }
 
-  return { isValid: true, payer: recovered }
+  return { isValid: true, payer: recovered.signer, signatureKind: recovered.kind }
 }
 
 // --- Task 8: /settle -------------------------------------------------------
@@ -703,6 +860,29 @@ const ESCROW_SETTLE_ABI = [
       { name: 'v', type: 'uint8' },
       { name: 'r', type: 'bytes32' },
       { name: 's', type: 'bytes32' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'settleAuthorizationWithSignature',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'merchant', type: 'address' },
+      { name: 'paymentId', type: 'bytes32' },
+      {
+        name: 'auth',
+        type: 'tuple',
+        components: [
+          { name: 'from', type: 'address' },
+          { name: 'to', type: 'address' },
+          { name: 'value', type: 'uint256' },
+          { name: 'validAfter', type: 'uint256' },
+          { name: 'validBefore', type: 'uint256' },
+          { name: 'nonce', type: 'bytes32' },
+        ],
+      },
+      { name: 'signature', type: 'bytes' },
     ],
     outputs: [],
   },
@@ -920,6 +1100,23 @@ function decodeSettleRevert(err: unknown): DecodedSettleFailure {
   return { errorReason: 'unexpected_settle_error', label: `non-revert failure: ${message}` }
 }
 
+/** The `Escrow.Authorization` calldata tuple shape, shared by both
+ *  `settleAuthorization*` entry points' ABI encoding. */
+type AuthTuple = { from: Address; to: Address; value: bigint; validAfter: bigint; validBefore: bigint; nonce: Hex }
+
+/**
+ * Which `Escrow` entry point a settlement submission calls, and with what
+ * arguments — the ECDSA `(v, r, s)` overload or the Task-11 `bytes
+ * signature` overload, keyed on `SignatureKind` exactly like `recoverSigner`
+ * decided during `/verify`. A discriminated union (not two optional fields)
+ * so `decodeMinedRevert`'s re-simulation and `settlePayment`'s own
+ * submission always agree on functionName/args as one unit, never a
+ * mismatched pairing of one call's function name with another's args.
+ */
+type SettleCall =
+  | { functionName: 'settleAuthorization'; args: readonly [Address, Hex, AuthTuple, number, Hex, Hex] }
+  | { functionName: 'settleAuthorizationWithSignature'; args: readonly [Address, Hex, AuthTuple, Hex] }
+
 /**
  * Best-effort re-decoding of an ALREADY-MINED, reverted transaction (see
  * check 6 in `settlePayment`'s doc comment for why this path exists at all).
@@ -933,20 +1130,32 @@ function decodeSettleRevert(err: unknown): DecodedSettleFailure {
  */
 async function decodeMinedRevert(
   publicClient: ReturnType<typeof createChainClient>,
-  call: {
-    address: Address
-    account: Address
-    args: readonly [Address, Hex, { from: Address; to: Address; value: bigint; validAfter: bigint; validBefore: bigint; nonce: Hex }, number, Hex, Hex]
-  },
+  call: { address: Address; account: Address } & SettleCall,
 ): Promise<DecodedSettleFailure> {
   try {
-    await publicClient.simulateContract({
-      address: call.address,
-      abi: ESCROW_SETTLE_ABI,
-      functionName: 'settleAuthorization',
-      args: call.args,
-      account: call.account,
-    })
+    // Branches explicitly on the literal `functionName` discriminant (rather
+    // than passing `call.functionName`/`call.args` through as still-a-union
+    // values) so TypeScript narrows `call` to ONE concrete member of
+    // `SettleCall` per branch — viem's `simulateContract` overload
+    // resolution cannot itself infer a single instantiation across a union
+    // argument, even though every individual member type-checks fine.
+    if (call.functionName === 'settleAuthorization') {
+      await publicClient.simulateContract({
+        address: call.address,
+        abi: ESCROW_SETTLE_ABI,
+        functionName: call.functionName,
+        args: call.args,
+        account: call.account,
+      })
+    } else {
+      await publicClient.simulateContract({
+        address: call.address,
+        abi: ESCROW_SETTLE_ABI,
+        functionName: call.functionName,
+        args: call.args,
+        account: call.account,
+      })
+    }
     return {
       errorReason: 'unexpected_settle_error',
       label: 're-simulation succeeded against current state; mined revert reason unavailable',
@@ -1062,11 +1271,30 @@ export async function settlePayment(
     return { success: false, errorReason: 'invalid_payment_requirements', payer, transaction: '', network }
   }
 
-  const split = splitEcdsaSignature(payload.payload.signature)
-  if (!split) {
-    // verifyPayment's check 5 already requires a well-formed 65-byte ECDSA
-    // signature for isValid:true; unreachable in practice.
+  // Which Escrow entry point to call is read off the SAME verifyResult this
+  // function already required above — not re-derived via a second round of
+  // `getCode`/`isValidSignature` RPC calls. `signatureKind` is only ever
+  // absent when `isValid` is false, which the check at the top of this
+  // function already returned on, so this is unreachable in practice; still
+  // guarded, matching this function's existing defense-in-depth discipline
+  // around values `verifyPayment` already guaranteed.
+  const signatureKind = verifyResult.signatureKind
+  if (signatureKind === undefined) {
     return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+  }
+
+  // Only the ECDSA path needs its signature split into (v, r, s) here — the
+  // EIP-1271 path forwards `payload.payload.signature` to the contract as
+  // opaque bytes, exactly as `/verify` validated it.
+  let split: { r: Hex; s: Hex; v: number } | undefined
+  if (signatureKind === 'ecdsa') {
+    split = splitEcdsaSignature(payload.payload.signature)
+    if (!split) {
+      // verifyPayment's check 6 already requires a well-formed 65-byte
+      // ECDSA signature for an 'ecdsa' isValid:true result; unreachable in
+      // practice.
+      return { success: false, errorReason: 'unexpected_settle_error', payer, transaction: '', network }
+    }
   }
 
   const facilitatorPrivateKey = options.facilitatorPrivateKey ?? (process.env.FACILITATOR_PRIVATE_KEY as Hex | undefined)
@@ -1085,7 +1313,7 @@ export async function settlePayment(
   let account: ReturnType<typeof privateKeyToAccount>
   let escrowAddress: Address
   let merchantEvmAddress: Address
-  let authTuple: { from: Address; to: Address; value: bigint; validAfter: bigint; validBefore: bigint; nonce: Hex }
+  let authTuple: AuthTuple
   try {
     account = privateKeyToAccount(facilitatorPrivateKey)
     escrowAddress = getAddress(requirements.payTo)
@@ -1128,19 +1356,39 @@ export async function settlePayment(
   }
   const walletClient = createWalletClient({ account, chain, transport: http(options.rpcUrl, SETTLE_TRANSPORT_OPTIONS) })
 
-  const callArgs = [merchantEvmAddress, paymentId, authTuple, split.v, split.r, split.s] as const
+  // Which entry point to call, and with what args, as ONE unit (see
+  // `SettleCall`'s doc comment for why this is a discriminated union rather
+  // than two independently-optional fields).
+  const settleCall: SettleCall =
+    signatureKind === 'ecdsa' && split
+      ? { functionName: 'settleAuthorization', args: [merchantEvmAddress, paymentId, authTuple, split.v, split.r, split.s] }
+      : { functionName: 'settleAuthorizationWithSignature', args: [merchantEvmAddress, paymentId, authTuple, payload.payload.signature as Hex] }
 
   // 4. Submit, funded from the facilitator's own wallet. `gas` is always
   // explicit — see this function's doc comment, point 2.
   let hash: Hex
   try {
-    hash = await walletClient.writeContract({
-      address: escrowAddress,
-      abi: ESCROW_SETTLE_ABI,
-      functionName: 'settleAuthorization',
-      args: callArgs,
-      gas: SETTLE_GAS_LIMIT,
-    })
+    // Branches explicitly on the literal `functionName` discriminant, same
+    // reasoning as `decodeMinedRevert` above: viem's `writeContract` overload
+    // resolution cannot infer a single instantiation across `settleCall`
+    // while it is still typed as the `SettleCall` union.
+    if (settleCall.functionName === 'settleAuthorization') {
+      hash = await walletClient.writeContract({
+        address: escrowAddress,
+        abi: ESCROW_SETTLE_ABI,
+        functionName: settleCall.functionName,
+        args: settleCall.args,
+        gas: SETTLE_GAS_LIMIT,
+      })
+    } else {
+      hash = await walletClient.writeContract({
+        address: escrowAddress,
+        abi: ESCROW_SETTLE_ABI,
+        functionName: settleCall.functionName,
+        args: settleCall.args,
+        gas: SETTLE_GAS_LIMIT,
+      })
+    }
   } catch (err) {
     const decoded = decodeSettleRevert(err)
     console.error(`settlePayment: submission to escrow ${escrowAddress} on ${network} failed: ${decoded.label}`)
@@ -1158,7 +1406,7 @@ export async function settlePayment(
   // 6. A mined-but-reverted transaction is a failure — see this function's
   // doc comment, point 2.
   if (receipt.status !== 'success') {
-    const decoded = await decodeMinedRevert(publicClient, { address: escrowAddress, account: account.address, args: callArgs })
+    const decoded = await decodeMinedRevert(publicClient, { address: escrowAddress, account: account.address, ...settleCall })
     console.error(`settlePayment: transaction ${hash} on ${network} was mined but reverted: ${decoded.label}`)
     return { success: false, errorReason: decoded.errorReason, payer, transaction: hash, network }
   }

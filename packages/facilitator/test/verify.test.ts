@@ -297,10 +297,17 @@ describe('verifyPayment', () => {
     expect(result.invalidReason).toBe('invalid_exact_evm_payload_signature')
   })
 
-  it('rejects a malformed (wrong-length) signature', async () => {
+  // Task 11: a merely-SHORT (but well-formed) hex signature is no longer
+  // rejectable on shape alone — it's a legitimate EIP-1271 blob shape, and
+  // deciding whether it's valid needs a live RPC round trip against
+  // `authorization.from` (see eip1271.test.ts for that path, exercised
+  // against a real anvil instance). This test now covers what genuinely
+  // CAN still be rejected on shape alone, with no RPC involved at all: not
+  // even a well-formed hex byte string.
+  it('rejects a malformed (non-hex) signature without ever reaching the RPC', async () => {
     const auth = authFields()
     const result = await verifyPayment(
-      buildPayload({ network: 'base-sepolia', signature: '0xdead', authorization: auth }),
+      buildPayload({ network: 'base-sepolia', signature: '0xzz', authorization: auth }),
       requirements(),
       { rpcUrl: UNREACHABLE_RPC_URL, escrows: DEFAULT_ESCROWS },
     )
