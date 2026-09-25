@@ -2,12 +2,11 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express'
 import { PaymentPayloadSchema, VerifyResponseSchema } from 'x402/types'
 import type { PaymentPayload, VerifyResponse } from 'x402/types'
 import { buildRequirements } from './requirements.js'
-import { computeNonce, normalizeNonce } from './nonce.js'
-import { InMemoryChallengeStore } from './challengeStore.js'
-import type { ChallengeStore, CachedChallenge } from './challengeStore.js'
+import { normalizeNonce } from './nonce.js'
+import { assertValidSecret, deriveChallenge, matchChallenge, TIME_BUCKET_SECONDS } from './challengeDerivation.js'
+import { InMemoryConsumedNonceStore } from './challengeStore.js'
+import type { ConsumedNonceStore } from './challengeStore.js'
 import type { Ferry402Config, PaymentRequirements } from './types.js'
-
-const DEFAULT_TIMEOUT_SECONDS = 300
 
 /** Timeout for the facilitator's `/verify` round trip. A facilitator that
  *  hangs (rather than erroring quickly) must not hang this request forever
@@ -39,14 +38,16 @@ function parseAtomicAmount(value: string): bigint | undefined {
 
 export interface Ferry402Options {
   /**
-   * Storage for outstanding 402 challenges. Defaults to a fresh
-   * `InMemoryChallengeStore` — fine for a single process, but see
-   * `ChallengeStore`'s doc comment (`challengeStore.ts`) for why that
-   * default doesn't survive a restart or share state across
-   * horizontally-scaled instances. Pass a shared implementation (Redis, a
-   * database, ...) to fix that without changing anything else here.
+   * Storage for consumed nonces (replay protection only — see
+   * `challengeStore.ts`'s doc comment for why Task 12 removed the old
+   * *issued*-challenge store entirely). Defaults to a fresh
+   * `InMemoryConsumedNonceStore` — fine for a single process, but NOT
+   * shared across horizontally-scaled instances: a nonce consumed on
+   * instance A and replayed against instance B will not be caught unless a
+   * shared implementation (Redis, a database, ...) is passed here instead.
+   * `ferry402`'s signature does not need to change to fix that.
    */
-  store?: ChallengeStore
+  consumedNonceStore?: ConsumedNonceStore
 }
 
 /**
@@ -54,183 +55,133 @@ export interface Ferry402Options {
  * every chain in `config.accept`, settling into a per-chain non-custodial
  * `Escrow`.
  *
+ * ## Task 12: stateless challenge derivation
+ *
+ * `paymentId`/`nonce` are DERIVED, not minted and stored — see
+ * `challengeDerivation.ts` for the full design rationale:
+ *
+ * ```
+ * paymentId = HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)
+ * nonce     = keccak256(abi.encode(merchantEvm, paymentId))     // computeNonce, unchanged
+ * ```
+ *
+ * `issueChallenge` below is a pure, synchronous function: no store read, no
+ * store write, for any request, ever. The payment path recomputes the same
+ * derivation for the CURRENT and PREVIOUS time bucket
+ * (`challengeDerivation.matchChallenge`) and accepts
+ * `authorization.nonce` if it equals either — proving, with zero storage,
+ * that THIS server issued it, for THIS resource, inside the window.
+ * Resource binding and TTL are therefore structural: neither is a check
+ * that can be forgotten, because a mismatched nonce cannot be produced by
+ * construction (only a holder of `config.secret` can reproduce the HMAC,
+ * and `resource`/the time bucket are baked into its preimage).
+ *
+ * `config.secret` is required and validated (`assertValidSecret`) at
+ * CONSTRUCTION time — `ferry402(config)` throws synchronously if it is
+ * missing or under 32 bytes, before ever registering a request handler.
+ *
+ * ## What is NOT stateless: replay
+ *
+ * Proving "never redeemed before" needs memory of the past, which no pure
+ * derivation can supply. `ConsumedNonceStore` (`challengeStore.ts`) is that
+ * memory, but — unlike the old issuance store — it is written to ONLY when
+ * a request reaches the point of actually being paid: after every local
+ * floor check passes, immediately before calling the facilitator's
+ * `/verify`, this middleware atomically `consumeIfAbsent`s the presented
+ * nonce. If the facilitator then rejects the payment (or is unreachable),
+ * the nonce is `release`d again rather than left permanently consumed — see
+ * `ConsumedNonceStore.release`'s doc comment for why skipping that release
+ * step would turn one bogus-signature request into a total, cheap denial of
+ * service against a specific resource for its whole derivation window
+ * (a derived nonce is PUBLIC, same as the old random `paymentId` was: an
+ * anonymous GET learns it, so anyone can attempt to burn it).
+ *
+ * Consuming happens atomically (`ConsumedNonceStore.consumeIfAbsent` is a
+ * single check-and-set) so concurrent replays of the identical `X-PAYMENT`
+ * header race safely: at most one can ever proceed past this point,
+ * regardless of how many arrive at once or how slow the facilitator is to
+ * answer — see `challengeStore.ts` for why this MUST be one atomic
+ * operation, never a read followed by a write after an `await`.
+ *
  * ## The paymentId round trip
  *
- * `buildRequirements` (Task 5) mints a fresh, random `paymentId` on *every*
- * call — see its doc comment. The payer is expected to derive the EIP-3009
- * authorization `nonce` it signs as `computeNonce(merchantEvm, paymentId)`
- * (`keccak256(abi.encode(merchantEvm, paymentId))`; see `nonce.ts` and
- * `Escrow.settleAuthorization`'s doc comment in `packages/contracts`), using
- * the `paymentId`/`merchantEvm` published in the 402 challenge's
- * `accepts[].extra`. A facilitator's `/verify` (Task 7) — and ultimately the
- * `Escrow` contract itself at settlement — recomputes that same hash from
- * whatever `paymentRequirements` it is handed and rejects anything that
- * doesn't match the payer's signed `nonce`.
+ * The `paymentRequirements` object this middleware sends to `/verify` MUST
+ * be byte-for-byte the same `paymentId` the payer actually signed against.
+ * Because the payer's request can arrive after the time bucket has rolled
+ * over, the bucket that actually matched (`matchChallenge`'s return value)
+ * may be the PREVIOUS one, not the CURRENT one `issueChallenge` would derive
+ * for a brand-new request made right now — so the requirement object handed
+ * to `/verify` (and surfaced on `res.locals.x402.requirements` for
+ * settlement) is built from `matched.paymentId` specifically, never from a
+ * freshly-`issueChallenge`d one.
  *
- * That means the `paymentRequirements` this middleware sends to `/verify`
- * MUST be byte-for-byte the same object (same `paymentId`, same
- * `merchantEvm`) the payer saw in the 402 challenge they signed against. If
- * this middleware called `buildRequirements` a second time when the
- * `X-PAYMENT` request arrived, that call would mint a *different* random
- * `paymentId` — the payer's nonce would never match it, and every payment
- * would fail. This is a real bug in the task brief's starting-point code,
- * which called `buildRequirements` unconditionally on every request.
+ * ## A structural trade-off, stated explicitly (not silently dropped)
  *
- * ## Why the challenge store is keyed by nonce, not by resource
- *
- * An earlier version of this middleware cached issued challenges keyed by
- * `resource` (the requested URL). That collapses under ordinary concurrency:
- * two payers requesting the same protected endpoint at close to the same
- * time would get two different `paymentId`s, but the *second* challenge
- * would overwrite the first's cache entry. The fix: at challenge time, this
- * middleware already knows exactly which nonce a payer would have to sign to
- * pay each issued `PaymentRequirements` entry —
- * `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)` — so it
- * stores one `ChallengeStore` entry per entry (one per accepted chain),
- * keyed by that nonce (always normalized to lowercase — see `normalizeNonce`
- * — since x402's schema permits mixed-case hex but a `bytes32` has no
- * casing on-chain). On the payment path, the payer's own
- * `authorization.nonce` is an exact key into that store: no guessing via
- * `resource`, no collision between concurrent payers.
- *
- * ## One challenge, one payment: consume, don't just verify
- *
- * A `ChallengeStore` entry is a bearer credential once its nonce is known —
- * whoever can replay a valid `X-PAYMENT` header can replay it again. Nothing
- * about a successful `/verify` prevents that on its own: `/verify` is a
- * stateless signature/shape check, and `Escrow`'s on-chain nonce tracking
- * only ever runs at *settlement*, which this function does not perform (see
- * "known limitations" below). Without an explicit step here, one signed
- * authorization would buy unlimited calls to the protected route for the
- * entire `maxTimeoutSeconds` window.
- *
- * So a payment that passes every local check is `store.consume`d —
- * atomically returned-and-removed — immediately before calling `/verify`,
- * not `get` followed by a separate `delete` after. `get`-then-`delete` would
- * leave a window where several concurrent replays of the identical header
- * all observe the entry as present (via `get`) before any one of them
- * removes it, so several would independently pass verification. `consume`
- * closes that window: at most one caller ever receives the entry back: every
- * concurrent or later `consume` of the same nonce gets `undefined`.
- *
- * Consuming happens optimistically, before we know whether the facilitator
- * will actually approve the payment. If it turns out NOT to be valid — a
- * facilitator network/HTTP error, or an explicit `isValid: false` — the
- * consumed entry is reinstated (`store.set` with the same data) rather than
- * left gone, deliberately: nothing was actually collected in either case (no
- * on-chain settlement has happened), so there is no reason to force the
- * payer to fetch a brand-new challenge (a new price commitment) just because
- * our own infrastructure hiccuped, or to make an honest retry-with-a-corrected-signature
- * impossible after a rejected attempt. Only a confirmed `isValid: true`
- * permanently retires the challenge.
- *
- * Checks that can be answered locally (resource match, network match, the
- * authorization's value/recipient/time-window) run BEFORE `consume`, against
- * a read-only `get` — a payload that fails one of these was never a genuine
- * attempt at this specific challenge, so there is nothing to consume or
- * reinstate; the challenge simply remains available for a corrected retry.
- *
- * A payment that arrives with an unrecognized nonce (never issued, already
- * consumed, already expired) fails closed: `402` with a *freshly* issued
- * challenge and `error: 'payment_expired'`, without ever calling the
- * facilitator.
+ * Because `paymentId` depends only on `(merchantEvm, resource, timeBucket)`
+ * — never on WHO is asking — every anonymous requester of the SAME resource
+ * within the SAME bucket sees the SAME challenge, and `ConsumedNonceStore`
+ * is keyed purely by `nonce` (matching this task's spec literally). Two
+ * DIFFERENT payers racing to pay the identical resource in the identical
+ * window are therefore racing for ONE shared slot: whichever one's payment
+ * the facilitator confirms first consumes the nonce, and the other is
+ * indistinguishable from a replay and is rejected — even though on-chain
+ * EIP-3009 nonce tracking is scoped per-`from` and would not itself have
+ * conflicted. This is a genuine behavior change from Task 6, whose
+ * per-request random `paymentId` gave concurrent payers of the same
+ * resource independent slots (see the task-6 report's "concurrency
+ * (nonce-keyed store, not resource-keyed)" tests, now superseded — a
+ * challenge cannot be minted unique-per-payer before the payer has said
+ * anything, without storing something, which is exactly what this task
+ * removes). A route that needs independent concurrent slots can still get
+ * one per caller by folding a caller-supplied unique token into its own
+ * URL/query string (which becomes part of `resource`, and therefore of the
+ * HMAC preimage) — a route-design choice, not something this middleware
+ * does on the caller's behalf.
  *
  * ## Local floor checks
  *
- * `maxAmountRequired`, `payTo`, and the authorization's time window are all
- * inputs this middleware already has in hand once it has looked up the
- * matching `PaymentRequirements` — there is no reason to spend a network
- * round trip to a facilitator (a separate trust domain, reachable at a
- * configured URL) to reject a payload that authorizes too little value, pays
- * the wrong address, or has already expired. These are checked locally
- * before `consume`. There is deliberately no separate "asset" check: x402's
- * exact-evm `authorization` carries no asset field at all, so there is
- * nothing payer-supplied to validate here in the first place — the `asset`
- * that reaches `/verify` is always `cached.requirement.asset`, this
- * middleware's own value from `buildRequirements`/`config`, never anything
- * the payer could substitute. (It is ALSO true that `payTo` transitively
- * pins the token in this v1 design, since each `Escrow` is deployed against
- * one immutable token — but that is a secondary observation, not the reason
- * the check is unnecessary; it holds only so long as `config.escrows` and
- * `config.assets` are configured consistently with each other, which
- * `ferry402` does not itself validate — a configuration hazard for the
- * developer wiring up `Ferry402Config`, not something a payer can
- * exploit.)
+ * Unchanged from Task 6: `maxAmountRequired`, `payTo`, and the
+ * authorization's time window are checked locally, before ever consuming a
+ * nonce or calling the facilitator — see the inline comments below for the
+ * `parseAtomicAmount` rationale (x402's own `value` validator admits `"1e30"`
+ * which crashes bare `BigInt`).
  *
- * KNOWN LIMITATIONS (accepted for this task's slice, see the task-6 report):
- * - The default `InMemoryChallengeStore` is in-memory and per process. It
- *   does not survive a restart and is not shared across horizontally-scaled
- *   instances — a payment routed to a different instance than the one that
- *   issued its challenge is (correctly, if unhelpfully) told its challenge
- *   expired. Pass `{ store }` with a shared implementation (Redis, a
- *   database) to fix this; `ferry402`'s signature does not need to
- *   change.
- * - This function only calls `/verify`, never `/settle`. Double-*collection*
- *   protection (the same authorization being settled on-chain twice) is the
- *   `Escrow` contract's single-use nonce, at settlement time — out of scope
- *   here. What IS in scope here, and implemented, is double-*service*
- *   protection: consuming the challenge on first use means a replayed
- *   `X-PAYMENT` header cannot buy a second response, independent of
- *   whatever happens (or doesn't) at settlement.
- * - A malformed or schema-invalid `X-PAYMENT` cannot be correlated to any
- *   outstanding challenge (there is no nonce to look up yet), so it is
- *   answered with a freshly-minted challenge rather than the one — if any —
- *   the payer actually intended to pay against.
- * - The consume-before-verify window (see above) is a transient DENIAL
- *   vector, not a bypass, and it is a real one: everything needed to compute
- *   a challenge's nonce — `extra.merchantEvm`, `extra.paymentId` — is public
- *   in the 402 response body, and `computeNonce` is exported public API. So
- *   anyone who observes an outstanding challenge (not only its intended
- *   payer) can derive its nonce and submit a bogus-signature payload that
- *   passes every local check here. Doing so `consume`s the challenge for the
- *   duration of the `/verify` round trip; the legitimate payer's own
- *   (valid) submission arriving during that window sees `payment_expired`.
- *   `/verify` will reject the bogus signature and the entry gets reinstated
- *   (see above), which is exactly what keeps this transient rather than
- *   permanent — but an attacker looping this against one specific challenge,
- *   especially paired with a slow or hanging facilitator, can keep that
- *   challenge effectively unavailable for as long as they keep trying, at a
- *   cost of one request per cycle to them and one `VERIFY_TIMEOUT_MS` (or
- *   less) of denial per cycle to the victim. This is a structural consequence
- *   of reserving a single-slot-per-nonce entry before its verdict is known;
- *   the actual fix is a stateless-challenge redesign that doesn't require
- *   reserving anything before confirmation, which is intentionally NOT
- *   implemented here — it is separately scoped follow-up work.
+ * KNOWN LIMITATIONS (accepted for this task's slice):
+ * - The default `InMemoryConsumedNonceStore` is per-process; see
+ *   `Ferry402Options.consumedNonceStore`.
+ * - This function only calls `/verify`, never `/settle` — double-collection
+ *   protection (the same authorization redeemed twice on-chain) is
+ *   `Escrow`'s own single-use nonce tracking, out of scope here.
+ * - The concurrent-different-payers trade-off above.
  */
 export function ferry402(config: Ferry402Config, options: Ferry402Options = {}): RequestHandler {
-  const store = options.store ?? new InMemoryChallengeStore()
+  assertValidSecret(config.secret)
+  const consumedNonceStore = options.consumedNonceStore ?? new InMemoryConsumedNonceStore()
 
-  async function issueChallenge(resource: string): Promise<PaymentRequirements[]> {
+  /**
+   * Builds the `accepts` array for `resource` RIGHT NOW: one
+   * `PaymentRequirements` entry per accepted chain, each carrying the
+   * CURRENT bucket's derived `paymentId` in place of `buildRequirements`'s
+   * own random default (which is generated and then immediately discarded
+   * here — see this function's doc comment for why the random value must
+   * never be the one actually published). Pure and synchronous: no store of
+   * any kind is touched, for any request — this is the core of Task 12's
+   * fix. Calling this for the same `resource` twice inside the same time
+   * bucket returns byte-for-byte identical `paymentId`s, by design.
+   */
+  function issueChallenge(resource: string): PaymentRequirements[] {
     const requirements = buildRequirements(config, resource)
-    const maxTimeoutSeconds = requirements[0]?.maxTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS
-    const expiresAt = Date.now() + maxTimeoutSeconds * 1000
-    try {
-      await Promise.all(
-        requirements.map((requirement) => {
-          const nonce = computeNonce(
-            requirement.extra?.merchantEvm as `0x${string}`,
-            requirement.extra?.paymentId as `0x${string}`,
-          )
-          return store.set(nonce, { requirement, accepts: requirements, resource, expiresAt })
-        }),
-      )
-    } catch {
-      // A store backed by something remote (Redis, a database) can fail on
-      // its own terms. The challenge we hand back may end up unredeemable
-      // (any payment against it will simply see "no such challenge" — a
-      // safe, if unhelpful, failure mode) but returning SOME valid 402 body
-      // beats letting this rejection propagate: on Express 4 (within our
-      // declared peer range) an async middleware's rejected promise is not
-      // forwarded anywhere, which would otherwise surface as an unhandled
-      // rejection and a hung request rather than a clean response.
+    for (const requirement of requirements) {
+      const merchantEvm = requirement.extra?.merchantEvm as `0x${string}` | undefined
+      if (!merchantEvm) continue // defensive; buildRequirements always sets this
+      const derived = deriveChallenge(config.secret, merchantEvm, resource)
+      requirement.extra = { ...requirement.extra, paymentId: derived.paymentId }
     }
     return requirements
   }
 
   function send402(res: Response, accepts: PaymentRequirements[], error?: string): void {
-    // A 402 challenge/rejection must never be cached by an intermediary —
-    // each one is tied to a fresh paymentId and, once consumed, to a
-    // specific one-time nonce.
+    // A 402 challenge/rejection must never be cached by an intermediary.
     res.set('Cache-Control', 'no-store')
     res.status(402).json(error === undefined ? { x402Version: 1, accepts } : { x402Version: 1, accepts, error })
   }
@@ -264,12 +215,26 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     }
   }
 
+  async function release(nonce: `0x${string}`): Promise<void> {
+    try {
+      await consumedNonceStore.release(nonce)
+    } catch {
+      // Best effort — see ConsumedNonceStore.release's doc comment. A failed
+      // release just means the payer sees `payment_expired` on retry rather
+      // than a clean one; still fail-closed, never fail-open.
+    }
+  }
+
   return async (req: Request, res: Response, next: NextFunction) => {
     const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`
+    // Computed unconditionally, once, for every request: unlike the old
+    // store-backed `issueChallenge`, this costs nothing but a few HMAC
+    // computations — no I/O, no allocation proportional to request volume.
+    const requirements = issueChallenge(resource)
     const header = req.header('X-PAYMENT')
 
     if (!header) {
-      send402(res, await issueChallenge(resource))
+      send402(res, requirements)
       return
     }
 
@@ -282,7 +247,7 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     try {
       decoded = JSON.parse(Buffer.from(header, 'base64').toString('utf8'))
     } catch {
-      send402(res, await issueChallenge(resource), 'invalid_payload')
+      send402(res, requirements, 'invalid_payload')
       return
     }
 
@@ -290,7 +255,7 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     // shape check — see the task-6 corrections this implements.
     const parsed = PaymentPayloadSchema.safeParse(decoded)
     if (!parsed.success) {
-      send402(res, await issueChallenge(resource), 'invalid_payload')
+      send402(res, requirements, 'invalid_payload')
       return
     }
     const paymentPayload = parsed.data
@@ -298,50 +263,39 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     if (!('authorization' in paymentPayload.payload)) {
       // The schema's other branch is the exact-svm variant ({ transaction }),
       // which carries no `nonce` at all. v1 is EVM-only (USDC on
-      // base/base-sepolia/polygon/polygon-amoy), so there is nothing to look
-      // up a challenge by here.
-      send402(res, await issueChallenge(resource), 'invalid_payload')
+      // base/base-sepolia/polygon/polygon-amoy).
+      send402(res, requirements, 'invalid_payload')
       return
     }
     const authorization = paymentPayload.payload.authorization
-    const nonce = normalizeNonce(authorization.nonce)
+    const presentedNonce = normalizeNonce(authorization.nonce)
 
-    let cached: CachedChallenge | undefined
-    try {
-      cached = await store.get(nonce)
-    } catch {
-      send402(res, await issueChallenge(resource), 'unexpected_verify_error')
-      return
-    }
-    if (!cached) {
-      send402(res, await issueChallenge(resource), 'payment_expired')
+    const selected = requirements.find((r) => r.network === paymentPayload.network)
+    if (!selected) {
+      // The claimed network isn't one this merchant accepts at all — cheap,
+      // pre-derivation rejection; no HMAC needed to know this is wrong.
+      send402(res, requirements, 'invalid_network')
       return
     }
 
-    // Resource binding: a challenge issued for one resource must never be
-    // honored for another, even under the same route mount (`resource`
-    // includes the full request URL, query string and all) and even if a
-    // shared store makes another route's challenge technically reachable.
-    // Without this, a nonce is only bound to a chain and a price - not to
-    // WHICH protected resource that price was for.
-    if (cached.resource !== resource) {
-      send402(res, cached.accepts, 'invalid_payment_requirements')
-      return
-    }
-
-    // The nonce is the source of truth for which chain this payment is for.
-    // A payload whose outer `network` disagrees with the chain the nonce was
-    // actually minted for is rejected rather than trusted — this also
-    // catches an unaccepted network reusing a real nonce from a different,
-    // accepted chain.
-    if (cached.requirement.network !== paymentPayload.network) {
-      send402(res, cached.accepts, 'invalid_network')
+    const merchantEvm = selected.extra?.merchantEvm as `0x${string}`
+    // THE structural check: resource binding and TTL both fall out of this
+    // single recomputation (see challengeDerivation.ts's doc comment) rather
+    // than being separate lookups. A nonce for a different resource, a
+    // different merchant address, or more than one bucket in the past can
+    // never equal either candidate, by construction of the HMAC preimage —
+    // there is no store here to consult either way.
+    const matched = matchChallenge(config.secret, merchantEvm, resource, presentedNonce)
+    if (!matched) {
+      send402(res, requirements, 'payment_expired')
       return
     }
 
     // Local floor checks - cheap, and every input is already in hand. A
     // facilitator is a separate trust domain reachable over the network;
     // there is no reason to ask it to reject what we can already reject.
+    // `selected`'s static fields (maxAmountRequired, payTo) do not depend on
+    // which bucket matched, so they can be read straight off it.
     //
     // `value` is parsed via `parseAtomicAmount`, NOT a bare `BigInt(...)`:
     // x402's own validator for this field is
@@ -350,79 +304,78 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     // exponent notation - `"1e30"` passes (an integer, and only 4 characters,
     // nowhere near the 18-char length cap) but `BigInt("1e30")` throws a
     // SyntaxError. Reaching this line needs no valid payment at all: the 402
-    // challenge body itself publishes `extra.merchantEvm`/`extra.paymentId`,
-    // and `computeNonce` is exported public API, so anyone can derive a
-    // matching nonce and reach here with a crafted `value` alone (review
-    // round 3's Critical finding - on Express 4, within our declared peer
-    // range, an unguarded throw here doesn't just 500 the request, it kills
-    // the process outright under Node's default unhandled-rejection policy).
+    // challenge body itself publishes `extra.merchantEvm`, and the
+    // derivation is public knowledge of the request's own resource, so
+    // anyone can derive a matching nonce and reach here with a crafted
+    // `value` alone (review round 3's Critical finding, task 6).
     const authorizedValue = parseAtomicAmount(authorization.value)
-    const requiredValue = parseAtomicAmount(cached.requirement.maxAmountRequired)
+    const requiredValue = parseAtomicAmount(selected.maxAmountRequired)
     if (authorizedValue === undefined || requiredValue === undefined || authorizedValue < requiredValue) {
-      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_value')
+      send402(res, requirements, 'invalid_exact_evm_payload_authorization_value')
       return
     }
-    if (authorization.to.toLowerCase() !== cached.requirement.payTo.toLowerCase()) {
-      send402(res, cached.accepts, 'invalid_exact_evm_payload_recipient_mismatch')
+    if (authorization.to.toLowerCase() !== selected.payTo.toLowerCase()) {
+      send402(res, requirements, 'invalid_exact_evm_payload_recipient_mismatch')
       return
     }
     const nowSeconds = Math.floor(Date.now() / 1000)
     if (Number(authorization.validAfter) > nowSeconds) {
-      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_valid_after')
+      send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_after')
       return
     }
     if (Number(authorization.validBefore) <= nowSeconds) {
-      send402(res, cached.accepts, 'invalid_exact_evm_payload_authorization_valid_before')
+      send402(res, requirements, 'invalid_exact_evm_payload_authorization_valid_before')
       return
     }
 
-    // Every check above was read-only (via `get`). Only now, immediately
-    // before the facilitator call, do we actually consume the challenge —
-    // see this function's doc comment ("consume, don't just verify") for why
-    // this is the precise point that must be atomic.
-    let consumed: CachedChallenge | undefined
+    // The payer may have signed against the PREVIOUS bucket (see
+    // matchChallenge) rather than the CURRENT one `requirements`/`selected`
+    // were just built with — substitute `matched.paymentId` so what we hand
+    // the facilitator (and, downstream, on-chain settlement) is
+    // byte-for-byte what the payer actually signed.
+    const requirementForVerify: PaymentRequirements = {
+      ...selected,
+      extra: { ...selected.extra, paymentId: matched.paymentId },
+    }
+
+    // Every check above was read-only. Only now, immediately before the
+    // facilitator call, do we actually consume the nonce — atomically, so
+    // concurrent replays of the identical X-PAYMENT header race safely (see
+    // ConsumedNonceStore's doc comment for why this must be a single
+    // check-and-set, not a read followed by a write after an await).
+    const expiresAt = Date.now() + 2 * TIME_BUCKET_SECONDS * 1000
+    let firstConsume: boolean
     try {
-      consumed = await store.consume(nonce)
+      firstConsume = await consumedNonceStore.consumeIfAbsent(presentedNonce, expiresAt)
     } catch {
-      send402(res, await issueChallenge(resource), 'unexpected_verify_error')
+      send402(res, requirements, 'unexpected_verify_error')
       return
     }
-    if (!consumed) {
-      // Raced with another consumer of the same nonce (a genuine replay, or
-      // a concurrent duplicate request), or expired in the gap since `get`.
-      // Either way: no longer redeemable.
-      send402(res, await issueChallenge(resource), 'payment_expired')
+    if (!firstConsume) {
+      // Already consumed by a prior (or concurrently racing) request with
+      // the identical nonce — a genuine replay. Rejected locally; the
+      // facilitator is never called a second time for it.
+      send402(res, requirements, 'payment_expired')
       return
     }
 
-    const verdict = await callVerify(paymentPayload, consumed.requirement)
+    const verdict = await callVerify(paymentPayload, requirementForVerify)
     if ('networkError' in verdict) {
-      await reinstate(nonce, consumed)
-      send402(res, consumed.accepts, 'unexpected_verify_error')
+      await release(presentedNonce)
+      send402(res, requirements, 'unexpected_verify_error')
       return
     }
 
     if (!verdict.isValid) {
-      await reinstate(nonce, consumed)
-      send402(res, consumed.accepts, verdict.invalidReason ?? 'invalid_payment')
+      await release(presentedNonce)
+      send402(res, requirements, verdict.invalidReason ?? 'invalid_payment')
       return
     }
 
     // Never log `paymentPayload` (carries the payer's signature) or the raw
     // X-PAYMENT header anywhere on this path — see the task-6 judgement
     // notes. res.locals is request-scoped app state, not a log sink.
-    res.locals.x402 = { payload: paymentPayload, requirements: consumed.requirement, payer: verdict.payer }
+    res.locals.x402 = { payload: paymentPayload, requirements: requirementForVerify, payer: verdict.payer }
     next()
-  }
-
-  async function reinstate(nonce: `0x${string}`, entry: CachedChallenge): Promise<void> {
-    try {
-      await store.set(nonce, entry)
-    } catch {
-      // Best effort: if the store can't be written back to, the payer will
-      // see this challenge as expired on retry rather than reinstated. That
-      // is still fail-closed (no unintended access granted), just less
-      // convenient than a successful reinstatement would have been.
-    }
   }
 }

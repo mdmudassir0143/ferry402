@@ -4,5 +4,15 @@ export type { BuildRequirementsOptions } from './requirements.js'
 export { ferry402 } from './middleware.js'
 export type { Ferry402Options } from './middleware.js'
 export { computeNonce, normalizeNonce } from './nonce.js'
-export { InMemoryChallengeStore } from './challengeStore.js'
-export type { ChallengeStore, CachedChallenge } from './challengeStore.js'
+export { InMemoryConsumedNonceStore } from './challengeStore.js'
+export type { ConsumedNonceStore } from './challengeStore.js'
+export {
+  assertValidSecret,
+  deriveChallenge,
+  matchChallenge,
+  derivePaymentId,
+  timeBucket,
+  MIN_SECRET_BYTES,
+  TIME_BUCKET_SECONDS,
+} from './challengeDerivation.js'
+export type { DerivedChallenge } from './challengeDerivation.js'

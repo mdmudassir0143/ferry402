@@ -1,15 +1,21 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
+import type { Request, Response, NextFunction } from 'express'
 import type { Server } from 'node:http'
 import { ferry402 } from '../src/index.js'
 import { computeNonce } from '../src/nonce.js'
-import type { ChallengeStore, CachedChallenge } from '../src/challengeStore.js'
+import { MIN_SECRET_BYTES, TIME_BUCKET_SECONDS, timeBucket } from '../src/challengeDerivation.js'
+import type { ConsumedNonceStore } from '../src/challengeStore.js'
+import { InMemoryConsumedNonceStore } from '../src/challengeStore.js'
 import type { Ferry402Config, PaymentRequirements } from '../src/types.js'
 
-// Reused verbatim from Task 5's requirements.test.ts fixture (per the
-// controller's ruling: T6 reuses T5's config fixture rather than inventing a
-// second one), extended with the fields buildRequirements needs.
+// 32 bytes exactly (MIN_SECRET_BYTES) - the boundary this fixture must
+// satisfy for every "happy path" test in this file.
+const SECRET = 's'.repeat(MIN_SECRET_BYTES)
+
+// Reused verbatim from Task 5's requirements.test.ts fixture, extended with
+// the fields buildRequirements needs, plus Task 12's `secret`.
 const config: Ferry402Config = {
   price: '$0.01',
   accept: ['base-sepolia', 'polygon-amoy'],
@@ -34,6 +40,7 @@ const config: Ferry402Config = {
     polygon: '0x0000000000000000000000000000000000000000',
     'polygon-amoy': '0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582',
   },
+  secret: SECRET,
 }
 
 /**
@@ -66,19 +73,16 @@ function makePayload(network: 'base-sepolia' | 'polygon-amoy', nonce: string) {
 
 /**
  * The real nonce a payer would sign for a given issued `PaymentRequirements`
- * entry: `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)`. The
- * middleware's challenge store is keyed by exactly this value (not the bare
- * `paymentId`), so every test that pays against a real challenge must derive
- * its `X-PAYMENT` nonce this way rather than reusing `extra.paymentId`
- * directly.
+ * entry: `computeNonce(entry.extra.merchantEvm, entry.extra.paymentId)`. This
+ * is unchanged by Task 12 — only HOW `paymentId` is produced changed (derived
+ * instead of random); the nonce formula itself (`nonce.ts`) is untouched.
  */
 function nonceFor(requirement: PaymentRequirements): `0x${string}` {
   return computeNonce(requirement.extra?.merchantEvm, requirement.extra?.paymentId)
 }
 
-// A well-formed nonce that was never issued by any challenge in the test -
-// i.e. it does not equal computeNonce(merchantEvm, paymentId) for anything
-// ferry402 actually generated.
+// A well-formed nonce that cannot correspond to any valid derivation for
+// anything ferry402 would actually compute (garbage, not a real HMAC output).
 const UNKNOWN_NONCE = `0x${'11'.repeat(32)}` as const
 
 function toHeader(payload: unknown): string {
@@ -86,19 +90,17 @@ function toHeader(payload: unknown): string {
 }
 
 // supertest wraps a bare Express *function* in a brand-new http.Server (on a
-// brand-new ephemeral port) every single time `request(app)` is called - see
-// supertest's Test constructor. Two sequential `request(app).get(...)` calls
-// against "the same app" therefore hit two DIFFERENT ports, so the request's
-// Host header (and thus `resource`) differs between a challenge and its
-// follow-up payment. Real deployments don't have this problem (one process,
-// one host); the fix here is purely a test-fixture concern: listen once per
-// test and reuse that one server/port for every request in the round trip,
-// exactly like a real client would.
+// brand-new ephemeral port) every single time `request(app)` is called - two
+// sequential `request(app).get(...)` calls therefore hit two DIFFERENT ports,
+// so the request's Host header (and thus `resource`) differs between a
+// challenge and its follow-up payment unless the SAME listening server is
+// reused. The fix is a test-fixture concern only: listen once per test and
+// reuse that one server/port for every request in the round trip.
 const servers: Server[] = []
 
-function buildApp(): Server {
+function buildApp(cfg: Ferry402Config = config, options?: Parameters<typeof ferry402>[1]): Server {
   const app = express()
-  app.use('/premium', ferry402(config))
+  app.use('/premium', ferry402(cfg, options))
   app.get('/premium', (_req, res) => res.json({ ok: true }))
   const server = app.listen(0)
   servers.push(server)
@@ -111,35 +113,64 @@ function appWith(verifyResult: unknown): Server {
 }
 
 /**
- * The simplest possible `ChallengeStore`: a raw `Map`, keyed on whatever
- * string it is given, with NO casing normalization of its own. This is
- * deliberately naive - it stands in for a third-party store (Redis, a
- * database) that someone plugs into `ferry402(config, { store })` without
- * having thought about nonce casing at all, since `ChallengeStore`'s
- * contract puts that burden on the CALLER (`ferry402` itself), not on
- * every implementation. If `ferry402` ever stopped normalizing the
- * payer's nonce before calling this store, an uppercase-hex nonce (valid
- * per x402's schema; see nonce.test.ts) would silently miss this Map, since
- * nothing here would fold its casing either.
+ * A minimal fake Express `Request`/`Response` pair for driving a `ferry402`
+ * `RequestHandler` DIRECTLY, bypassing Express/HTTP/supertest entirely. Used
+ * where the volume (10,000 iterations) or precision (two isolated middleware
+ * instances that must see the IDENTICAL `resource` string with no port
+ * artifact from two separately-`listen()`ed servers) makes a real HTTP round
+ * trip either too slow or actively the wrong tool.
  */
-class CaseSensitiveMapStore implements ChallengeStore {
-  private readonly entries = new Map<string, CachedChallenge>()
+function fakeGetReq(resource: string, xPaymentHeader?: string): Request {
+  const url = new URL(resource)
+  return {
+    protocol: url.protocol.slice(0, -1),
+    get: (name: string) => (name.toLowerCase() === 'host' ? url.host : undefined),
+    originalUrl: url.pathname + url.search,
+    header: (name: string) => (name.toLowerCase() === 'x-payment' ? xPaymentHeader : undefined),
+  } as unknown as Request
+}
 
-  async get(nonce: `0x${string}`): Promise<CachedChallenge | undefined> {
-    return this.entries.get(nonce)
+interface FakeRes {
+  statusCode: number
+  body: unknown
+  headers: Record<string, string>
+}
+
+function fakeRes(): Response & FakeRes {
+  const res: FakeRes & Partial<Response> = { statusCode: 0, body: undefined, headers: {} }
+  res.set = ((name: string, value: string) => {
+    res.headers[name] = value
+    return res
+  }) as unknown as Response['set']
+  res.status = ((code: number) => {
+    res.statusCode = code
+    return res
+  }) as unknown as Response['status']
+  res.json = ((body: unknown) => {
+    res.body = body
+    return res
+  }) as unknown as Response['json']
+  res.locals = {}
+  return res as unknown as Response & FakeRes
+}
+
+/**
+ * The naive third-party `ConsumedNonceStore` an integrator might plug in via
+ * `ferry402(config, { consumedNonceStore })` without having thought about
+ * nonce casing at all — no internal lowercasing, unlike the default. Stands
+ * in for the OLD `CaseSensitiveMapStore` extension-point test, retargeted at
+ * Task 12's replacement seam.
+ */
+class CaseSensitiveMapConsumedNonceStore implements ConsumedNonceStore {
+  private readonly entries = new Map<string, number>()
+
+  async consumeIfAbsent(nonce: `0x${string}`, expiresAt: number): Promise<boolean> {
+    if (this.entries.has(nonce)) return false
+    this.entries.set(nonce, expiresAt)
+    return true
   }
 
-  async set(nonce: `0x${string}`, entry: CachedChallenge): Promise<void> {
-    this.entries.set(nonce, entry)
-  }
-
-  async consume(nonce: `0x${string}`): Promise<CachedChallenge | undefined> {
-    const entry = this.entries.get(nonce)
-    this.entries.delete(nonce)
-    return entry
-  }
-
-  async delete(nonce: `0x${string}`): Promise<void> {
+  async release(nonce: `0x${string}`): Promise<void> {
     this.entries.delete(nonce)
   }
 }
@@ -157,12 +188,14 @@ describe('ferry402 middleware', () => {
     expect(res.body.x402Version).toBe(1)
   })
 
+  it('sets Cache-Control: no-store on a 402 response (must never be cached by an intermediary)', async () => {
+    const res = await request(appWith({})).get('/premium')
+    expect(res.headers['cache-control']).toBe('no-store')
+  })
+
   it('serves the route when the facilitator says the payment is valid', async () => {
     // A real 20-byte address, not a placeholder like '0xabc' - x402's
-    // VerifyResponseSchema validates `payer` against EvmAddressRegex
-    // (/^0x[0-9a-fA-F]{40}$/), so a short/invalid one fails the "parse,
-    // don't hand-roll" check middleware.ts now applies to /verify responses
-    // and would misreport as `unexpected_verify_error` here.
+    // VerifyResponseSchema validates `payer` against EvmAddressRegex.
     const server = appWith({ isValid: true, payer: '0xCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCc' })
     const challengeRes = await request(server).get('/premium')
     const requirement = challengeRes.body.accepts[0] as PaymentRequirements
@@ -185,8 +218,190 @@ describe('ferry402 middleware', () => {
     expect(res.body.accepts).toHaveLength(2)
   })
 
-  describe('the paymentId round trip (correction 3)', () => {
-    it('sends the facilitator the SAME paymentId the 402 challenge issued, not a freshly generated one', async () => {
+  describe('secret validation (Task 12: throw at construction, never silently generate)', () => {
+    it('throws when config.secret is missing', () => {
+      const { secret: _secret, ...rest } = config
+      expect(() => ferry402(rest as Ferry402Config)).toThrow(/secret/i)
+    })
+
+    it('throws when config.secret is undefined', () => {
+      expect(() => ferry402({ ...config, secret: undefined as unknown as string })).toThrow(/secret/i)
+    })
+
+    it('throws when config.secret is an empty string', () => {
+      expect(() => ferry402({ ...config, secret: '' })).toThrow(/secret/i)
+    })
+
+    it(`throws when config.secret is ${MIN_SECRET_BYTES - 1} bytes (one short of the minimum)`, () => {
+      expect(() => ferry402({ ...config, secret: 'x'.repeat(MIN_SECRET_BYTES - 1) })).toThrow(
+        new RegExp(String(MIN_SECRET_BYTES)),
+      )
+    })
+
+    it(`does not throw when config.secret is exactly ${MIN_SECRET_BYTES} bytes`, () => {
+      expect(() => ferry402({ ...config, secret: 'x'.repeat(MIN_SECRET_BYTES) })).not.toThrow()
+    })
+
+    it('never falls back to generating a random secret - two configs with no secret both throw identically, they do not silently diverge', () => {
+      const { secret: _secret, ...rest } = config
+      expect(() => ferry402(rest as Ferry402Config)).toThrow()
+      expect(() => ferry402(rest as Ferry402Config)).toThrow()
+    })
+  })
+
+  describe('Task 12: stateless challenge derivation - core properties', () => {
+    it('10,000 anonymous requests write ZERO entries to the consumed-nonce store (the availability bug this task fixes)', async () => {
+      const store = new InMemoryConsumedNonceStore()
+      let consumeCalls = 0
+      let releaseCalls = 0
+      const spyStore: ConsumedNonceStore = {
+        consumeIfAbsent: async (nonce, expiresAt) => {
+          consumeCalls++
+          return store.consumeIfAbsent(nonce, expiresAt)
+        },
+        release: async (nonce) => {
+          releaseCalls++
+          return store.release(nonce)
+        },
+      }
+      const fetchSpy = vi.fn()
+      globalThis.fetch = fetchSpy as any
+      const handler = ferry402(config, { consumedNonceStore: spyStore })
+
+      for (let i = 0; i < 10_000; i++) {
+        const req = fakeGetReq(`https://api.test/premium?i=${i}`)
+        const res = fakeRes()
+        // eslint-disable-next-line no-await-in-loop
+        await handler(req, res, (() => {}) as NextFunction)
+        if (res.statusCode !== 402) throw new Error(`expected 402, got ${res.statusCode} at i=${i}`)
+      }
+
+      expect(consumeCalls).toBe(0)
+      expect(releaseCalls).toBe(0)
+      expect(store.size).toBe(0)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it('a challenge for resource A is rejected at resource B, with no store involved (structural resource binding)', async () => {
+      const store = new InMemoryConsumedNonceStore()
+      let consumeCalls = 0
+      const spyStore: ConsumedNonceStore = {
+        consumeIfAbsent: async (nonce, expiresAt) => {
+          consumeCalls++
+          return store.consumeIfAbsent(nonce, expiresAt)
+        },
+        release: async (nonce) => store.release(nonce),
+      }
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp(config, { consumedNonceStore: spyStore })
+
+      const challengeA = await request(server).get('/premium?resource=A')
+      const requirementA = challengeA.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirementA.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirementA))
+
+      const res = await request(server).get('/premium?resource=B').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('payment_expired')
+      expect(fetchSpy).not.toHaveBeenCalled()
+      // The rejection happened before ever reaching the consume step - no
+      // store lookup, no store write, for either resource.
+      expect(consumeCalls).toBe(0)
+    })
+
+    it('still honors the SAME challenge when presented back at the SAME resource it was issued for', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium?id=1')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      const res = await request(server).get('/premium?id=1').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('a payment at bucket boundary MINUS ONE (the "previous" bucket) still verifies', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      // An arbitrary, deterministic bucket boundary far from both epoch 0
+      // and Date.now() - nothing in this test depends on real wall-clock
+      // time at all, both requests use fully mocked Date.now() values.
+      const boundaryMs = 5_000 * TIME_BUCKET_SECONDS * 1000
+
+      vi.spyOn(Date, 'now').mockReturnValue(boundaryMs - 1000) // 1s before the boundary -> bucket B-1
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      vi.spyOn(Date, 'now').mockReturnValue(boundaryMs + 500) // just after -> bucket B (current); B-1 is "previous"
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('a payment derived TWO buckets in the past is rejected - the window is exactly current+previous, not unlimited', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const boundaryMs = 5_001 * TIME_BUCKET_SECONDS * 1000 // distinct boundary from the previous test
+
+      vi.spyOn(Date, 'now').mockReturnValue(boundaryMs - 1000) // bucket B-1
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      // bucket B+1 - two full buckets after B-1, so neither "current" (B+1)
+      // nor "previous" (B) matches.
+      vi.spyOn(Date, 'now').mockReturnValue(boundaryMs + TIME_BUCKET_SECONDS * 1000 + 500)
+      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+      expect(res.status).toBe(402)
+      expect(res.body.error).toBe('payment_expired')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it("two INDEPENDENT middleware instances sharing a secret accept each other's challenges, with no shared store", async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+
+      // Two entirely separate closures - separate InMemoryConsumedNonceStore
+      // instances, no module-level state, no shared object of any kind.
+      // Only `config.secret` is shared.
+      const handlerA = ferry402(config)
+      const handlerB = ferry402(config)
+
+      const resource = 'https://api.test/premium'
+      const challengeRes = fakeRes()
+      await handlerA(fakeGetReq(resource), challengeRes, (() => {}) as NextFunction)
+      expect(challengeRes.statusCode).toBe(402)
+      const requirement = (challengeRes.body as { accepts: PaymentRequirements[] }).accepts[0]
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+
+      let nextCalled = false
+      const payRes = fakeRes()
+      await handlerB(fakeGetReq(resource, toHeader(payload)), payRes, (() => {
+        nextCalled = true
+      }) as NextFunction)
+
+      expect(nextCalled).toBe(true)
+      expect(payRes.statusCode).toBe(0) // next() was called, never send402
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it("issues a DIFFERENT paymentId per accepted chain in the same 402 - paymentId's HMAC preimage includes merchantEvm, which differs per chain (a deliberate change from Task 6's single-shared-random-paymentId design)", async () => {
+      const res = await request(appWith({})).get('/premium')
+      const [baseSepolia, polygonAmoy] = res.body.accepts as PaymentRequirements[]
+      expect(baseSepolia.extra?.paymentId).not.toBe(polygonAmoy.extra?.paymentId)
+    })
+  })
+
+  describe('paymentId determinism (Task 12 supersedes Task 6\'s randomness guarantee)', () => {
+    it('sends the facilitator the SAME paymentId the 402 challenge issued, not a re-derived one', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const server = buildApp()
@@ -204,38 +419,39 @@ describe('ferry402 middleware', () => {
       const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
       const sentBody = JSON.parse(init.body as string)
       expect(sentBody.paymentRequirements.extra.paymentId).toBe(issuedPaymentId)
-      // Guards the regression directly: two independent calls to
-      // buildRequirements never produce the same id, so if the middleware had
-      // re-derived requirements on the payment path (the brief's bug) this id
-      // could not possibly equal what the challenge handed out.
     })
 
-    it('never issues the same paymentId across two independent challenges', async () => {
+    it('issues the SAME paymentId for two independent GETs of the identical resource within the same time bucket (determinism, not randomness, is the point of Task 12)', async () => {
       const server = appWith({})
       const first = await request(server).get('/premium')
       const second = await request(server).get('/premium')
+      expect(first.body.accepts[0].extra.paymentId).toBe(second.body.accepts[0].extra.paymentId)
+    })
+
+    it('issues a DIFFERENT paymentId for a different resource (same instant, same chain)', async () => {
+      const server = appWith({})
+      const first = await request(server).get('/premium?id=1')
+      const second = await request(server).get('/premium?id=2')
       expect(first.body.accepts[0].extra.paymentId).not.toBe(second.body.accepts[0].extra.paymentId)
     })
 
-    it('rejects a payment against a well-formed but never-issued nonce, without calling the facilitator', async () => {
+    it('rejects a payment against a well-formed but never-derivable nonce, without calling the facilitator', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const server = buildApp()
 
-      // No prior GET /premium against this server -> UNKNOWN_NONCE cannot be
-      // in the store under any key.
       const payload = makePayload('base-sepolia', UNKNOWN_NONCE)
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
 
       expect(res.status).toBe(402)
       expect(res.body.accepts).toHaveLength(2)
       expect(res.body.error).toBe('payment_expired')
-      // Must fail closed locally, without ever asking the facilitator to
-      // verify a payload that cannot possibly match anything we issued.
       expect(fetchSpy).not.toHaveBeenCalled()
     })
+  })
 
-    it('a challenge past its maxTimeoutSeconds is treated as unknown (TTL expiry), not a crash', async () => {
+  describe('replay protection (Task 6 C1, carried forward: a consumed nonce must not grant unlimited service)', () => {
+    it('under two CONCURRENT identical requests, exactly ONE succeeds and the facilitator is called exactly once (atomic consume, not get-then-check-across-an-await)', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const server = buildApp()
@@ -243,72 +459,21 @@ describe('ferry402 middleware', () => {
       const challengeRes = await request(server).get('/premium')
       const requirement = challengeRes.body.accepts[0] as PaymentRequirements
       const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
 
-      // Fast-forward past the 300s default maxTimeoutSeconds by mocking
-      // Date.now (not vi.useFakeTimers, which would also stub setTimeout and
-      // risk interfering with supertest/Express's own use of real timers).
-      const realNow = Date.now()
-      vi.spyOn(Date, 'now').mockReturnValue(realNow + 301_000)
+      const [a, b] = await Promise.all([
+        request(server).get('/premium').set('X-PAYMENT', header),
+        request(server).get('/premium').set('X-PAYMENT', header),
+      ])
 
-      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
-      expect(res.status).toBe(402)
-      expect(res.body.error).toBe('payment_expired')
-      expect(res.body.accepts).toHaveLength(2)
-      expect(fetchSpy).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('concurrency (nonce-keyed store, not resource-keyed)', () => {
-    it('honors the FIRST of two outstanding challenges for the same resource when it is the one paid', async () => {
-      // Regression barrier for the resource-keyed design: two challenges for
-      // the identical resource string used to share one cache slot, so the
-      // second challenge silently evicted the first's paymentId. This test
-      // deterministically demonstrates two outstanding challenges for one
-      // resource (issued back to back, both still live) and pays the FIRST
-      // one - the ordinary "two users hit one endpoint" case, not a
-      // contrived race. Confirmed (see the task-6 report) to FAIL against
-      // the prior resource-keyed implementation: paying challenge A there
-      // sends challenge B's paymentId to the facilitator instead of A's.
-      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
-      globalThis.fetch = fetchSpy as any
-      const server = buildApp()
-
-      const challengeA = await request(server).get('/premium')
-      const challengeB = await request(server).get('/premium')
-      const requirementA = challengeA.body.accepts[0] as PaymentRequirements
-      const requirementB = challengeB.body.accepts[0] as PaymentRequirements
-      expect(requirementA.extra?.paymentId).not.toBe(requirementB.extra?.paymentId)
-
-      const payload = makePayload(requirementA.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirementA))
-      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
-
-      expect(res.status).toBe(200)
-      expect(res.body).toEqual({ ok: true })
-      const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
-      const sentBody = JSON.parse(init.body as string)
-      expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirementA.extra?.paymentId)
+      const statuses = [a.status, b.status].sort((x, y) => x - y)
+      expect(statuses).toEqual([200, 402])
+      // If consumption were a `get`/check followed by a separate `set` after
+      // an await, BOTH concurrent callers could observe "not yet consumed"
+      // before either records it - this pins that it cannot happen here.
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
 
-    it('also honors the SECOND of two outstanding challenges for the same resource, independently of the first', async () => {
-      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
-      globalThis.fetch = fetchSpy as any
-      const server = buildApp()
-
-      await request(server).get('/premium')
-      const challengeB = await request(server).get('/premium')
-      const requirementB = challengeB.body.accepts[0] as PaymentRequirements
-
-      const payload = makePayload(requirementB.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirementB))
-      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
-
-      expect(res.status).toBe(200)
-      const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
-      const sentBody = JSON.parse(init.body as string)
-      expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirementB.extra?.paymentId)
-    })
-  })
-
-  describe('replay protection (review C1: a consumed challenge must not grant unlimited service)', () => {
     it('serves the route once, then rejects the identical X-PAYMENT header replayed a second time', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
@@ -324,26 +489,27 @@ describe('ferry402 middleware', () => {
       expect(first.body).toEqual({ ok: true })
 
       // Same header, byte for byte - a bearer credential replay, not a new
-      // payment. Must not buy a second response even though the facilitator
-      // would (per this mock) happily say isValid: true again.
+      // payment. Rejected atomically at the consumed-nonce check, BEFORE the
+      // facilitator is ever called a second time.
       const second = await request(server).get('/premium').set('X-PAYMENT', header)
       expect(second.status).toBe(402)
       expect(second.body.error).toBe('payment_expired')
       expect(second.body.accepts).toHaveLength(2)
-
-      // The replay was rejected locally, from the now-consumed challenge
-      // store - it never reached the facilitator a second time.
       expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
 
-    it('reinstates the challenge (does not burn it) when the facilitator rejects the payment', async () => {
+    it('releases the consumed nonce (does not permanently burn it) when the facilitator rejects the payment, so a corrected retry still succeeds', async () => {
       // Consuming happens optimistically, before the verdict is known. A
       // rejected (not merely replayed) payment must not permanently destroy
-      // the challenge - nothing was collected, so the payer gets to correct
-      // their signature and retry with the SAME nonce within the TTL.
+      // the nonce: since it is PUBLIC (derivable/readable by anyone from an
+      // anonymous 402), failing to release it would let anyone permanently
+      // deny the legitimate payer service for this resource's whole
+      // derivation window with a single bogus-signature attempt.
       const fetchSpy = vi
         .fn()
-        .mockResolvedValueOnce(new Response(JSON.stringify({ isValid: false, invalidReason: 'insufficient_funds' }), { status: 200 }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ isValid: false, invalidReason: 'insufficient_funds' }), { status: 200 }),
+        )
         .mockResolvedValueOnce(new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const server = buildApp()
@@ -361,9 +527,61 @@ describe('ferry402 middleware', () => {
       expect(retried.status).toBe(200)
       expect(fetchSpy).toHaveBeenCalledTimes(2)
     })
+
+    it('releases the nonce when the facilitator is unreachable too, not just on an explicit isValid:false', async () => {
+      const fetchSpy = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const errored = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(errored.status).toBe(402)
+      expect(errored.body.error).toBe('unexpected_verify_error')
+
+      const retried = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(retried.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('normalizes the payer-supplied nonce even against a deliberately case-sensitive custom ConsumedNonceStore - a replay with DIFFERENT casing is still caught', async () => {
+      // Proves the protection a CUSTOM store's users get comes from
+      // `ferry402` itself normalizing before it ever calls the store, not
+      // from any lowercasing the store might or might not do internally, and
+      // not merely from Buffer's own case-insensitive hex decoding (which is
+      // enough for `matchChallenge`'s byte comparison alone, but does
+      // nothing for a STRING-keyed store that never sees normalized input).
+      // A single accepted uppercase nonce would pass even without
+      // normalization; the real test is that the SAME nonce, replayed under
+      // a DIFFERENT casing, is still recognized as the SAME key.
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp(config, { consumedNonceStore: new CaseSensitiveMapConsumedNonceStore() })
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const canonicalNonce = nonceFor(requirement)
+      const uppercaseNonce = (`0x${canonicalNonce.slice(2).toUpperCase()}`) as `0x${string}`
+
+      const firstPayload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', canonicalNonce)
+      const first = await request(server).get('/premium').set('X-PAYMENT', toHeader(firstPayload))
+      expect(first.status).toBe(200)
+
+      const secondPayload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', uppercaseNonce)
+      const second = await request(server).get('/premium').set('X-PAYMENT', toHeader(secondPayload))
+      expect(second.status).toBe(402)
+      expect(second.body.error).toBe('payment_expired')
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
   })
 
-  describe('resource binding (review C2: a challenge for one resource must not pay for another)', () => {
+  describe('resource binding (Task 6 C2, carried forward — now structural, see the "Task 12 core properties" block above for the no-store proof)', () => {
     it('rejects a challenge presented at a different resource than it was issued for', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
@@ -374,32 +592,20 @@ describe('ferry402 middleware', () => {
       const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
 
       // Same nonce, same everything - just a different resource string
-      // (`resource` includes the query string). The reviewer's probe used
-      // two distinct routes under one router mount; a differing query
-      // string reproduces the identical class of bug against a single route.
+      // (`resource` includes the query string). Task 6 reported this as
+      // `invalid_payment_requirements` (an explicit lookup found a resource
+      // mismatch); Task 12 reports it as `payment_expired` because there is
+      // no longer a separate lookup to fail — the nonce simply never matches
+      // the derivation for this resource in the first place.
       const res = await request(server).get('/premium?id=999').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
-      expect(res.body.error).toBe('invalid_payment_requirements')
+      expect(res.body.error).toBe('payment_expired')
       expect(res.body.accepts).toHaveLength(2)
       expect(fetchSpy).not.toHaveBeenCalled()
     })
-
-    it('still honors the SAME challenge when presented back at the SAME resource it was issued for', async () => {
-      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
-      globalThis.fetch = fetchSpy as any
-      const server = buildApp()
-
-      const challengeRes = await request(server).get('/premium?id=1')
-      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
-      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
-
-      const res = await request(server).get('/premium?id=1').set('X-PAYMENT', toHeader(payload))
-      expect(res.status).toBe(200)
-      expect(fetchSpy).toHaveBeenCalledTimes(1)
-    })
   })
 
-  describe('nonce casing (review I1: x402 permits mixed-case hex; bytes32 has no casing on-chain)', () => {
+  describe('nonce casing (Task 6 I1, carried forward: x402 permits mixed-case hex; bytes32 has no casing on-chain)', () => {
     it('accepts a payment whose authorization.nonce is presented in uppercase hex', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
@@ -414,45 +620,13 @@ describe('ferry402 middleware', () => {
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(200)
       expect(fetchSpy).toHaveBeenCalledTimes(1)
-      // And the store key genuinely normalized rather than coincidentally
-      // matching: the /verify body still carries the original (lowercase)
-      // paymentId the challenge issued.
       const [, init] = fetchSpy.mock.calls[0] as unknown as [string, RequestInit]
       const sentBody = JSON.parse(init.body as string)
       expect(sentBody.paymentRequirements.extra.paymentId).toBe(requirement.extra?.paymentId)
     })
   })
 
-  describe('custom ChallengeStore extension point (review round 3: normalizeNonce must protect it, not just the default store)', () => {
-    it('normalizes the payer-supplied nonce even against a deliberately case-sensitive custom store', async () => {
-      // The in-memory default's OWN internal lowercasing (defense in depth,
-      // see review round 2) does nothing for a third-party store plugged in
-      // via `{ store }` - if it were carrying the real protection here, this
-      // test would be meaningless. Using CaseSensitiveMapStore instead of
-      // the default proves the protection payers of a CUSTOM store actually
-      // get comes from `ferry402` itself normalizing before it ever calls
-      // the store, exactly as `ChallengeStore`'s contract requires.
-      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
-      globalThis.fetch = fetchSpy as any
-      const app = express()
-      app.use('/premium', ferry402(config, { store: new CaseSensitiveMapStore() }))
-      app.get('/premium', (_req, res) => res.json({ ok: true }))
-      const server = app.listen(0)
-      servers.push(server)
-
-      const challengeRes = await request(server).get('/premium')
-      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
-      const canonicalNonce = nonceFor(requirement)
-      const uppercaseNonce = (`0x${canonicalNonce.slice(2).toUpperCase()}`) as `0x${string}`
-      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', uppercaseNonce)
-
-      const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
-      expect(res.status).toBe(200)
-      expect(fetchSpy).toHaveBeenCalledTimes(1)
-    })
-  })
-
-  describe('local floor checks (review I2: do not delegate everything to the facilitator)', () => {
+  describe('local floor checks (Task 6 I2, carried forward: do not delegate everything to the facilitator)', () => {
     it('rejects an authorization whose value is below maxAmountRequired', async () => {
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
@@ -520,15 +694,12 @@ describe('ferry402 middleware', () => {
     it('returns a clean 402 (not a crash) for a value in exponent notation that BigInt cannot parse', async () => {
       // x402's own validator for `value` is Number.isInteger(Number(v)) &&
       // Number(v) >= 0 with a length cap of 18 chars - operating on the
-      // Number() COERCION, not the string's shape. "1e30" passes: Number
-      // ("1e30") is 1e30, an integer per Number.isInteger, and the STRING
-      // is only 4 characters (nowhere near the 18-char cap that bounds
-      // legitimate atomic-unit amounts). BigInt("1e30") throws a
-      // SyntaxError. No real payment is needed to reach this: the 402
-      // challenge body itself publishes extra.merchantEvm and
-      // extra.paymentId, and computeNonce is exported public API, so an
-      // attacker can derive a valid nonce without ever seeing a real
-      // payer's payload (review round 3, new Critical).
+      // Number() COERCION, not the string's shape. "1e30" passes that but
+      // BigInt("1e30") throws a SyntaxError. No real payment is needed to
+      // reach this: the 402 body publishes extra.merchantEvm, and `resource`
+      // is whatever the attacker requested, so a matching nonce is fully
+      // computable by anyone from public information (Task 6 review round
+      // 3's Critical finding - still true, unchanged, under Task 12).
       const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
       globalThis.fetch = fetchSpy as any
       const server = buildApp()
@@ -564,7 +735,6 @@ describe('ferry402 middleware', () => {
   describe('malformed input handling', () => {
     it('returns 402 (not a thrown error) for a non-base64, non-JSON X-PAYMENT header', async () => {
       const server = appWith({})
-      await request(server).get('/premium') // seed a cached challenge
       const res = await request(server).get('/premium').set('X-PAYMENT', '%%%not-valid-base64-or-json%%%')
       expect(res.status).toBe(402)
       expect(res.body.error).toBe('invalid_payload')
@@ -573,7 +743,6 @@ describe('ferry402 middleware', () => {
 
     it('returns 402 for well-formed JSON that fails the x402 PaymentPayloadSchema', async () => {
       const server = appWith({})
-      await request(server).get('/premium')
       const res = await request(server)
         .get('/premium')
         .set('X-PAYMENT', toHeader({ hello: 'world' }))
@@ -585,9 +754,9 @@ describe('ferry402 middleware', () => {
       const server = appWith({})
       const challengeRes = await request(server).get('/premium')
       const requirement = challengeRes.body.accepts[0] as PaymentRequirements // base-sepolia
-      // The nonce is only valid for base-sepolia (it is derived from
-      // base-sepolia's merchantEvm+paymentId); claiming 'base' in the outer
-      // envelope must be rejected even though 'base' is a real SupportedChain.
+      // 'base' is a real x402 network but is NOT in this merchant's
+      // config.accept, so no PaymentRequirements entry (and no derivation)
+      // exists for it at all - rejected before any HMAC is computed.
       const payload = { ...makePayload('base-sepolia', nonceFor(requirement)), network: 'base' }
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
@@ -611,10 +780,6 @@ describe('ferry402 middleware', () => {
       expect(res.status).toBe(402)
       expect(res.body.accepts).toHaveLength(2)
       expect(res.body.error).toBe('unexpected_verify_error')
-      // Pins that this genuinely exercised the facilitator-error path rather
-      // than short-circuiting on payment_expired before ever reaching fetch
-      // (the bug that silently made the pre-fix version of these two tests
-      // pass for the wrong reason - see the task-6 report).
       expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
 
@@ -633,5 +798,53 @@ describe('ferry402 middleware', () => {
       expect(res.body.error).toBe('unexpected_verify_error')
       expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
+  })
+
+  describe('no logging of sensitive data (Task 6 judgement notes, carried forward)', () => {
+    it('never logs anything during a full successful payment cycle', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildApp()
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+
+      expect(logSpy).not.toHaveBeenCalled()
+      expect(errorSpy).not.toHaveBeenCalled()
+      expect(warnSpy).not.toHaveBeenCalled()
+    })
+
+    it('never logs anything on a rejected/invalid payment attempt either', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const server = appWith({ isValid: false, invalidReason: 'insufficient_funds' })
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
+
+      expect(logSpy).not.toHaveBeenCalled()
+      expect(errorSpy).not.toHaveBeenCalled()
+      expect(warnSpy).not.toHaveBeenCalled()
+    })
+  })
+})
+
+// Sanity: `timeBucket` is re-exported and usable directly, matching the
+// public surface `challengeDerivation.test.ts` exercises in depth.
+describe('challengeDerivation re-export sanity', () => {
+  it('timeBucket increments once per TIME_BUCKET_SECONDS', () => {
+    const t0 = timeBucket(0)
+    const t1 = timeBucket(TIME_BUCKET_SECONDS * 1000 - 1)
+    const t2 = timeBucket(TIME_BUCKET_SECONDS * 1000)
+    expect(t0).toBe(t1)
+    expect(t2).toBe(t0 + 1)
   })
 })

@@ -61,4 +61,31 @@ export type Ferry402Config = {
   escrows: Record<SupportedChain, `0x${string}`>
   /** Per-chain USDC (or other v1-supported asset) contract address. */
   assets: Record<SupportedChain, `0x${string}`>
+  /**
+   * The HMAC key `ferry402` derives every challenge's `paymentId`/`nonce`
+   * from (Task 12: stateless challenge derivation — see
+   * `challengeDerivation.ts`):
+   *
+   * ```
+   * paymentId = HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)
+   * nonce     = keccak256(abi.encode(merchantEvm, paymentId))
+   * ```
+   *
+   * **Required. Minimum 32 bytes (UTF-8). `ferry402(config)` THROWS at
+   * construction if this is missing or short** — see
+   * `challengeDerivation.assertValidSecret`. There is deliberately no
+   * fallback to a randomly-generated secret: a per-process random value
+   * would make every derived nonce process-specific, so a payment routed to
+   * a different instance than the one whose 402 the payer saw would never
+   * verify — silently breaking every horizontally-scaled or
+   * rolling-restarted deployment, in a way that only appears under load.
+   *
+   * MUST be the exact same value on every process/instance serving this
+   * merchant's traffic (that is precisely what lets two independent
+   * `ferry402` instances validate each other's challenges with no shared
+   * store at all). Generate it once with real CSPRNG randomness (e.g.
+   * `openssl rand -hex 32`) and load it from a secret store / environment
+   * variable — never commit it, never derive it from anything guessable.
+   */
+  secret: string
 }
