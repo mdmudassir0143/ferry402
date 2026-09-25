@@ -59,9 +59,22 @@ import { computeNonce } from './nonce.js'
  * therefore still needs a `ConsumedNonceStore` (`challengeStore.ts`) — but
  * unlike the old issuance store, it only grows when a request reaches the
  * point of actually being paid (locally valid, then facilitator-verified),
- * never merely on being requested. Minting stays free; growing the replay
- * store costs a real signed, on-chain-payable authorization. That is the
- * asymmetry the old design was missing.
+ * never merely on being requested. Minting stays free; PERMANENT residency in
+ * the replay store — an entry that survives past this one request — costs a
+ * real signed, on-chain-payable authorization, since anything that fails the
+ * facilitator's `/verify` is `release`d again (`middleware.ts`). That is the
+ * asymmetry the old design was missing. It is not a claim about TRANSIENT
+ * growth: a `consumeIfAbsent` happens BEFORE `/verify` is even called (see
+ * `middleware.ts`'s "consume-before-verify, release-on-failure"), so an
+ * attacker who only satisfies the LOCAL floor checks — a currently-valid
+ * public nonce plus an arbitrary, distinct `authorization.from` and an
+ * unverified signature — can still occupy a slot for the duration of that one
+ * request and, with enough concurrency, drive `InMemoryConsumedNonceStore`
+ * up to its `DEFAULT_MAX_ENTRIES` (100k) FIFO cap and start evicting live
+ * entries, same as any other consume-then-release traffic would. That is
+ * cheaper than a real authorization, though still bounded by concurrency and
+ * (unlike the old issuance bug) requires knowing a nonce this server actually
+ * derived, not an arbitrary free GET.
  *
  * ## Many payers, one derived nonce — keyed by `(from, nonce)` (round 1 fix)
  *

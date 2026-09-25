@@ -174,7 +174,24 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     const requirements = buildRequirements(config, resource, { skipPaymentIdGeneration: true })
     for (const requirement of requirements) {
       const merchantEvm = requirement.extra?.merchantEvm as `0x${string}` | undefined
-      if (!merchantEvm) continue // defensive; buildRequirements always sets this
+      if (!merchantEvm) {
+        // Defensive: `types.ts`'s `Ferry402Config.merchantEvm` is a
+        // `Record<SupportedChain, ...>`, not partial, so `buildRequirements`
+        // always sets this in practice — reaching here means config itself
+        // is broken. The old behavior was `continue`, which left this
+        // entry's `extra.paymentId` at `buildRequirements`'
+        // `skipPaymentIdGeneration` all-zero placeholder and published THAT
+        // in the 402 body — strictly worse than the random `paymentId` a
+        // pre-Task-12 `continue` would have left in place, because an
+        // all-zero placeholder looks like a legitimate (if wrong) derived
+        // value rather than an obviously-broken one. A misconfigured
+        // merchant must fail loudly, not silently publish a payable-looking
+        // placeholder.
+        throw new Error(
+          `ferry402: no merchantEvm configured for network "${requirement.network}" - ` +
+            'config.merchantEvm must have an entry for every chain in config.accept.',
+        )
+      }
       const derived = deriveChallenge(config.secret, merchantEvm, resource)
       requirement.extra = { ...requirement.extra, paymentId: derived.paymentId }
     }

@@ -18,13 +18,19 @@
  * it records `(from, nonce)` pairs that were consumed BY A SUCCESSFULLY PAID
  * request (one that passed derivation, every local floor check, AND the
  * facilitator's `/verify`), and rejects a pair already present. Crucially,
- * unlike the old store, THIS one only grows on paid requests — an anonymous
- * GET never touches it, and a malformed/badly-signed `X-PAYMENT` attempt is
- * released again rather than left consumed (see `middleware.ts`'s
- * "consume-before-verify, release-on-failure" section) — so growing this
- * store costs an attacker a real, locally-valid, facilitator-approved
- * authorization, not a free HTTP GET. That asymmetry is the property the
- * old design was missing.
+ * unlike the old store, an anonymous GET never touches it at all, and a
+ * malformed/badly-signed `X-PAYMENT` attempt is `release`d again rather than
+ * left consumed (see `middleware.ts`'s "consume-before-verify,
+ * release-on-failure" section) — so a PERMANENT entry here costs an attacker
+ * a real, locally-valid, facilitator-approved authorization, not a free HTTP
+ * GET. That asymmetry (permanent growth needs a real authorization) is the
+ * property the old design was missing; it is narrower than "this store only
+ * grows on paid requests" — `consumeIfAbsent` runs BEFORE `/verify`, so a
+ * request that only clears the local floor checks still occupies a slot
+ * TRANSIENTLY (until its `release`), and enough concurrent such attempts can
+ * still drive `InMemoryConsumedNonceStore` up to its FIFO cap (see
+ * `DEFAULT_MAX_ENTRIES` below) — see `challengeDerivation.ts`'s doc comment
+ * for the full accounting of what this asymmetry does and does not buy.
  *
  * ## Why `(from, nonce)`, not `nonce` alone (round 1 review fix)
  *

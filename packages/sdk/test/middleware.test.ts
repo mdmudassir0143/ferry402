@@ -474,10 +474,23 @@ describe('ferry402 middleware', () => {
         expect(fetchSpy).toHaveBeenCalledTimes(1)
       })
 
-      it('a checksummed (mixed-case) authorization.from does not defeat replay defense - same address, same key', async () => {
+      it('a checksummed (mixed-case) authorization.from does not defeat replay defense, even against a deliberately case-sensitive custom ConsumedNonceStore - same address, same key', async () => {
+        // Deliberately uses `CaseSensitiveMapConsumedNonceStore`, NOT
+        // `buildApp()`'s default store. The default `InMemoryConsumedNonceStore`
+        // lowercases both halves of its own composite key internally
+        // (`compositeKey` in challengeStore.ts), so a version of this test
+        // built on the default store would pass even if `middleware.ts`
+        // stopped calling `normalizeAddress` entirely — the store's own
+        // internal lowercasing would silently paper over it, and the test
+        // would prove nothing about `normalizeAddress` being load-bearing.
+        // Only a THIRD-PARTY store that does no casing normalization of its
+        // own (like this one) can show that the protection comes from
+        // `ferry402` normalizing `from` before it ever calls the store - the
+        // same reasoning the sibling nonce-casing test above applies to
+        // `normalizeNonce`.
         const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
         globalThis.fetch = fetchSpy as any
-        const server = buildApp()
+        const server = buildApp(config, { consumedNonceStore: new CaseSensitiveMapConsumedNonceStore() })
 
         const challengeRes = await request(server).get('/premium')
         const requirement = challengeRes.body.accepts[0] as PaymentRequirements
@@ -499,6 +512,27 @@ describe('ferry402 middleware', () => {
         expect(replayDifferentCasing.body.error).toBe('payment_expired')
         expect(fetchSpy).toHaveBeenCalledTimes(1)
       })
+    })
+  })
+
+  describe('misconfigured merchantEvm (carry-forward from Task 12 review): fail loudly, never publish a placeholder', () => {
+    it('throws rather than publishing an all-zero paymentId when a network in config.accept has no merchantEvm entry', async () => {
+      // `types.ts`'s `Ferry402Config.merchantEvm` is `Record<SupportedChain,
+      // ...>` and is not partial, so this can only happen via a config that
+      // bypasses the type system (e.g. built from untyped JSON/env vars) -
+      // exactly the case worth defending against, since TypeScript itself
+      // will not catch it. The old behavior here was `continue`, which left
+      // `extra.paymentId` at `buildRequirements`' internal all-zero
+      // placeholder and published THAT in the 402 body - indistinguishable
+      // from a real (if wrong) derived value. This must fail loudly instead.
+      const brokenConfig = {
+        ...config,
+        merchantEvm: { ...config.merchantEvm, 'base-sepolia': undefined },
+      } as unknown as Ferry402Config
+      const handler = ferry402(brokenConfig)
+      const req = fakeGetReq('https://api.test/premium')
+      const res = fakeRes()
+      await expect(handler(req, res, (() => {}) as NextFunction)).rejects.toThrow(/merchantEvm/i)
     })
   })
 

@@ -3,7 +3,7 @@ export { buildRequirements, parsePrice, generatePaymentId } from './requirements
 export type { BuildRequirementsOptions } from './requirements.js'
 export { ferry402 } from './middleware.js'
 export type { Ferry402Options } from './middleware.js'
-export { computeNonce, normalizeNonce } from './nonce.js'
+export { computeNonce, normalizeNonce, normalizeAddress } from './nonce.js'
 export { InMemoryConsumedNonceStore } from './challengeStore.js'
 export type { ConsumedNonceStore } from './challengeStore.js'
 export {
