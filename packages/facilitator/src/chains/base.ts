@@ -43,6 +43,20 @@ export type VerifyInvalidReason =
   | 'invalid_network'
   | 'invalid_payment_requirements'
   | 'unexpected_verify_error'
+  /**
+   * Final whole-branch review, C1: `balanceOf(authorization.from)` on
+   * `requirements.asset` is below `requirements.maxAmountRequired`. This
+   * codebase's architecture is serve-then-settle (the resource is served the
+   * moment `/verify` returns `isValid: true`, before `/settle` ever redeems
+   * anything on-chain — see `packages/sdk/src/middleware.ts`), so a
+   * signature that verifies but can never settle is a FREE resource, not a
+   * safely-caught error: a throwaway keypair with a valid `ReceiveWithAuthorization`
+   * signature and zero balance passed every one of this function's other
+   * checks. This is a real member of x402's own `ErrorReasons` (its
+   * reference exact-evm verifier's `getERC20Balance` produces exactly this),
+   * not a project-specific invention.
+   */
+  | 'insufficient_funds'
 
 /**
  * `Sub`'s only use is as a compile-time assertion that `Sub` is a subtype of
@@ -144,6 +158,37 @@ const SECP256K1N_HALF = SECP256K1N / 2n
  */
 const MAX_UINT256 = 2n ** 256n - 1n
 
+/**
+ * Minimum remaining lifetime, in seconds, `authorization.validBefore` must
+ * still have at the moment `/verify` checks it — final whole-branch review,
+ * C1, mechanism 2. This codebase's architecture is serve-then-settle:
+ * `/verify` approves, the resource is served, and ONLY THEN does
+ * `settlePayment` submit the authorization on-chain (see
+ * `packages/sdk/src/middleware.ts`). An authorization accepted with, say,
+ * one second of remaining lifetime can legitimately expire during that
+ * round trip — RPC latency, mempool inclusion delay, a slow facilitator
+ * under load — and `receiveWithAuthorization` enforces `validBefore` at
+ * REDEMPTION time, not at signing time, so an expired-by-the-time-it-lands
+ * authorization simply reverts. That is exactly the same class of failure
+ * as C1's other two mechanisms: a request that reads as valid at `/verify`
+ * but cannot settle.
+ *
+ * x402's own reference exact-evm facilitator uses a 6-second buffer
+ * (`validAfter/validBefore` are widened by `6` seconds relative to the
+ * client's requested window on the FACILITATOR side of a comparable check).
+ * This codebase uses 10 seconds instead — deliberately larger, not smaller:
+ * `settlePayment` reuses `SETTLE_TRANSPORT_OPTIONS` (10s timeout, 3
+ * retries) for its own submission and then polls `waitForTransactionReceipt`
+ * with no fixed deadline, so the true worst-case gap between a `/verify`
+ * pass and the authorization actually landing on-chain is not bounded by
+ * x402's reference architecture's own latency budget. 10 seconds is not a
+ * guarantee against every possible delay (nothing short of re-verifying
+ * immediately before submission would be), but it closes the specific,
+ * easily-reachable failure mode this check exists for: a client requesting
+ * (or a facilitator accepting) a validBefore only a second or two out.
+ */
+const VERIFY_SETTLEMENT_BUFFER_SECONDS = 10n
+
 const RECEIVE_WITH_AUTHORIZATION_TYPES = {
   ReceiveWithAuthorization: [
     { name: 'from', type: 'address' },
@@ -158,6 +203,30 @@ const RECEIVE_WITH_AUTHORIZATION_TYPES = {
 const DOMAIN_ABI = [
   { type: 'function', name: 'name', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { type: 'function', name: 'version', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
+] as const
+
+/**
+ * The one ERC20 read `verifyPayment`'s payer-balance check needs (C1) —
+ * `balanceOf`, nothing else. Deliberately its own tiny ABI rather than a
+ * reuse of `ESCROW_SETTLE_ABI` (which describes `Escrow`, not the token) or
+ * a pull-in of a full ERC20 interface this module has no other use for.
+ */
+const ERC20_BALANCE_ABI = [
+  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
+] as const
+
+/**
+ * The one read `verifyPayment`'s escrow↔asset binding check needs (C1) —
+ * `Escrow.sol`'s public getter for its `immutable token`. Kept separate from
+ * `ESCROW_SETTLE_ABI` below (used only by `settlePayment`, for the
+ * settlement call itself) so this module's two RPC surfaces against the
+ * escrow — "what token is this bound to" (verify-time, cheap, memoizable)
+ * and "redeem this authorization" (settle-time) — stay independently
+ * readable, the same way `DOMAIN_ABI` is kept separate from `ERC1271_ABI`
+ * above.
+ */
+const ESCROW_TOKEN_ABI = [
+  { type: 'function', name: 'token', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
 ] as const
 
 const SUPPORTED_CHAINS = { base, 'base-sepolia': baseSepolia } as const
@@ -421,6 +490,16 @@ interface CachedClient {
 
 const clientCache = new Map<string, CachedClient>()
 const domainCache = new Map<string, { name: string; version: string }>()
+/**
+ * `Escrow.sol`'s `token` field is `immutable` — fixed forever at deployment,
+ * never mutable state — so, exactly like `domainCache` above, it is safe to
+ * cache for the life of this process once read once per `(chainId, rpcUrl,
+ * escrow)` triple. This is the ONE part of C1's new checks that IS safe to
+ * cache; the payer-balance check deliberately is not (see
+ * `verifyPayment`'s own comment at its call site) — a real ERC20 balance
+ * changes over time, an escrow's bound token never does.
+ */
+const escrowTokenCache = new Map<string, Address>()
 
 // `profile` is part of the key: `/verify` and `/settle` deliberately use
 // DIFFERENT transport tuning (see `VERIFY_TRANSPORT_OPTIONS`/
@@ -434,6 +513,13 @@ function clientCacheKey(network: string, rpcUrl: string | undefined, profile: Cl
 
 function domainCacheKey(chainId: number, rpcUrl: string | undefined, asset: Address): string {
   return `${chainId}::${rpcUrl ?? ''}::${asset.toLowerCase()}`
+}
+
+// Same shape as `domainCacheKey` (and same `rpcUrl`-collision reasoning —
+// see that key's own doc comment above), keyed by the ESCROW's address
+// rather than the asset's.
+function escrowTokenCacheKey(chainId: number, rpcUrl: string | undefined, escrow: Address): string {
+  return `${chainId}::${rpcUrl ?? ''}::${escrow.toLowerCase()}`
 }
 
 async function getVerifiedClient(
@@ -492,6 +578,62 @@ async function getTokenDomain(
     const domain = { name, version }
     domainCache.set(key, domain)
     return domain
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Reads `escrow.token()` — the token address `Escrow.sol`'s `immutable
+ * token` was constructed with — memoized exactly like `getTokenDomain`
+ * above, for the identical reason (immutable on-chain state never changes
+ * for the life of the contract). C1's mechanism 3: the trusted-escrow
+ * allowlist (`VerifyOptions.escrows`) proves `payTo` is a facilitator-owned
+ * `Escrow` deployment; it proves nothing about whether `requirements.asset`
+ * — the token whose EIP-712 domain this module is about to read and build a
+ * signing digest against — is the SAME token that escrow will actually try
+ * to pull funds from at settlement. A mistyped `config.assets[chain]`
+ * (pointing `asset` at some OTHER token entirely) would otherwise verify a
+ * signature against the wrong token's domain while still passing every
+ * other check, then revert at `/settle` on every single request — a
+ * silent, total, misconfiguration-triggered "free resource" bug this read
+ * closes off.
+ */
+async function getEscrowToken(
+  client: ReturnType<typeof createChainClient>,
+  chainId: number,
+  rpcUrl: string | undefined,
+  escrow: Address,
+): Promise<Address | undefined> {
+  const key = escrowTokenCacheKey(chainId, rpcUrl, escrow)
+  const cached = escrowTokenCache.get(key)
+  if (cached) return cached
+  try {
+    const token = await client.readContract({ address: escrow, abi: ESCROW_TOKEN_ABI, functionName: 'token' })
+    escrowTokenCache.set(key, token)
+    return token
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Reads `token.balanceOf(account)` live — NEVER cached, and this is
+ * deliberate, not an oversight (C1's own guidance: "cache the client, not
+ * the balance — balances change"). Every other RPC read this module caches
+ * (`{name, version}`, `escrow.token()`, the chain-id check) is immutable for
+ * the life of the contract; a payer's balance is exactly the opposite — it
+ * changes on every incoming/outgoing transfer, including ones this very
+ * facilitator's own `/settle` calls trigger. Memoizing this would let a
+ * payer who had funds at their FIRST `/verify` call keep passing every
+ * subsequent one after spending them elsewhere, defeating the entire point
+ * of the check. What IS reused here is the already-cached `client` (see
+ * `getVerifiedClient`) — only the underlying RPC connection is amortized,
+ * never the answer.
+ */
+async function getErc20Balance(client: ReturnType<typeof createChainClient>, asset: Address, account: Address): Promise<bigint | undefined> {
+  try {
+    return await client.readContract({ address: asset, abi: ERC20_BALANCE_ABI, functionName: 'balanceOf', args: [account] })
   } catch {
     return undefined
   }
@@ -782,7 +924,12 @@ export async function verifyPayment(
   if (validAfter > nowSeconds) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_after' }
   }
-  if (validBefore <= nowSeconds) {
+  // Buffered, not a bare `validBefore <= nowSeconds` — see
+  // `VERIFY_SETTLEMENT_BUFFER_SECONDS`'s doc comment (C1, mechanism 2). This
+  // strictly subsumes the un-buffered check (the buffer is positive), so an
+  // already-expired authorization is still rejected with the identical
+  // reason as before.
+  if (validBefore <= nowSeconds + VERIFY_SETTLEMENT_BUFFER_SECONDS) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_authorization_valid_before' }
   }
 
@@ -833,6 +980,22 @@ export async function verifyPayment(
     return { isValid: false, invalidReason: 'unexpected_verify_error' }
   }
 
+  // 7. Escrow ↔ asset binding (final whole-branch review, C1, mechanism 3).
+  // Check 1's allowlist proves `payTo`/`trustedEscrow` is THIS facilitator's
+  // own `Escrow` deployment; it proves nothing about whether
+  // `requirements.asset` — the token whose domain this function is about to
+  // read and sign a digest against — is the SAME token that escrow will
+  // actually try to redeem from at settlement. Run before the (cached, but
+  // still meaningfully wasted on a doomed request) domain lookup below, and
+  // memoized exactly like that lookup — see `getEscrowToken`'s doc comment.
+  const escrowToken = await getEscrowToken(client, chain.id, options.rpcUrl, getAddress(trustedEscrow))
+  if (!escrowToken) {
+    return { isValid: false, invalidReason: 'unexpected_verify_error' }
+  }
+  if (!addressesEqual(escrowToken, assetAddress)) {
+    return { isValid: false, invalidReason: 'invalid_payment_requirements' }
+  }
+
   const tokenDomain = await getTokenDomain(client, chain.id, options.rpcUrl, assetAddress)
   if (!tokenDomain) {
     return { isValid: false, invalidReason: 'unexpected_verify_error' }
@@ -864,6 +1027,29 @@ export async function verifyPayment(
   }
   if (!addressesEqual(recovered.signer, authorization.from)) {
     return { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' }
+  }
+
+  // 8. Payer solvency (final whole-branch review, C1, mechanism 1) — THE
+  // headline fix. Every check above proves the SIGNATURE is genuine; none of
+  // them proves the authorization can ever actually be REDEEMED.
+  // Serve-then-settle (this codebase's architecture — see
+  // `packages/sdk/src/middleware.ts`) means the resource is served the
+  // instant this function returns `isValid: true`, before `/settle` submits
+  // anything on-chain: a zero-balance payer with an otherwise perfectly
+  // valid signature costs nothing to produce (no ETH, no USDC, not even an
+  // on-chain trace) and would previously pass every check here, making the
+  // resource free, repeatably, for anyone who can generate a keypair. x402's
+  // own reference exact-evm verifier performs this identical check
+  // (`getERC20Balance` → `insufficient_funds`); this was the one check this
+  // module never had. Deliberately NOT cached — see `getErc20Balance`'s doc
+  // comment for why a balance, unlike everything else this module memoizes,
+  // must be read fresh on every single call.
+  const payerBalance = await getErc20Balance(client, assetAddress, authorization.from as Address)
+  if (payerBalance === undefined) {
+    return { isValid: false, invalidReason: 'unexpected_verify_error' }
+  }
+  if (payerBalance < requiredValue) {
+    return { isValid: false, invalidReason: 'insufficient_funds' }
   }
 
   return { isValid: true, payer: recovered.signer, signatureKind: recovered.kind }
@@ -976,9 +1162,8 @@ const SETTLE_GAS_LIMIT = 500_000n
  * union is checked against below.
  */
 export type SettleInvalidReason =
-  | VerifyInvalidReason
+  | VerifyInvalidReason // `insufficient_funds` is already a member here (C1)
   | 'unexpected_settle_error'
-  | 'insufficient_funds'
   | 'duplicate_settlement'
 
 // See `_VerifyInvalidReasonIsSubsetOfX402ErrorReasons` above for why this

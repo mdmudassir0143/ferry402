@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
-import { createPublicClient, createWalletClient, http, type Address, type Hex } from 'viem'
+import { createPublicClient, createTestClient, createWalletClient, http, type Address, type Hex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { foundry } from 'viem/chains'
 import { domainTokenAbi, domainTokenBytecode } from '../fixtures/DomainToken.abi.js'
 import { escrowAbi, escrowBytecode } from '../fixtures/Escrow.abi.js'
 import { settleTokenAbi, settleTokenBytecode } from '../fixtures/SettleToken.abi.js'
+import { ESCROW_ADDRESS } from './fixtures.js'
 
 /**
  * anvil's well-known default account #0/#1/#2 private keys, derived from its
@@ -114,6 +115,19 @@ export interface AnvilFixture {
 }
 
 /**
+ * Minted to `ANVIL_PAYER_ADDRESS` by `startAnvilWithDomainToken` by default
+ * (final whole-branch review, C1) — comfortably larger than any
+ * `maxAmountRequired`/`value` this test suite's `DomainToken`-based fixtures
+ * ever use (typically `'1000000'`, i.e. 1 unit at 6 decimals), so every
+ * EXISTING test that expects `isValid: true` keeps passing now that
+ * `verifyPayment` reads the payer's live balance. Pass `payerInitialBalance:
+ * 0n` to deliberately construct the opposite: a zero-balance payer with an
+ * otherwise perfectly valid signature (the `insufficient_funds` regression
+ * test).
+ */
+const DEFAULT_DOMAIN_TOKEN_PAYER_BALANCE = 1_000_000_000n
+
+/**
  * Spins up a local, freshly-genesis'd anvil chain — NOT a fork of live Base
  * Sepolia — and deploys the `DomainToken` test fixture to it.
  *
@@ -135,11 +149,28 @@ export interface AnvilFixture {
  * network every other test in this suite uses. Pass a different value only
  * to deliberately construct a chain-id MISMATCH (see the I2 review-fix
  * tests), which is the one case that needs anything else.
+ *
+ * Also deploys a REAL `Escrow` bound to this `DomainToken` and mints
+ * `payerInitialBalance` of it to `ANVIL_PAYER_ADDRESS` (final whole-branch
+ * review, C1): `verifyPayment` now reads both `escrow.token()` (asset ↔
+ * escrow binding) and `balanceOf(authorization.from)` (payer solvency)
+ * live from chain on every call, so a fixture that used to get away with a
+ * fake, undeployed `payTo` (every caller in this test suite already
+ * hardcodes `ESCROW_ADDRESS`/`DEFAULT_ESCROWS` from `./fixtures.js`) no
+ * longer can. Rather than update every one of those call sites, the freshly
+ * deployed `Escrow`'s OWN runtime bytecode — which already has its
+ * `immutable token` value baked in from the constructor run, see
+ * `Escrow.sol`'s `token` field — is copied via `anvil_setCode` onto that
+ * SAME fixed `ESCROW_ADDRESS` every existing fixture already references, so
+ * every pre-existing `payTo`/`escrows` reference keeps working unchanged
+ * while actually resolving to a real, correctly-bound contract.
  */
 export async function startAnvilWithDomainToken(params: {
   name: string
   version: string
   chainId?: number
+  /** See `DEFAULT_DOMAIN_TOKEN_PAYER_BALANCE`'s doc comment. */
+  payerInitialBalance?: bigint
 }): Promise<AnvilFixture> {
   const requestedChainId = params.chainId ?? BASE_SEPOLIA_CHAIN_ID
   const port = await getFreePort()
@@ -170,11 +201,44 @@ export async function startAnvilWithDomainToken(params: {
     await stopChild(child)
     throw new Error('DomainToken deployment produced no contract address')
   }
+  const tokenAddress = receipt.contractAddress
   const chainId = await publicClient.getChainId()
+
+  const payerInitialBalance = params.payerInitialBalance ?? DEFAULT_DOMAIN_TOKEN_PAYER_BALANCE
+  if (payerInitialBalance > 0n) {
+    const mintHash = await walletClient.writeContract({
+      address: tokenAddress,
+      abi: domainTokenAbi,
+      functionName: 'mint',
+      args: [ANVIL_PAYER_ADDRESS, payerInitialBalance],
+    })
+    await publicClient.waitForTransactionReceipt({ hash: mintHash })
+  }
+
+  // Deploy the real Escrow, then relocate its runtime code onto the fixed
+  // ESCROW_ADDRESS every existing fixture already hardcodes — see this
+  // function's own doc comment for why.
+  const escrowDeployHash = await walletClient.deployContract({
+    abi: escrowAbi,
+    bytecode: escrowBytecode,
+    args: [tokenAddress],
+  })
+  const escrowReceipt = await publicClient.waitForTransactionReceipt({ hash: escrowDeployHash })
+  if (!escrowReceipt.contractAddress) {
+    await stopChild(child)
+    throw new Error('Escrow deployment produced no contract address')
+  }
+  const escrowRuntimeCode = await publicClient.getCode({ address: escrowReceipt.contractAddress })
+  if (!escrowRuntimeCode) {
+    await stopChild(child)
+    throw new Error('failed to read back deployed Escrow runtime bytecode')
+  }
+  const testClient = createTestClient({ mode: 'anvil', chain: foundry, transport: http(rpcUrl) })
+  await testClient.setCode({ address: ESCROW_ADDRESS, bytecode: escrowRuntimeCode })
 
   return {
     rpcUrl,
-    tokenAddress: receipt.contractAddress,
+    tokenAddress,
     chainId,
     stop: () => stopChild(child),
   }

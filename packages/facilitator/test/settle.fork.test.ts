@@ -174,8 +174,23 @@ describe('settlePayment', () => {
   // actually ran. A call to a CODELESS address is a no-op at the EVM level --
   // it mines cleanly, with `status: 'success'` and no logs at all -- and
   // moves nothing. `Escrow._safeTransfer` already defends this exact hazard
-  // one layer down for `withdraw`'s token address; this proves `settlePayment`
-  // does not reintroduce it one layer up for a caller-supplied `payTo`.
+  // one layer down for `withdraw`'s token address; this originally proved
+  // `settlePayment`'s OWN receipt-log check caught it too, as a second-layer
+  // defense exercised AFTER a transaction was actually mined.
+  //
+  // Final whole-branch review, C1, mechanism 3 supersedes that mechanism for
+  // this specific fixture: `verifyPayment` now reads `escrow.token()` before
+  // a wallet client is even constructed, and a codeless address has no
+  // `token()` to read -- so this exact scenario is now rejected at
+  // `/verify`, before a transaction is ever built, let alone sent. That is a
+  // STRICTLY earlier and cheaper rejection than the original receipt-log
+  // check (no gas spent at all, versus a mined-but-inert transaction). The
+  // receipt-log check itself is still live -- it still covers the residual
+  // case a codeless address cannot: a hostile contract that DOES implement
+  // `token()` correctly but still forges or omits its settlement (see
+  // "rejects a forged PaymentSettled log..." below, whose fixture now
+  // constructs `HostileEscrow` with a matching `token()` specifically so it
+  // still reaches that deeper check).
   it('never reports success for an authorization sent to a codeless address', async () => {
     const paymentId = freshPaymentId()
     const codelessAddress: Address = '0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de'
@@ -184,23 +199,23 @@ describe('settlePayment', () => {
     const payload = buildPayload({ network: 'base-sepolia', signature, authorization: auth })
     const reqs = requirements(paymentId, { payTo: codelessAddress })
 
+    const nonceBefore = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
     // Escrows overridden to TRUST the codeless address itself (task-8 review
-    // round 2): with the round-2 allowlist in place, an UNTRUSTED payTo like
-    // this is now rejected off-chain before ever reaching this check (see
-    // the dedicated allowlist tests below) -- this override simulates an
-    // operator who has (mistakenly) configured their trusted escrow to be
-    // this codeless address, so the C1 receipt-log check below is still
-    // exercised on its own, as the independent safety net it's meant to be.
+    // round 2): simulates an operator who has (mistakenly) configured their
+    // trusted escrow to be a codeless address.
     const result = await settle(payload, reqs, { escrows: { 'base-sepolia': codelessAddress } })
+    const nonceAfter = await publicClient.getTransactionCount({ address: FACILITATOR_ADDRESS })
 
     expect(result.success).toBe(false)
-    expect(result.errorReason).toBe('unexpected_settle_error')
-    // The transaction really was mined and did NOT revert -- the whole point
-    // is that this alone must never be read as a settled payment.
-    expect(result.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
-    const receipt = await publicClient.getTransactionReceipt({ hash: result.transaction as Hex })
-    expect(receipt.status).toBe('success')
-    expect(receipt.logs.length).toBe(0)
+    // Not `unexpected_settle_error` any more: `verifyPayment`'s own
+    // escrow↔asset check (C1) rejects a codeless escrow before `settlePayment`
+    // ever gets far enough to construct, let alone submit, a transaction.
+    expect(result.errorReason).toBe('unexpected_verify_error')
+    expect(result.transaction).toBe('')
+    // The load-bearing assertion: no transaction was EVER sent -- strictly
+    // stronger than the original "sent, mined, but correctly recognized as a
+    // no-op" guarantee this test used to check.
+    expect(nonceAfter).toBe(nonceBefore)
   })
 
   it('reverts MerchantNotBound on-chain for an authorization submitted against the wrong merchant', async () => {
@@ -349,7 +364,11 @@ describe('settlePayment', () => {
     // log. The allowlist must reject it WITHOUT ever finding that out.
     const deployer = privateKeyToAccount(FACILITATOR_PRIVATE_KEY)
     const walletClient = createWalletClient({ account: deployer, chain: foundry, transport: http(anvil.rpcUrl) })
-    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [] })
+    // `args: [anvil.tokenAddress]` -- HostileEscrow's `token()` getter (C1)
+    // now needs to match `requirements.asset` so `verifyPayment`'s escrow↔asset
+    // check doesn't reject this fixture before the scenario under test even
+    // gets a chance to run.
+    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [anvil.tokenAddress] })
     const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
     if (!deployReceipt.contractAddress) throw new Error('HostileEscrow deployment produced no contract address')
     const hostileAddress = deployReceipt.contractAddress
@@ -404,7 +423,11 @@ describe('settlePayment', () => {
     // trusts it); the cross-check catches it from the log's contents.
     const deployer = privateKeyToAccount(FACILITATOR_PRIVATE_KEY)
     const walletClient = createWalletClient({ account: deployer, chain: foundry, transport: http(anvil.rpcUrl) })
-    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [] })
+    // `args: [anvil.tokenAddress]` -- HostileEscrow's `token()` getter (C1)
+    // now needs to match `requirements.asset` so `verifyPayment`'s escrow↔asset
+    // check doesn't reject this fixture before the scenario under test even
+    // gets a chance to run.
+    const deployHash = await walletClient.deployContract({ abi: hostileEscrowAbi, bytecode: hostileEscrowBytecode, args: [anvil.tokenAddress] })
     const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployHash })
     if (!deployReceipt.contractAddress) throw new Error('HostileEscrow deployment produced no contract address')
     const hostileAddress = deployReceipt.contractAddress

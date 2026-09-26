@@ -22,6 +22,21 @@ pragma solidity ^0.8.24;
 ///         even bother forging those correctly, to make the point that it
 ///         doesn't need to for the ALLOWLIST test -- the allowlist rejects
 ///         this contract without ever inspecting a log).
+///
+///         `token` (final whole-branch review, C1, mechanism 3): a public
+///         immutable getter with the exact same shape as `Escrow.sol`'s own
+///         `token`. Added so this fixture can still reach `settlePayment`'s
+///         on-chain submission at all once `verifyPayment` itself started
+///         reading `escrow.token()` and rejecting any escrow that doesn't
+///         expose one matching `requirements.asset` -- a fixture with NO
+///         `token()` getter (this contract's original shape) is now caught
+///         at `/verify`, before ever reaching the deeper defenses this
+///         fixture exists to exercise. Constructed with the SAME real token
+///         address the test's `requirements.asset` names, so the escrow↔asset
+///         check passes and execution proceeds to actually attempt
+///         settlement against this contract -- which is the scenario this
+///         fixture is for: a hostile contract that looks bindable at
+///         `/verify` but forges its settlement result.
 contract HostileEscrow {
     struct Authorization {
         address from;
@@ -32,7 +47,13 @@ contract HostileEscrow {
         bytes32 nonce;
     }
 
+    address public immutable token;
+
     event PaymentSettled(address indexed merchant, address indexed payer, uint256 value, bytes32 nonce);
+
+    constructor(address token_) {
+        token = token_;
+    }
 
     /// @notice Same external ABI shape as `Escrow.settleAuthorization` (see
     ///         `packages/contracts/src/Escrow.sol`), so a caller that
