@@ -1,11 +1,32 @@
 {
   "name": "@ferry402/sdk",
   "version": "0.1.0",
-  "private": false,
+  "description": "Accept x402 payments from users on other chains. Non-custodial escrow settlement with Hedera Consensus Service as the clearing ledger.",
+  "keywords": [
+    "x402",
+    "payments",
+    "hedera",
+    "base",
+    "usdc",
+    "eip-3009",
+    "eip-1271",
+    "agent-payments",
+    "micropayments"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdmudassir0143/ferry402.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://github.com/mdmudassir0143/ferry402#readme",
+  "bugs": {
+    "url": "https://github.com/mdmudassir0143/ferry402/issues"
+  },
   "type": "module",
-  "engines": { "node": ">=20.18.3" },
-  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,12 +35,16 @@
     },
     "./package.json": "./package.json"
   },
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "files": [
     "dist"
   ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.18.3"
+  },
   "scripts": {
     "test": "vitest run",
     "build": "tsc -p tsconfig.json",
@@ -41,5 +66,6 @@
     "typescript": "^5.7.3",
     "viem": "^2.56.8",
     "vitest": "^3.0.5"
-  }
+  },
+  "private": false
 }
