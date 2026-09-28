@@ -126,7 +126,7 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
         'ferry402', 'buildRequirements', 'parsePrice', 'generatePaymentId',
         'computeNonce', 'normalizeNonce', 'normalizeAddress',
         'assertValidSecret', 'deriveChallenge', 'matchChallenge', 'derivePaymentId', 'timeBucket',
-        'InMemoryConsumedNonceStore',
+        'InMemoryConsumedNonceStore', 'createPaymentHeader',
       ]
       for (const name of expectedFunctions) {
         assert.equal(typeof sdk[name], 'function', \`expected sdk.\${name} to be a function, got \${typeof sdk[name]}\`)
@@ -147,6 +147,28 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       assert.equal(sdk.computeNonce(merchantEvm, challenge.paymentId), challenge.nonce)
       assert.equal(sdk.normalizeAddress(merchantEvm), merchantEvm.toLowerCase())
 
+      // I5: createPaymentHeader signs against the DERIVED nonce, exercised
+      // here with a bare-bones fake EIP3009Signer (no viem installed in
+      // this throwaway consumer dir) rather than a real account - proving
+      // the built package's own export threads computeNonce correctly is
+      // the point, not re-proving EIP-712 signature recovery (that's
+      // paymentHeader.test.ts, against the real source, with viem).
+      const fakeSigner = {
+        address: merchantEvm,
+        async signTypedData() { return '0x' + 'ab'.repeat(65) },
+      }
+      const requirement = {
+        scheme: 'exact', network: 'base-sepolia', maxAmountRequired: '10000',
+        resource: 'https://example.test/premium', description: 'x', mimeType: 'application/json',
+        payTo: merchantEvm, maxTimeoutSeconds: 300, asset: merchantEvm,
+        extra: { merchantEvm, paymentId: challenge.paymentId },
+      }
+      const header = await sdk.createPaymentHeader(requirement, fakeSigner, {
+        tokenName: 'USDC', tokenVersion: '2', chainId: 84532,
+      })
+      const decodedPayload = JSON.parse(Buffer.from(header, 'base64').toString('utf8'))
+      assert.equal(decodedPayload.payload.authorization.nonce, challenge.nonce)
+
       console.log('SMOKE_OK')
     `
     const scriptPath = join(consumerDir, 'smoke.mjs')
@@ -160,13 +182,14 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       import {
         ferry402, buildRequirements, parsePrice, generatePaymentId,
         computeNonce, normalizeNonce, normalizeAddress,
-        InMemoryConsumedNonceStore,
+        InMemoryConsumedNonceStore, createPaymentHeader,
         assertValidSecret, deriveChallenge, matchChallenge, derivePaymentId, timeBucket,
         MIN_SECRET_BYTES, TIME_BUCKET_SECONDS,
       } from '@ferry402/sdk'
       import type {
         Ferry402Config, SupportedChain, PaymentRequirements,
         BuildRequirementsOptions, Ferry402Options, ConsumedNonceStore, DerivedChallenge,
+        EIP3009Signer, CreatePaymentHeaderOptions,
       } from '@ferry402/sdk'
 
       const chain: SupportedChain = 'base-sepolia'
@@ -198,12 +221,20 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       generatePaymentId()
       parsePrice('$0.01')
 
+      const fakeSigner: EIP3009Signer = {
+        address: zeroAddr,
+        async signTypedData() { return zeroAddr.padEnd(132, '0') as \`0x\${string}\` },
+      }
+      const headerOpts: CreatePaymentHeaderOptions = { tokenName: 'USDC', tokenVersion: '2', chainId: 84532 }
+      const headerPromise: Promise<string> = createPaymentHeader(reqs[0], fakeSigner, headerOpts)
+
       void handler
       void opts
       void store
       void reqs
       void MIN_SECRET_BYTES
       void TIME_BUCKET_SECONDS
+      void headerPromise
     `
     writeFileSync(join(consumerDir, 'types-check.ts'), tsScript)
     writeFileSync(

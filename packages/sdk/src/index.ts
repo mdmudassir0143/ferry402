@@ -6,6 +6,8 @@ export type { Ferry402Options } from './middleware.js'
 export { computeNonce, normalizeNonce, normalizeAddress } from './nonce.js'
 export { InMemoryConsumedNonceStore } from './challengeStore.js'
 export type { ConsumedNonceStore } from './challengeStore.js'
+export { createPaymentHeader } from './paymentHeader.js'
+export type { EIP3009Signer, CreatePaymentHeaderOptions } from './paymentHeader.js'
 export {
   assertValidSecret,
   deriveChallenge,

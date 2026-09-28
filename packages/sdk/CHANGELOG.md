@@ -1,6 +1,6 @@
 # @ferry402/sdk
 
-## Unreleased
+## 0.1.0
 
 ### Breaking
 
@@ -30,6 +30,18 @@
   incorporate both fields, not `nonce` alone, or it will reject distinct
   payers as replays of each other.
 
+### Added
+
+- `createPaymentHeader(requirement, signer, options)` — a client-side helper
+  that derives the merchant-bound nonce (`computeNonce`) and signs the
+  EIP-3009 `ReceiveWithAuthorization` for a `PaymentRequirements` entry,
+  returning the base64 `X-PAYMENT` header value. Added because **no stock
+  x402 client can pay a ferry402 route**: `x402@1.2.0`'s own client helpers
+  mint a random nonce, and ferry402's merchant-binding fix (deriving the
+  nonce from `(merchantEvm, paymentId)` instead) means a random nonce never
+  matches a challenge ferry402 issued. This is the one supported way to pay
+  a ferry402 route until a dedicated client package exists.
+
 ### Fixed
 
 - `issueChallenge` now throws instead of silently `continue`-ing when a
@@ -49,3 +61,7 @@
   claimed. Proven by `test/consume-built-package.test.ts`, which packs the
   built artifact, installs the tarball into a directory outside this
   workspace, and imports it from plain Node.
+- The published tarball now includes `README.md` and `LICENSE` (previously
+  neither was present — `npm pack --dry-run` showed 22 files, all `dist/**`
+  plus `package.json`, so the npm page would have rendered blank and the
+  MIT license text would not have been distributed with the package).
