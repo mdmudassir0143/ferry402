@@ -1,4 +1,4 @@
-# anychain402 — Plan 1: Base Vertical Slice
+# ferry402 — Plan 1: Base Vertical Slice
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Foundry (Solidity 0.8.24), TypeScript 5.x, pnpm workspaces, Express, viem, `@hashgraph/sdk`, Vitest.
 
-**Spec:** `docs/superpowers/specs/2026-09-23-anychain402-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-23-ferry402-design.md`
 
 ## Global Constraints
 
@@ -61,7 +61,7 @@ packages/
     src/index.ts              public exports
     src/middleware.ts         Express middleware; emits multi-entry accepts
     src/requirements.ts       builds PaymentRequirements[] from config
-    src/types.ts              Anychain402Config and friends
+    src/types.ts              Ferry402Config and friends
     test/*.test.ts
   facilitator/
     src/server.ts             Express app: /verify, /settle
@@ -101,7 +101,7 @@ EOF
 
 ```json
 {
-  "name": "anychain402",
+  "name": "ferry402",
   "private": true,
   "license": "MIT",
   "engines": { "node": ">=20.18.3" },
@@ -453,9 +453,9 @@ git add packages/contracts && git commit -m "test(contracts): replay fuzzing and
 **Interfaces:**
 - Consumes: nothing from earlier tasks
 - Produces:
-  - `type Anychain402Config = { price: string; accept: SupportedChain[]; settleTo: 'hedera'; merchant: string; facilitator: string; escrows: Record<SupportedChain, \`0x${string}\`>; assets: Record<SupportedChain, \`0x${string}\`> }`
+  - `type Ferry402Config = { price: string; accept: SupportedChain[]; settleTo: 'hedera'; merchant: string; facilitator: string; escrows: Record<SupportedChain, \`0x${string}\`>; assets: Record<SupportedChain, \`0x${string}\`> }`
   - `type SupportedChain = 'base' | 'base-sepolia' | 'polygon' | 'polygon-amoy'`
-  - `buildRequirements(config: Anychain402Config, resource: string): PaymentRequirements[]`
+  - `buildRequirements(config: Ferry402Config, resource: string): PaymentRequirements[]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -501,13 +501,13 @@ describe('buildRequirements', () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement `requirements.ts`**
 
 ```ts
-import type { Anychain402Config, PaymentRequirements } from './types'
+import type { Ferry402Config, PaymentRequirements } from './types'
 
 const USDC_DECIMALS = 6
 
@@ -520,7 +520,7 @@ export function parsePrice(price: string): string {
 }
 
 export function buildRequirements(
-  config: Anychain402Config,
+  config: Ferry402Config,
   resource: string,
 ): PaymentRequirements[] {
   const maxAmountRequired = parsePrice(config.price)
@@ -541,7 +541,7 @@ export function buildRequirements(
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Verify the testnet USDC addresses before relying on them**
@@ -570,8 +570,8 @@ git add packages/sdk && git commit -m "feat(sdk): build multi-chain PaymentRequi
 - Test: `packages/sdk/test/middleware.test.ts`
 
 **Interfaces:**
-- Consumes: `buildRequirements`, `Anychain402Config` from Task 5
-- Produces: `anychain402(config: Anychain402Config): RequestHandler`
+- Consumes: `buildRequirements`, `Ferry402Config` from Task 5
+- Produces: `ferry402(config: Ferry402Config): RequestHandler`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -579,13 +579,13 @@ git add packages/sdk && git commit -m "feat(sdk): build multi-chain PaymentRequi
 import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
-import { anychain402 } from '../src'
+import { ferry402 } from '../src'
 
 function appWith(verifyResult: any) {
   globalThis.fetch = vi.fn(async () =>
     new Response(JSON.stringify(verifyResult), { status: 200 })) as any
   const app = express()
-  app.use('/premium', anychain402(config as any))
+  app.use('/premium', ferry402(config as any))
   app.get('/premium', (_req, res) => res.json({ ok: true }))
   return app
 }
@@ -614,17 +614,17 @@ it('returns 402 with the reason when verification fails', async () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/sdk test`
-Expected: FAIL — `anychain402` not exported.
+Run: `pnpm --filter @ferry402/sdk test`
+Expected: FAIL — `ferry402` not exported.
 
 - [ ] **Step 3: Implement the middleware**
 
 ```ts
 import type { Request, Response, NextFunction, RequestHandler } from 'express'
 import { buildRequirements } from './requirements'
-import type { Anychain402Config } from './types'
+import type { Ferry402Config } from './types'
 
-export function anychain402(config: Anychain402Config): RequestHandler {
+export function ferry402(config: Ferry402Config): RequestHandler {
   return async (req: Request, res: Response, next: NextFunction) => {
     const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`
     const accepts = buildRequirements(config, resource)
@@ -669,7 +669,7 @@ export function anychain402(config: Anychain402Config): RequestHandler {
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/sdk test`
+Run: `pnpm --filter @ferry402/sdk test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Commit**
@@ -723,7 +723,7 @@ it('accepts a well-formed authorization signed by the payer', async () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test`
+Run: `pnpm --filter @ferry402/facilitator test`
 Expected: FAIL — `verifyPayment` not defined.
 
 - [ ] **Step 3: Implement verification**
@@ -738,7 +738,7 @@ enum on the first failure.
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test`
+Run: `pnpm --filter @ferry402/facilitator test`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Commit**
@@ -782,7 +782,7 @@ Run this against an anvil fork: `anvil --fork-url https://sepolia.base.org`.
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test settle`
+Run: `pnpm --filter @ferry402/facilitator test settle`
 Expected: FAIL — `settlePayment` not defined.
 
 - [ ] **Step 3: Implement settlement**
@@ -794,7 +794,7 @@ funded from `FACILITATOR_PRIVATE_KEY`, wait for the receipt, and return the
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test settle`
+Run: `pnpm --filter @ferry402/facilitator test settle`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -834,7 +834,7 @@ it('rejects an entry missing its originating txHash', () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `pnpm --filter @anychain402/facilitator test journal`
+Run: `pnpm --filter @ferry402/facilitator test journal`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the writer**
@@ -846,7 +846,7 @@ from `@hashgraph/sdk`, using a client built from `HEDERA_ACCOUNT_ID` and
 
 - [ ] **Step 4: Run and confirm passing**
 
-Run: `pnpm --filter @anychain402/facilitator test journal`
+Run: `pnpm --filter @ferry402/facilitator test journal`
 Expected: PASS, 2 tests.
 
 - [ ] **Step 5: Commit**
@@ -882,13 +882,13 @@ Record the address in `.env.example` as a comment, not as a secret.
 - [ ] **Step 2: Create the HCS topic**
 
 ```bash
-pnpm --filter @anychain402/facilitator exec tsx scripts/create-topic.ts
+pnpm --filter @ferry402/facilitator exec tsx scripts/create-topic.ts
 ```
 Expected: prints a topic id like `0.0.xxxxxxx`. Record it.
 
 - [ ] **Step 3: Write the end-to-end test**
 
-Start the facilitator, start a demo Express app using `anychain402`, then:
+Start the facilitator, start a demo Express app using `ferry402`, then:
 request without payment and assert 402 with two `accepts` entries; sign a real
 EIP-3009 authorization with a funded Base Sepolia key; retry with `X-PAYMENT`;
 assert 200. Then assert `escrow.balanceOf(merchant)` increased and that the HCS
@@ -896,7 +896,7 @@ topic gained a message whose `txHash` matches the settlement transaction.
 
 - [ ] **Step 4: Run it**
 
-Run: `pnpm --filter @anychain402/facilitator test e2e`
+Run: `pnpm --filter @ferry402/facilitator test e2e`
 Expected: PASS. Capture the settlement tx hash and the Hashscan topic URL.
 
 - [ ] **Step 5: Write the README**
@@ -928,6 +928,137 @@ network enum. Options: contribute the network upstream, fork the schema, or drop
 Arbitrum from v1. Decide before Plan 3 begins, not during it.
 
 **Type consistency.** `Authorization` is spelled identically in Tasks 2, 3, 4, 7
-and 8. `buildRequirements` and `Anychain402Config` from Task 5 are used unchanged
+and 8. `buildRequirements` and `Ferry402Config` from Task 5 are used unchanged
 in Task 6. `SettleResponse` field names in Task 8 match the upstream schema
 verified above.
+
+---
+
+## AMENDMENTS (applied mid-execution — supersede the task text above)
+
+**A1 — merchant binding (supersedes Task 2 Step 5 and ripples forward).**
+See spec Amendment 1. `settleAuthorization` gains a `bytes32 paymentId` parameter and
+requires `auth.nonce == keccak256(abi.encode(merchant, paymentId))`. Credit uses the
+observed `balanceOf` delta, not `auth.value`, under a `nonReentrant` guard.
+
+Binding on later tasks:
+- **Task 4:** fuzz that a valid authorization cannot be settled to a different merchant.
+- **Task 5:** `PaymentRequirements.extra` must carry `paymentId` alongside `merchant`.
+- **Task 6:** the client derives `nonce = keccak256(abi.encode(merchant, paymentId))`.
+- **Task 7:** `/verify` recomputes the nonce and rejects a mismatch before settling.
+- **Task 8:** `settlePayment` passes `paymentId` through to the contract call.
+
+**A2 — MockUSDC strictness.** The mock rejects malleable signatures (`s` above
+secp256k1n/2, `v` outside {27,28}) because real USDC does, and its strictness tests are
+committed so CI enforces them.
+
+**A3 — known limitation, deferred.** EIP-1271 smart-contract-wallet signatures are not
+supported. Real USDC v2.2 accepts them and smart wallets are common on Base; adding
+support changes `IEIP3009`, the mock and the verify path, so it belongs to its own plan.
+
+---
+
+# Plan extension — Tasks 11-13 (added 2026-09-24)
+
+Three known limitations, promoted from "recorded" to "must fix". All three block real
+adoption by developers or by agents.
+
+**Sequencing:** finish Tasks 7-9 (the core payment flow) first, then 11-13, then Task 10
+last — so the live end-to-end test exercises everything, including this work.
+
+---
+
+## Task 11: EIP-1271 smart-contract wallet signatures
+
+**Why.** Real USDC v2.2's `receiveWithAuthorization` also accepts a `bytes signature`
+with EIP-1271 support. Our stack is `(v, r, s)`-only, so **every smart-contract wallet is
+excluded** — a large share of Base users, and the majority of agent wallets, which are
+usually smart accounts rather than EOAs. For a product whose pitch is "agents can pay",
+this is the single most limiting gap.
+
+**Files:**
+- Modify: `packages/contracts/src/interfaces/IEIP3009.sol` — add the `bytes signature` overload
+- Modify: `packages/contracts/src/Escrow.sol` — `settleAuthorizationWithSignature(...)` taking `bytes calldata`
+- Modify: `packages/contracts/test/mocks/MockUSDC.sol` — implement both overloads; EIP-1271 path calls `isValidSignature`
+- Create: `packages/contracts/test/mocks/MockSmartWallet.sol` — returns `0x1626ba7e` for signatures it accepts, `0xffffffff` otherwise
+- Modify: `packages/facilitator/src/chains/base.ts` — ECDSA first, then EIP-1271 fallback
+- Test: contracts + facilitator
+
+**Interfaces produced:**
+- `Escrow.settleAuthorizationWithSignature(address merchant, bytes32 paymentId, Authorization calldata auth, bytes calldata signature)`
+- `verifyPayment` accepts either a 65-byte `(v,r,s)` signature or an arbitrary-length EIP-1271 blob
+
+**Required semantics.** A 65-byte signature takes the ECDSA path unchanged. Anything else,
+or a 65-byte signature whose recovered signer is a contract, is validated by calling
+`IERC1271(authorization.from).isValidSignature(digest, signature)` and requiring exactly
+`0x1626ba7e`. Any other return value, a revert, or a call to an address with no code is a
+rejection. Keep malleability rejection on the ECDSA path.
+
+**Tests that must exist and must fail against the unfixed code:**
+a smart wallet accepting → settles; a smart wallet returning `0xffffffff` → rejected;
+a smart wallet that reverts → rejected, no unhandled error; an EOA path unchanged;
+a codeless `from` with a non-65-byte signature → rejected.
+
+---
+
+## Task 12: stateless challenge derivation
+
+**Why.** Today every anonymous request mints one store entry per accepted chain, so
+roughly 5,000 unauthenticated GETs evict all 10,000 outstanding challenges and every
+in-flight payer gets `payment_expired`. Memory is bounded; availability is not. The root
+cause is that the store holds *issued* challenges and issuing is free.
+
+**Files:**
+- Modify: `packages/sdk/src/middleware.ts`
+- Create: `packages/sdk/src/challengeDerivation.ts`
+- Modify: `packages/sdk/src/challengeStore.ts` — becomes a *consumed-nonce* store
+- Modify: `packages/sdk/src/types.ts` — config gains `secret`
+- Test: `packages/sdk/test/challengeDerivation.test.ts`, plus middleware updates
+
+**Design.** Derive rather than store:
+
+```
+paymentId = HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)   // 32 bytes
+nonce     = keccak256(abi.encode(merchantEvm, paymentId))
+```
+
+On the payment path, recompute for the current **and previous** bucket and compare against
+`authorization.nonce`. A match proves the challenge was issued by this server, for this
+resource, within the window — with no storage at all. Resource binding and TTL become
+structural rather than checks that can be forgotten.
+
+Replay defence keeps a **consumed-nonce** set, which only grows on *paid* requests. Minting
+stays free for an attacker; writing to the store now costs them a real on-chain payment.
+
+`secret` is required config, minimum 32 bytes, and the middleware must throw at
+construction if it is missing or short — never silently generate one, because a
+per-process random secret breaks every multi-instance deployment in a way that only shows
+up under load.
+
+**Tests that must fail against the unfixed code:** 10,000 anonymous requests write zero
+store entries; a challenge for resource A is rejected at resource B with no store involved;
+a payment at bucket boundary−1 still verifies; a replayed nonce is rejected; two instances
+sharing a secret accept each other's challenges; a missing or short secret throws at
+construction.
+
+---
+
+## Task 13: SDK packaging
+
+**Why.** `packages/sdk`'s `main` and `types` point straight at `src/index.ts` with no build
+step, so the package works under vitest and `tsc` in this repo and **cannot be consumed by
+anyone else**. A package nobody can install is not a product.
+
+**Files:**
+- Modify: `packages/sdk/package.json` — `exports` map, `main`, `module`, `types`, `files`, `sideEffects: false`, `build` script
+- Create: `packages/sdk/tsup.config.ts` (or a `tsc` build — either is fine)
+- Modify: `.github/workflows/ci.yaml` — build before test
+- Create: `packages/sdk/test/consume-built-package.test.ts`
+
+**The test that matters:** pack the built artifact (`pnpm pack`), install the tarball into
+a temp directory outside the workspace, and import it from plain Node — both ESM and CJS
+if both are published. Importing from `src` in-repo proves nothing about what consumers get.
+Assert the public surface is exported and the type declarations resolve.
+
+Ship both ESM and CJS, or ESM-only with `exports` declared honestly — but do not claim CJS
+support without the smoke test proving it.

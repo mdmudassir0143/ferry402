@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    name: pnpm workspaces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.3'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      # @ferry402/sdk's package.json now points main/types/exports at dist/,
+      # not src/ - packages/facilitator depends on it at runtime (imports
+      # `@ferry402/sdk`, resolved through the workspace symlink to
+      # packages/sdk's own package.json), so its tests fail to resolve the
+      # module at all until sdk has been built. `pnpm -r build` runs in
+      # dependency-topological order, so this also builds sdk before
+      # facilitator. See packages/sdk/test/consume-built-package.test.ts for
+      # the packaging test proper (it builds/packs/installs the tarball
+      # itself and does not depend on this step).
+      - run: pnpm -r build
+      - run: pnpm -r test
+
+  contracts:
+    name: foundry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: forge build
+        run: forge build
+        working-directory: packages/contracts
+
+      - name: forge test
+        run: forge test -vvv
+        working-directory: packages/contracts

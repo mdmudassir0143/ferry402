@@ -1,0 +1,17 @@
+{
+  "name": "ferry402",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=20.18.3" },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint"
+  },
+  "pnpm": {
+    "overrides": {
+      "zod": "3.25.76"
+    }
+  }
+}

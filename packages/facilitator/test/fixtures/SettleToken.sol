@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title SettleToken
+/// @notice Test-only EIP-3009 + ERC20-ish token fixture, used only by
+///         packages/facilitator/test/settle.fork.test.ts.
+///
+///         Neither of this directory's other two fixtures is enough on its
+///         own for a settlement test: `DomainToken.sol` exposes `name()`/
+///         `version()` (so `/verify` can read the real EIP-712 domain from
+///         chain) but deliberately never implements `receiveWithAuthorization`
+///         at all -- it exists only to prove `/verify` doesn't hardcode the
+///         domain. `packages/contracts/test/mocks/MockUSDC.sol` DOES
+///         implement a real, executable `receiveWithAuthorization` (and is
+///         exhaustively proven correct by `packages/contracts/test/Escrow.t.sol`),
+///         but its EIP-712 domain's `version` is a private constructor-time
+///         constant with no public getter -- fine for Foundry tests that sign
+///         directly against its own `receiveAuthorizationDigest`, but not
+///         for this facilitator's `verifyPayment`, which independently reads
+///         `name()`/`version()` over RPC (Task 7's whole point: never
+///         hardcode a token's domain). `settlePayment` needs BOTH properties
+///         at once -- a real, redeemable authorization AND a domain the
+///         facilitator can read live -- hence this fixture, which combines
+///         them. Its EIP-3009 logic mirrors `MockUSDC.sol` line-for-line
+///         (same guardrails: single-use nonces, time windows, non-malleable
+///         low-s/v-in-{27,28} signatures); the only real difference is that
+///         `version` is a public constant instead of a private one baked
+///         directly into `DOMAIN_SEPARATOR`.
+///
+///         Self-contained (no imports), like `DomainToken.sol` in this same
+///         directory, so it compiles with a bare `solc` invocation and needs
+///         no foundry project of its own:
+///           solc --optimize --combined-json abi,bin test/fixtures/SettleToken.sol
+///         Regenerate `SettleToken.abi.ts` from that output if this file
+///         changes.
+///
+///         Task 11 adds the `bytes signature` overload (mirroring
+///         `MockUSDC.sol`'s own addition, after task-11 review round 1):
+///         branches on `from`'s on-chain code, NOT `signature.length` --
+///         real USDC v2.2's own `SignatureChecker.isValidSignatureNow`
+///         dispatches this way, and both `receiveWithAuthorization`
+///         overloads collapse onto it. A codeless `from` takes the identical
+///         ECDSA path as the `(v, r, s)` overload above and REQUIRES exactly
+///         65 bytes; a `from` with code always takes EIP-1271 regardless of
+///         length, verified via a raw `staticcall` requiring the FULL
+///         32-byte return word to equal `bytes32(IERC1271.isValidSignature.selector)`
+///         -- not a `bytes4`-typed decode, matching real USDC's own
+///         `SignatureChecker.sol` and `packages/contracts/test/mocks/MockUSDC.sol`
+///         exactly (see that file's `_checkEip1271` doc comment for what a
+///         typed decode does instead on this Solidity version -- an opaque,
+///         uncaught revert rather than the silent acceptance the equivalent
+///         naive check has on the TypeScript/viem side of this facilitator).
+///         `IERC1271` is declared inline (not imported) to keep this
+///         fixture self-contained.
+interface IERC1271 {
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4 magicValue);
+}
+
+contract SettleToken {
+    string public constant name = "SettleToken";
+    string public constant version = "1";
+    uint8 public constant decimals = 6;
+
+    bytes32 private constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH = keccak256(
+        "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    );
+
+    // secp256k1's curve order (task-11 review round 1, item (e)): derived
+    // as ORDER / 2 rather than a separately hand-written half literal --
+    // the half is the mistypeable direction (see MockUSDC.sol's
+    // Secp256k1TestHelper for the full history: this exact literal has
+    // already been mistyped twice in this project). This fixture stays
+    // self-contained (no cross-package import of that shared helper) by
+    // keeping its own copy of the well-known, easily-eyeballed full order
+    // and deriving the half from it in-file instead.
+    uint256 private constant _SECP256K1N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+    uint256 private constant _SECP256K1N_HALF = _SECP256K1N / 2;
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(bytes32 => bool)) private _authorizationStates;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce);
+
+    error CallerNotPayee();
+    error AuthorizationNotYetValid();
+    error AuthorizationExpired();
+    error AuthorizationAlreadyUsed();
+    error InvalidSignature();
+    error InvalidSignatureSValue();
+    error InvalidSignatureVValue();
+    error TokenInsufficientBalance();
+    error TransferToZeroAddress();
+
+    constructor() {
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                EIP712_DOMAIN_TYPEHASH, keccak256(bytes(name)), keccak256(bytes(version)), block.chainid, address(this)
+            )
+        );
+    }
+
+    /// @notice Test-only faucet. Deliberately unguarded, matching MockUSDC.sol.
+    function mint(address to, uint256 amount) external {
+        _balances[to] += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return _balances[account];
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function authorizationState(address authorizer, bytes32 nonce) external view returns (bool) {
+        return _authorizationStates[authorizer][nonce];
+    }
+
+    /// @notice The EIP-712 digest for a ReceiveWithAuthorization struct,
+    ///         exposed so tests can sign it directly if needed.
+    function receiveAuthorizationDigest(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce
+    ) public view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(RECEIVE_WITH_AUTHORIZATION_TYPEHASH, from, to, value, validAfter, validBefore, nonce)
+        );
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    /// @notice EIP-3009 receiveWithAuthorization, restricted to
+    ///         `msg.sender == to` (matching MockUSDC.sol) so only the named
+    ///         recipient (the Escrow contract, in practice) can redeem.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
+        if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
+        if (v != 27 && v != 28) revert InvalidSignatureVValue();
+
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0) || signer != from) revert InvalidSignature();
+
+        _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    /// @notice Task 11: the `bytes signature` overload -- see this contract's
+    ///         doc comment above for the branch rule.
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes calldata signature
+    ) external {
+        bytes32 digest = _checkAuthorization(from, to, value, validAfter, validBefore, nonce);
+
+        if (from.code.length == 0) {
+            if (signature.length != 65) revert InvalidSignature();
+            bytes32 r = abi.decode(signature[0:32], (bytes32));
+            bytes32 s = abi.decode(signature[32:64], (bytes32));
+            uint8 v = uint8(signature[64]);
+            if (uint256(s) > _SECP256K1N_HALF) revert InvalidSignatureSValue();
+            if (v != 27 && v != 28) revert InvalidSignatureVValue();
+            address signer = ecrecover(digest, v, r, s);
+            if (signer == address(0) || signer != from) revert InvalidSignature();
+        } else {
+            if (!_checkEip1271(from, digest, signature)) revert InvalidSignature();
+        }
+
+        _finalizeAuthorization(from, to, value, nonce);
+    }
+
+    /// @notice Raw `staticcall` + full-word comparison -- see this contract's
+    ///         doc comment above for why a typed `bytes4` decode isn't safe
+    ///         here.
+    function _checkEip1271(address from, bytes32 digest, bytes calldata signature) private view returns (bool) {
+        (bool success, bytes memory result) =
+            from.staticcall(abi.encodeCall(IERC1271.isValidSignature, (digest, signature)));
+        return success && result.length == 32 && abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector);
+    }
+
+    function _checkAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce
+    ) private view returns (bytes32 digest) {
+        if (msg.sender != to) revert CallerNotPayee();
+        if (block.timestamp <= validAfter) revert AuthorizationNotYetValid();
+        if (block.timestamp >= validBefore) revert AuthorizationExpired();
+        if (_authorizationStates[from][nonce]) revert AuthorizationAlreadyUsed();
+        digest = receiveAuthorizationDigest(from, to, value, validAfter, validBefore, nonce);
+    }
+
+    function _finalizeAuthorization(address from, address to, uint256 value, bytes32 nonce) private {
+        _authorizationStates[from][nonce] = true;
+        emit AuthorizationUsed(from, nonce);
+        _transfer(from, to, value);
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        if (to == address(0)) revert TransferToZeroAddress();
+        uint256 fromBalance = _balances[from];
+        if (fromBalance < amount) revert TokenInsufficientBalance();
+        unchecked {
+            _balances[from] = fromBalance - amount;
+        }
+        _balances[to] += amount;
+        emit Transfer(from, to, amount);
+    }
+}
