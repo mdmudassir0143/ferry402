@@ -12,9 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `version:` input on purpose. The root package.json pins
+      # `packageManager: pnpm@9.15.9`, and pnpm/action-setup@v4 fails with
+      # "Multiple versions of pnpm specified" when given both. The
+      # packageManager field is the better source of truth: it is exact,
+      # committed, and what corepack uses locally.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
