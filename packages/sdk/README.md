@@ -92,6 +92,67 @@ const paid = await fetch('http://merchant.example/premium-endpoint', {
 `signTypedData` — a viem `PrivateKeyAccount` (as above) works directly; no
 `viem` dependency is required by this package itself.
 
+## API reference
+
+### Merchant side
+
+| Export | Signature |
+|---|---|
+| `ferry402` | `(config: Ferry402Config, options?: Ferry402Options) => RequestHandler` |
+| `buildRequirements` | `(config, resource: string, options?: BuildRequirementsOptions) => PaymentRequirements[]` |
+| `parsePrice` | `(price: string) => string` — `"$0.01"` to atomic units (`"10000"`) |
+| `InMemoryConsumedNonceStore` | `class implements ConsumedNonceStore` — the default, per-process replay store |
+
+`ferry402()` is the whole integration for most users. `buildRequirements` is
+exported so you can issue a 402 yourself (a non-Express framework, say)
+without reimplementing the `accepts` array.
+
+### Payer side
+
+| Export | Signature |
+|---|---|
+| `createPaymentHeader` | `(requirement: PaymentRequirements, signer: EIP3009Signer, options: CreatePaymentHeaderOptions) => Promise<string>` |
+
+### Nonce derivation
+
+The binding the `Escrow` contract enforces on-chain, and the single
+TypeScript implementation of it.
+
+| Export | Signature |
+|---|---|
+| `computeNonce` | `(merchantEvm: Hex, paymentId: Hex) => Hex` — `keccak256(abi.encode(merchantEvm, paymentId))` |
+| `normalizeNonce` | `(nonce: string) => Hex` — canonicalise before comparison |
+| `normalizeAddress` | `(address: string) => Hex` — same, for addresses, so a checksum difference never changes a derivation |
+
+`computeNonce` is pinned to golden vectors in both this package and the
+Foundry suite, so the TypeScript and Solidity derivations cannot drift apart
+without a test going red.
+
+### Stateless challenges
+
+Used internally by `ferry402()`. Exported for anyone issuing or validating
+challenges outside the middleware.
+
+| Export | Signature |
+|---|---|
+| `deriveChallenge` | `(secret, merchantEvm, resource, nowMs?) => DerivedChallenge` |
+| `matchChallenge` | `(secret, merchantEvm, resource, presentedNonce, nowMs?) => DerivedChallenge \| undefined` |
+| `derivePaymentId` | `(secret, merchantEvm, resource, bucket) => Hex` |
+| `timeBucket` | `(nowMs: number, bucketSeconds?: number) => number` |
+| `generatePaymentId` | `() => Hex` — random id, for callers not using derivation |
+| `assertValidSecret` | `(secret: unknown) => asserts secret is string` |
+| `MIN_SECRET_BYTES` | `32` |
+| `TIME_BUCKET_SECONDS` | `300` |
+
+`matchChallenge` checks the current bucket and the previous one, so the
+usable payment window is up to `2 * TIME_BUCKET_SECONDS` (10 minutes).
+
+### Types
+
+`Ferry402Config`, `Ferry402Options`, `SupportedChain`, `PaymentRequirements`,
+`BuildRequirementsOptions`, `ConsumedNonceStore`, `EIP3009Signer`,
+`CreatePaymentHeaderOptions`, `DerivedChallenge`.
+
 ## Configuration reference
 
 | Field | Notes |
@@ -100,18 +161,31 @@ const paid = await fetch('http://merchant.example/premium-endpoint', {
 | `escrows` | Per-chain `Escrow` contract address. Not this package's concern to validate against a live facilitator, but note: a **facilitator** started with no matching `escrows` entry for a chain rejects every payment on that chain (fail-closed) — see `@ferry402/facilitator`. |
 | `merchant` | Your Hedera account id (e.g. `"0.0.123456"`) — the clearing-layer identity the HCS journal keys on. |
 | `merchantEvm` | Per-chain EVM payout address — the `Escrow` ledger row key and one of the two preimages of the nonce binding. **Different from `merchant`**: one is a Hedera account id, the other is an EVM address, and mixing them up breaks the nonce derivation for that chain. |
-| `accept` | Which chains (`'base' \| 'base-sepolia' \| 'polygon' \| 'polygon-amoy'`) this merchant takes payment on. |
+| `accept` | Which chains this merchant takes payment on. **The type allows `'base' \| 'base-sepolia' \| 'polygon' \| 'polygon-amoy'`, but `@ferry402/facilitator` only serves `base` and `base-sepolia` today.** Advertising a Polygon network yields a 402 no payment can satisfy — the facilitator returns `invalid_network`. |
 | `assets` | Per-chain USDC (or other supported asset) contract address. |
 | `facilitator` | Base URL of the facilitator this middleware calls `/verify` against. |
 | `price` | Decimal-dollar string, e.g. `"$0.01"`. USDC (6 decimals) only in v1. |
 
-## Known limitation
+## Known limitations
 
-The default `InMemoryConsumedNonceStore` (replay protection) is **per-process**.
-A restart clears it for the current derivation window, and it is not shared
-across horizontally-scaled instances — pass your own `ConsumedNonceStore`
-(Redis, a database, ...) via `ferry402(config, { consumedNonceStore })` for a
-multi-instance deployment.
+- **Replay protection is per-process by default.** `InMemoryConsumedNonceStore`
+  clears on restart, losing protection for the derivation window still open at
+  that moment, and it is not shared across horizontally-scaled instances. Pass
+  your own `ConsumedNonceStore` (Redis, a database, ...) via
+  `ferry402(config, { consumedNonceStore })` for a multi-instance deployment.
+- **`ferry402()` verifies; it does not settle.** Calling `/settle` and writing
+  the HCS journal entry is your handler's job, immediately after `next()`.
+- **Keep settlements sequential per facilitator.** See
+  [`docs/troubleshooting.md`](https://github.com/mdmudassir0143/ferry402/blob/main/docs/troubleshooting.md).
+- **Testnet, and unaudited.** See
+  [`SECURITY.md`](https://github.com/mdmudassir0143/ferry402/blob/main/SECURITY.md).
+
+## More
+
+- [Architecture](https://github.com/mdmudassir0143/ferry402/blob/main/docs/architecture.md) — how a payment moves, and the trust model.
+- [Deployments](https://github.com/mdmudassir0143/ferry402/blob/main/docs/deployments.md) — live addresses and every settlement transaction.
+- [Troubleshooting](https://github.com/mdmudassir0143/ferry402/blob/main/docs/troubleshooting.md) — real failure modes and fixes.
+- [`examples/demo`](https://github.com/mdmudassir0143/ferry402/tree/main/examples/demo) — a runnable end-to-end demo using this package from npm.
 
 ## License
 

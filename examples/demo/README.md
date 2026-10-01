@@ -131,3 +131,10 @@ plain `npm`, not `pnpm`, specifically so `npm install` resolves
 `@ferry402/sdk` from the real npm registry — proving the published package
 actually works for a consumer, not just inside this monorepo's own symlinked
 dev environment.
+
+## What to read next
+
+- [Architecture](../../docs/architecture.md) — what each step of this demo is actually doing, and why.
+- [Deployments](../../docs/deployments.md) — the full table of every settlement this project has made on Base Sepolia, including the ones this demo adds.
+- [Troubleshooting](../../docs/troubleshooting.md) — if a step here fails.
+- [`SECURITY.md`](../../SECURITY.md) — the properties the three security checks at the end are demonstrating.

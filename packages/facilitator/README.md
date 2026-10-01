@@ -196,3 +196,14 @@ real testnet funds on every run) — without it, the file is still collected
 no credentials, so importing it is safe with no `.env` present at all. See
 the root README's "Live end-to-end run" section for the most recent proof
 (transaction hash, Hashscan link, measured `gasUsed`).
+
+## More
+
+- [Architecture](../../docs/architecture.md) — how a payment moves through the system, and the trust model a facilitator operator sits inside.
+- [Deployments](../../docs/deployments.md) — live addresses and every settlement transaction this facilitator has submitted.
+- [Troubleshooting](../../docs/troubleshooting.md) — the failure modes an operator actually hits.
+- [`SECURITY.md`](../../SECURITY.md) — what a malicious or failing facilitator can and cannot do.
+
+Note this package is `private: true` and is **not** published to npm. Running
+a facilitator means self-hosting from this source — which is deliberate:
+nothing in ferry402 requires trusting someone else's instance.
