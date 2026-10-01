@@ -108,6 +108,35 @@ function kvGrid(pairs) {
   return dl;
 }
 
+/** Renders JSON.stringify(obj, null, 2) as a <pre> with keys/strings/numbers
+ * wrapped in spans, so the data reads as structured values rather than a
+ * flat text dump. Pure presentation — the underlying text is unchanged. */
+function renderJsonBlock(obj, className) {
+  const pre = document.createElement('pre');
+  pre.className = className;
+  const text = JSON.stringify(obj, null, 2);
+  const tokenRe = /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(?:\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+  let lastIndex = 0;
+  let match;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      pre.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+    }
+    const token = match[0];
+    const span = document.createElement('span');
+    if (token[0] === '"' && /:\s*$/.test(token)) span.className = 'tok-key';
+    else if (token[0] === '"') span.className = 'tok-str';
+    else if (token === 'true' || token === 'false') span.className = 'tok-bool';
+    else if (token === 'null') span.className = 'tok-null';
+    else span.className = 'tok-num';
+    span.textContent = token;
+    pre.appendChild(span);
+    lastIndex = tokenRe.lastIndex;
+  }
+  if (lastIndex < text.length) pre.appendChild(document.createTextNode(text.slice(lastIndex)));
+  return pre;
+}
+
 // ---------- SSE (POST) consumption ----------
 
 async function streamPost(url, onEvent) {
@@ -228,10 +257,7 @@ function renderServed(data) {
     ['HTTP status', `${data.httpStatus} OK — resource served`],
     ['Resource', data.resource],
   ]));
-  const pre = document.createElement('pre');
-  pre.className = 'quote-json';
-  pre.textContent = JSON.stringify(data.quote, null, 2);
-  node.appendChild(pre);
+  node.appendChild(renderJsonBlock(data.quote, 'quote-json'));
   return node;
 }
 
@@ -271,10 +297,7 @@ function renderJournal(data) {
     ['Consensus timestamp', hashEl({ value: data.consensusTimestamp, href: data.hashscanTxUrl, linkLabel: 'Hashscan ↗', front: 14, back: 6 })],
     ['Topic', hashEl({ value: data.topicId, href: data.hashscanTopicUrl, linkLabel: 'Hashscan topic ↗' })],
   ]));
-  const pre = document.createElement('pre');
-  pre.className = 'entry-json';
-  pre.textContent = JSON.stringify(data.entry, null, 2);
-  node.appendChild(pre);
+  node.appendChild(renderJsonBlock(data.entry, 'entry-json'));
   return node;
 }
 
@@ -298,8 +321,8 @@ function renderReconciled(data) {
   const verdict = document.createElement('div');
   verdict.className = `reconcile-verdict ${data.matches ? 'match' : 'mismatch'}`;
   verdict.innerHTML = data.matches
-    ? '<span class="glyph">✓</span> ALL THREE AGREE'
-    : '<span class="glyph">⚠</span> NUMBERS DIFFER (see note below)';
+    ? '<span class="glyph">✓</span> All three agree'
+    : '<span class="glyph">⚠</span> Numbers differ (see note below)';
   node.appendChild(verdict);
 
   if (!data.matches) {
@@ -324,7 +347,7 @@ const STEP_RENDERERS = {
 function renderError(stage, message) {
   const node = document.createElement('p');
   node.className = 'placeholder';
-  node.style.color = 'var(--bad-text)';
+  node.style.color = 'var(--fail)';
   node.textContent = `Failed: ${message}`;
   setStepBody(stage, node);
 }
@@ -446,7 +469,7 @@ async function runCheck(kind) {
         container.innerHTML = '';
         const p = document.createElement('p');
         p.className = 'placeholder';
-        p.style.color = 'var(--bad-text)';
+        p.style.color = 'var(--fail)';
         p.textContent = `Failed: ${data?.message ?? 'unknown error'}`;
         container.appendChild(p);
         return;
@@ -466,7 +489,7 @@ async function runCheck(kind) {
     container.innerHTML = '';
     const p = document.createElement('p');
     p.className = 'placeholder';
-    p.style.color = 'var(--bad-text)';
+    p.style.color = 'var(--fail)';
     p.textContent = `Failed: ${err.message}`;
     container.appendChild(p);
   } finally {
