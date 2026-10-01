@@ -1,12 +1,17 @@
 # @ferry402/sdk
 
-The merchant-side (and payer-side) half of [ferry402](https://github.com/mdmudassir0143/ferry402):
-an [x402](https://x402.org) Express middleware that turns any route into a
-payable one, settling into a non-custodial per-chain `Escrow` contract with
-Hedera as the clearing ledger.
+Charge for an API call before your Express route handles it. `@ferry402/sdk`
+is an [x402](https://x402.org) middleware — x402 is an open standard that
+uses HTTP's `402 Payment Required` status to ask a caller for a stablecoin
+payment, then lets the request through once that payment is verified. Each
+payment settles into a non-custodial `Escrow` smart contract (one per chain)
+and is journaled to Hedera, used here as a clearing ledger: an ordered,
+independently-auditable record of who paid whom.
 
-See the [repo root README](https://github.com/mdmudassir0143/ferry402#readme)
-for the full system — this package, the facilitator, and the contracts.
+This package is [ferry402](https://github.com/mdmudassir0143/ferry402)'s
+merchant-side (and payer-side) half. See the
+[repo root README](https://github.com/mdmudassir0143/ferry402#readme) for
+the full system — this package, the facilitator, and the contracts.
 
 ## Install
 
@@ -48,22 +53,25 @@ app.get('/premium-endpoint', ferry402(config), (_req, res) => {
 
 An unpaid request gets a `402` with an `accepts` array; a request carrying a
 valid `X-PAYMENT` header falls through to your handler via `next()`.
+
 **`ferry402()` only verifies — it does not call `/settle`.** Actually
 collecting the payment and journaling it to HCS is your handler's job,
-immediately after `next()` runs — see the root README's "How it works" and
-`@ferry402/facilitator`'s docs for the settlement half of that wiring.
+immediately after `next()` runs. See the root README's "How it works" and
+`@ferry402/facilitator` (the companion service that verifies and settles
+payments on-chain) for the settlement half of that wiring.
 
 ## Paying a route: `createPaymentHeader`
 
-**No stock x402 client (`x402-fetch`, `x402-axios`, or anything built against
-plain `x402@1.2.0`) can pay a ferry402 route.** ferry402 binds the EIP-3009
-authorization `nonce` to the merchant it was issued for —
+**No stock x402 client (`x402-fetch`, `x402-axios`, or anything built
+against plain `x402@1.2.0`) can pay a ferry402 route.** ferry402 binds the
+EIP-3009 authorization's `nonce` to the merchant it was issued for —
 `nonce = keccak256(abi.encode(merchantEvm, paymentId))` — instead of letting
-the payer mint random bytes, specifically so a signed payment can never be
-redirected to a merchant other than the one who issued the 402. Upstream
-`x402` clients generate a random nonce; ferry402 never recognizes it as
-matching any challenge it issued, so the payment fails closed with
-`invalid_payment` — the server has no way to tell a self-invented nonce
+the payer mint random bytes. This way a signed payment can never be
+redirected to a merchant other than the one who issued the 402.
+
+Upstream `x402` clients generate a random nonce instead, so ferry402 never
+recognizes it as matching any challenge it issued. The payment fails closed
+with `invalid_payment`: the server has no way to tell a self-invented nonce
 apart from a genuinely expired or mismatched one, so it doesn't claim to.
 
 Use `createPaymentHeader` instead — it derives the same nonce ferry402
@@ -106,11 +114,18 @@ const paid = await fetch('http://merchant.example/premium-endpoint', {
 | `buildRequirements` | `(config, resource: string, options?: BuildRequirementsOptions) => PaymentRequirements[]` |
 | `parsePrice` | `(price: string) => string` — `"$0.01"` to atomic units (`"10000"`) |
 | `InMemoryConsumedNonceStore` | `class implements ConsumedNonceStore` — the default, per-process replay store |
-| `Ferry402Locals` | type — the shape of `res.locals.x402` once a payment verifies: `{ payload, requirements, payer, release }`. `release(): Promise<void>` lets your route handler release the consumed nonce if its own `/settle` call fails. |
+| `Ferry402Locals` | type for `res.locals.x402` once a payment verifies — see below |
 
 `ferry402()` is the whole integration for most users. `buildRequirements` is
 exported so you can issue a 402 yourself (a non-Express framework, say)
 without reimplementing the `accepts` array.
+
+**`res.locals.x402` (`Ferry402Locals`).** Once a payment verifies, your route
+handler can read `res.locals.x402 as Ferry402Locals`:
+`{ payload, requirements, payer, release }`. `release(): Promise<void>` lets
+the handler free the nonce ferry402 already consumed, if the handler's own
+`/settle` call then fails — call it from that failure branch; the happy path
+never needs it.
 
 ### Payer side
 
@@ -162,14 +177,36 @@ usable payment window is up to `2 * TIME_BUCKET_SECONDS` (10 minutes).
 
 | Field | Notes |
 |---|---|
-| `secret` | **Required, >= 32 bytes.** `ferry402(config)` throws at construction if missing/short. Must be identical across every process/instance serving this merchant — it's what lets two instances validate each other's challenges with no shared store. Generate with `openssl rand -hex 32`; never commit it. |
-| `escrows` | `Partial<Record<SupportedChain, ...>>` — an entry is required for every chain listed in `accept` (`ferry402(config)` throws at construction, naming the chain, if one is missing), and you simply omit the chains you don't accept. Not this package's concern to validate against a live facilitator, but note: a **facilitator** started with no matching `escrows` entry for a chain rejects every payment on that chain (fail-closed) — see `@ferry402/facilitator`. |
-| `merchant` | Your Hedera account id (e.g. `"0.0.123456"`) — the clearing-layer identity the HCS journal keys on. |
-| `merchantEvm` | `Partial<Record<SupportedChain, ...>>`, same per-accepted-chain requirement as `escrows` above — the `Escrow` ledger row key and one of the two preimages of the nonce binding. **Different from `merchant`**: one is a Hedera account id, the other is an EVM address, and mixing them up breaks the nonce derivation for that chain. |
-| `accept` | Which chains this merchant takes payment on. **The type allows `'base' \| 'base-sepolia' \| 'polygon' \| 'polygon-amoy'`, but `@ferry402/facilitator` only serves `base` and `base-sepolia` today.** Advertising a Polygon network yields a 402 no payment can satisfy — the facilitator returns `invalid_network`. |
-| `assets` | `Partial<Record<SupportedChain, ...>>`, same per-accepted-chain requirement as `escrows` above — USDC (or other supported asset) contract address. |
+| `secret` | **Required, >= 32 bytes.** Same value on every instance. See notes below. |
+| `escrows` | Per-chain `Escrow` address. Required for each chain in `accept`. See notes below. |
+| `merchant` | Your Hedera account id, e.g. `"0.0.123456"` — the clearing-layer identity the HCS journal keys on. |
+| `merchantEvm` | Per-chain payout address. Required for each chain in `accept`. See notes below. |
+| `accept` | Chains this merchant takes payment on. **Facilitator supports only 2 of 4 values today** — see notes below. |
+| `assets` | Per-chain USDC (or other supported asset) contract address. Required for each chain in `accept`. |
 | `facilitator` | Base URL of the facilitator this middleware calls `/verify` against. |
 | `price` | Decimal-dollar string, e.g. `"$0.01"`. USDC (6 decimals) only in v1. |
+
+- **`secret`** — `ferry402(config)` throws at construction if it's missing or
+  under 32 bytes. It must be identical across every process/instance serving
+  this merchant: that's what lets two instances validate each other's
+  challenges with no shared store. Generate it with `openssl rand -hex 32`
+  and never commit it.
+- **`escrows`, `merchantEvm`, `assets`** are each
+  `Partial<Record<SupportedChain, ...>>` — you only need an entry for chains
+  you actually list in `accept`; `ferry402(config)` throws at construction,
+  naming the chain, if one is missing. This package doesn't validate
+  `escrows` against a live facilitator, but note: a **facilitator** started
+  with no matching `escrows` entry for a chain rejects every payment on that
+  chain, fail-closed — see `@ferry402/facilitator`.
+- **`merchant` vs. `merchantEvm`** — these are different identifiers:
+  `merchant` is a Hedera account id, `merchantEvm` is an EVM address and one
+  of the two preimages of the nonce binding. Mixing them up breaks the nonce
+  derivation for that chain.
+- **`accept`** — the type allows
+  `'base' | 'base-sepolia' | 'polygon' | 'polygon-amoy'`, but
+  `@ferry402/facilitator` only serves `base` and `base-sepolia` today.
+  Advertising a Polygon network produces a 402 no payment can satisfy: the
+  facilitator returns `invalid_network`.
 
 ## Known limitations
 

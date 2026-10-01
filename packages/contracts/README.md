@@ -1,7 +1,12 @@
 # Escrow.sol
 
+> **Not audited.** This contract has a 39-test Foundry suite including fuzz
+> and invariant runs, and every property described below is tested — but no
+> third party has reviewed it. It is deployed on testnet only. Read
+> [SECURITY.md](../../SECURITY.md) before trusting it with anything.
+
 `Escrow.sol` is the custody contract ferry402 settles x402 payments into. One
-instance is deployed per source chain (Base, Base Sepolia, Polygon, …); each
+instance is deployed per source chain (Base and Base Sepolia today); each
 instance pools one ERC-20/EIP-3009 token's balance and attributes it to
 merchants through a private ledger (`_balances`). A payment settles in
 through `settleAuthorization` or `settleAuthorizationWithSignature`; a
@@ -14,12 +19,14 @@ stating precisely rather than gesturing at: **there is no admin path —
 not for the facilitator, not for ferry402 itself — that can move a
 merchant's credited funds anywhere the merchant didn't ask.** `withdraw`
 only ever debits `_balances[msg.sender]`; nothing in this contract can debit
-any other address's row. A facilitator can refuse to submit a payment, go
-offline, or misbehave in every way its role allows — it cannot reach into
-escrow and take what's already been credited. That property is enforced by
-the absence of code, not by a role check: grep the contract for `onlyOwner`,
-`Ownable`, or any `msg.sender`-gated path into `_balances` other than
-`withdraw`'s own, and you will find none.
+any other address's row.
+
+A facilitator can refuse to submit a payment, go offline, or misbehave in
+every way its role allows — it cannot reach into escrow and take what's
+already been credited. That property is enforced by the absence of code,
+not by a role check: grep the contract for `onlyOwner`, `Ownable`, or any
+`msg.sender`-gated path into `_balances` other than `withdraw`'s own, and
+you will find none.
 
 `token` is set once, as an immutable, in the constructor, and never changes.
 The constructor does not validate it — passing the zero address or a
@@ -27,28 +34,33 @@ codeless address is accepted at deploy time, and the contract fails safe
 rather than loud: the first `settleAuthorization*` call against such a
 `token` reverts automatically (a Solidity call that expects a return value,
 like `token.balanceOf(...)`, has an implicit `extcodesize` check baked in by
-the compiler), just later than a constructor check would. `withdraw`'s own
-codeless-token check in `_safeTransfer` exists for a different scenario —
-a token that was valid at deploy time and later becomes codeless (e.g.
-`selfdestruct`) after merchants have already accrued ledger balances.
+the compiler), just later than a constructor check would.
+
+`withdraw`'s own codeless-token check in `_safeTransfer` exists for a
+different scenario — a token that was valid at deploy time and later
+becomes codeless (e.g. `selfdestruct`) after merchants have already accrued
+ledger balances.
 
 ## The merchant-binding nonce (Amendment 1)
 
 EIP-3009's `ReceiveWithAuthorization` typehash commits a payer's signature to
 exactly six fields: `from, to, value, validAfter, validBefore, nonce`. The
 beneficiary of the escrow credit is not one of them — nothing in the signed
-payload says who gets paid once the authorization is redeemed. An earlier
-version of this design took `merchant` as a plain, separate argument to a
-permissionless `settleAuthorization`, which meant the beneficiary was never
-actually bound to what the payer signed: **anyone holding `(auth, v, r, s)`
-could call `settleAuthorization(attacker, auth, v, r, s)` and have the
-payment credited to `attacker`,** with a perfectly valid signature and no
-forgery involved. In x402's flow this isn't a hypothetical — the signed
-payload travels in an `X-PAYMENT` header through the resource server and the
-facilitator, both of which are untrusted in this design's threat model. The
-token's own `msg.sender == to` guard on `receiveWithAuthorization` doesn't
-help either, since `Escrow` itself is always the caller regardless of which
-merchant argument it was given.
+payload says who gets paid once the authorization is redeemed.
+
+An earlier version of this design took `merchant` as a plain, separate
+argument to a permissionless `settleAuthorization`, which meant the
+beneficiary was never actually bound to what the payer signed: **anyone
+holding `(auth, v, r, s)` could call `settleAuthorization(attacker, auth, v,
+r, s)` and have the payment credited to `attacker`,** with a perfectly valid
+signature and no forgery involved.
+
+In x402's flow this isn't a hypothetical — the signed payload travels in an
+`X-PAYMENT` header through the resource server and the facilitator, both of
+which are untrusted in this design's threat model. The token's own
+`msg.sender == to` guard on `receiveWithAuthorization` doesn't help either,
+since `Escrow` itself is always the caller regardless of which merchant
+argument it was given.
 
 The fix binds the beneficiary into the one 32 bytes EIP-3009 leaves free for
 the application to use — the nonce:
@@ -62,22 +74,26 @@ recomputes it on-chain from the caller-supplied `merchant` and `paymentId`
 and reverts `MerchantNotBound` on any mismatch. Changing the merchant
 changes the nonce, which invalidates the payer's signature over the EIP-712
 digest — there is no way to redirect a signed payment to a different
-beneficiary without the payer re-signing. This costs no extra gas over
-carrying an arbitrary nonce, requires no change to the token's typehash, and
-introduces no privileged role that could have "fixed" the same hole by
-narrowing who's allowed to call `settleAuthorization` instead of removing the
-capability to redirect funds at all.
+beneficiary without the payer re-signing.
+
+This costs no extra gas over carrying an arbitrary nonce, requires no change
+to the token's typehash, and introduces no privileged role that could have
+"fixed" the same hole by narrowing who's allowed to call
+`settleAuthorization` instead of removing the capability to redirect funds
+at all.
 
 The off-chain half of this has to recompute the identical hash — the SDK's
 nonce derivation and the facilitator's `/verify` both use
 `keccak256(abi.encode(merchantEvm, paymentId))` against the same inputs.
+
 `test/NonceGoldenVectors.t.sol` exists specifically because that symmetry is
 easy to break silently: every *other* Solidity test builds its own expected
 nonce with the same `abi.encode` expression the contract uses, which proves
 internal self-consistency but would stay green even if `_checkBinding`'s
 `abi.encode` were mutated to `abi.encodePacked` — every test's helper would
-recompute the broken hash in lockstep with the contract and still match. The
-golden-vector tests instead settle against two literal `bytes32` nonces
+recompute the broken hash in lockstep with the contract and still match.
+
+The golden-vector tests instead settle against two literal `bytes32` nonces
 copied verbatim from the TypeScript SDK's own pinned vectors
 (`packages/sdk/test/nonce.test.ts`), computed nowhere in this repo's
 Solidity. If the contract's hashing scheme ever drifts from what the SDK
@@ -99,16 +115,19 @@ Crediting the requested amount instead of the measured one is a real pooled-
 custody bug waiting to happen, not a theoretical one: a fee-on-transfer or
 deflationary token delivers strictly less than `auth.value` to the escrow,
 and a rebasing token can deliver more or less depending on when the balance
-is read. Credit the requested amount under either and the ledger row stops
-being backed by real holdings — the merchant's balance now claims tokens the
+is read.
+
+Credit the requested amount under either and the ledger row stops being
+backed by real holdings — the merchant's balance now claims tokens the
 contract never received, and because custody is pooled (one token balance
 backs every merchant's row), the shortfall is first-come-first-served
 insolvency the moment enough merchants try to withdraw. "This escrow only
 ever holds USDC" is a deployment choice the facilitator operator makes when
 picking `token`, not a guarantee the contract enforces — the constructor
-accepts any ERC-20/EIP-3009 token, as described above. `test/mocks/
-EscrowSecurityDoubles.t.sol`'s `LossyMockUSDC` is a fee-skimming token built
-specifically to make this distinction observable: it proves
+accepts any ERC-20/EIP-3009 token, as described above.
+
+`test/mocks/EscrowSecurityDoubles.t.sol`'s `LossyMockUSDC` is a fee-skimming
+token built specifically to make this distinction observable: it proves
 `settleAuthorization` and `settleAuthorizationWithSignature` both credit the
 delta, not the request, and the invariant suite (below) runs its entire
 128,000-call campaign against this same lossy token so the solvency property
@@ -190,19 +209,22 @@ function settleAuthorizationWithSignature(
 Identical to `settleAuthorization` in every respect that matters here — same
 merchant-binding check, same `nonReentrant` guard, same observed-delta
 crediting — except it redeems through the token's `bytes signature` overload
-instead of a `(v, r, s)` tuple. This is the path that lets a payer whose
-`from` is a smart-contract wallet (EIP-1271) pay through this escrow at all:
-a contract wallet holds no ECDSA private key, so `(v, r, s)` has no meaning
-for it, and it can only ever produce an arbitrary-length signature blob that
-some verifier checks on the wallet's own terms. Which verification path a
-given `signature` takes is decided entirely by the token, not by `Escrow` —
-a conforming token (see `test/mocks/MockUSDC.sol`, modeled on real USDC
-v2.2's `SignatureChecker`) dispatches on whether `auth.from` has code, never
-on the signature's length: a 65-byte blob against a codeless `from` is
-parsed as plain ECDSA, while the exact same 65 bytes against a `from` with
-code is routed to `from.isValidSignature(digest, signature)` and must return
-precisely the ERC-1271 magic value `0x1626ba7e` as a full, cleanly-padded
-32-byte word.
+instead of a `(v, r, s)` tuple.
+
+This is the path that lets a payer whose `from` is a smart-contract wallet
+(EIP-1271) pay through this escrow at all: a contract wallet holds no ECDSA
+private key, so `(v, r, s)` has no meaning for it, and it can only ever
+produce an arbitrary-length signature blob that some verifier checks on the
+wallet's own terms.
+
+Which verification path a given `signature` takes is decided entirely by
+the token, not by `Escrow` — a conforming token (see `test/mocks/MockUSDC.sol`,
+modeled on real USDC v2.2's `SignatureChecker`) dispatches on whether
+`auth.from` has code, never on the signature's length: a 65-byte blob
+against a codeless `from` is parsed as plain ECDSA, while the exact same 65
+bytes against a `from` with code is routed to
+`from.isValidSignature(digest, signature)` and must return precisely the
+ERC-1271 magic value `0x1626ba7e` as a full, cleanly-padded 32-byte word.
 
 Reverts: identical set to `settleAuthorization` (`ZeroMerchant`,
 `RecipientMismatch`, `MerchantNotBound`, `Reentrancy`), plus whatever the
@@ -226,8 +248,10 @@ Reverts:
 - `TransferFailed()` — the token transfer failed in a way that carries no
   revert reason of its own: a bare revert with empty return data, a codeless
   `token` address, a return shorter than one word, or an explicit `false`
-  return. If the token's `transfer` instead reverts *with* data, that
-  original revert reason is bubbled unchanged rather than being replaced by
+  return.
+
+  If the token's `transfer` instead reverts *with* data, that original
+  revert reason is bubbled unchanged rather than being replaced by
   `TransferFailed()` — see `_safeTransfer` in Security notes.
 
 Emits `Withdrawn(msg.sender, to, amount)` on success.
@@ -271,12 +295,14 @@ later one. The mechanism is the SSTORE on `_balances[merchant]`: the first
 credit writes that storage slot from zero to a nonzero value, which the EVM
 prices as the expensive "set" case (plus the cold-access surcharge, since
 every transaction starts with an empty access list regardless of what a
-prior transaction touched). Every later settlement to the same merchant
-updates an already-nonzero slot — the cheap "reset" case — so cost settles
-to ~107.7k and stays flat regardless of the amount being settled. If you're
-a facilitator operator budgeting gas per settlement, budget for the cold
-case on a merchant's first payment and the warm case afterward; don't take
-one number and multiply it by settlement count.
+prior transaction touched).
+
+Every later settlement to the same merchant updates an already-nonzero slot
+— the cheap "reset" case — so cost settles to ~107.7k and stays flat
+regardless of the amount being settled. If you're a facilitator operator
+budgeting gas per settlement, budget for the cold case on a merchant's first
+payment and the warm case afterward; don't take one number and multiply it
+by settlement count.
 
 ## Deployment
 
@@ -337,42 +363,49 @@ The suite is organized around proving the two design decisions above hold
 under adversarial input, not just under the happy path, plus a baseline of
 ordinary settlement/withdrawal correctness:
 
-**`test/Escrow.t.sol`** (11 tests) is the core suite: a payment settles and
-credits the right amount and emits the right event; a replayed `(auth, v, r,
-s)` never credits twice (`testFuzz_authorizationCannotBeReplayed`); a
-withdrawal moves funds to the requested recipient and never touches another
-merchant's row even under direct attack
-(`test_withdraw_attackerCannotDrainOtherMerchantsRow` actually attempts to
-pull the whole pool, not just a well-behaved withdrawal); and
-`test_noAdminCanMoveMerchantFunds` is the literal proof of this README's
-headline claim — an unrelated caller with no ledger balance of their own
-cannot withdraw anything, full stop. The merchant-binding property itself
-gets both a hand-picked regression
-(`test_settleAuthorization_revertsWhenMerchantNotBoundToSignature`) and a
-full-address-space fuzz
-(`testFuzz_settleAuthorization_merchantBindingRejectsMismatch`) — this is
-the regression barrier for the exact flaw Amendment 1 describes: without the
-on-chain nonce check, anyone holding a signed payload could redirect the
-credit to themselves.
+**`test/Escrow.t.sol`** (11 tests) is the core suite — ordinary
+settlement/withdrawal correctness, plus the two headline security
+properties:
+
+- A payment settles and credits the right amount and emits the right event;
+  a replayed `(auth, v, r, s)` never credits twice
+  (`testFuzz_authorizationCannotBeReplayed`).
+- A withdrawal moves funds to the requested recipient and never touches
+  another merchant's row, even under direct attack —
+  `test_withdraw_attackerCannotDrainOtherMerchantsRow` actually attempts to
+  pull the whole pool, not just a well-behaved withdrawal.
+- `test_noAdminCanMoveMerchantFunds` is the literal proof of this README's
+  headline claim: an unrelated caller with no ledger balance of their own
+  cannot withdraw anything, full stop.
+- The merchant-binding property gets both a hand-picked regression
+  (`test_settleAuthorization_revertsWhenMerchantNotBoundToSignature`) and a
+  full-address-space fuzz
+  (`testFuzz_settleAuthorization_merchantBindingRejectsMismatch`) — the
+  regression barrier for the exact flaw Amendment 1 describes: without the
+  on-chain nonce check, anyone holding a signed payload could redirect the
+  credit to themselves.
 
 **`test/EscrowEip1271.t.sol`** (8 tests) covers the smart-contract-wallet
 path end to end: a wallet that accepts settles like an EOA would; a wallet
 that rejects, or reverts internally, is treated as a clean rejection rather
 than an unhandled error; a codeless `from` can never satisfy EIP-1271 and is
-rejected without even attempting the call. One test here exists because a
-real bug was found during review: dispatching on signature *length* (65
-bytes → ECDSA) rather than on whether `from` has code would misroute a
-1-of-1 smart-contract wallet whose owner signs the raw digest — which
-produces an incidentally-65-byte signature — to `ecrecover`, which recovers
-the owner's address, not the wallet's, and reverts even though the wallet's
-own `isValidSignature` would have accepted it.
-`test_settleAuthorizationWithSignature_smartWalletWith65ByteSignature_stillUsesEip1271`
-is the regression test for that specific failure mode. A second test,
-`test_settleAuthorizationWithSignature_dirtyMagicValuePadding_rejects`,
-proves the full 32-byte return word is checked, not just its leading 4
-bytes — a wallet returning the correct magic value with non-zero trailing
-padding (only reachable via raw assembly; no ordinary Solidity `return` can
-produce it) must still be rejected.
+rejected without even attempting the call.
+
+Two of its tests are regressions for real bugs found during review:
+
+- Dispatching on signature *length* (65 bytes → ECDSA) rather than on
+  whether `from` has code would misroute a 1-of-1 smart-contract wallet
+  whose owner signs the raw digest — which produces an incidentally-65-byte
+  signature — to `ecrecover`, which recovers the owner's address, not the
+  wallet's, and reverts even though the wallet's own `isValidSignature`
+  would have accepted it.
+  `test_settleAuthorizationWithSignature_smartWalletWith65ByteSignature_stillUsesEip1271`
+  is the regression test for that failure mode.
+- `test_settleAuthorizationWithSignature_dirtyMagicValuePadding_rejects`
+  proves the full 32-byte return word is checked, not just its leading 4
+  bytes — a wallet returning the correct magic value with non-zero trailing
+  padding (only reachable via raw assembly; no ordinary Solidity `return`
+  can produce it) must still be rejected.
 
 **`test/NonceGoldenVectors.t.sol`** (2 tests) is described in detail above —
 it settles against literal `bytes32` nonces lifted from the TypeScript SDK's
@@ -382,64 +415,82 @@ off-chain signer computes, not just that it's internally consistent with
 itself.
 
 **`test/mocks/EscrowSecurityDoubles.t.sol`** (8 tests) settles and withdraws
-against a set of hostile or non-conforming token doubles: a fee-skimming
-token proving observed-delta crediting (Amendment 2, above); a token whose
-`receiveWithAuthorization` reenters `settleAuthorization`/
-`settleAuthorizationWithSignature` mid-call, and one whose `transfer`
-reenters `withdraw` mid-call, both of which must be rejected by the
-`nonReentrant` guard; a USDT-style token that returns no data at all from
-`transfer`, proving `_safeTransfer`'s no-return-data tolerance actually
-*succeeds* a withdrawal correctly, not merely fails to revert; a token
-returning an explicit `false`, proving that's treated as a failure; and a
-token made codeless after a merchant has already accrued a balance,
-proving `withdraw` rejects it rather than silently succeeding against
-empty bytecode. Two tests here exist because reviewers found real gaps in
-earlier versions of `settleAuthorizationWithSignature` specifically: one
-reviewer mutated it to credit `auth.value` directly instead of the observed
-delta, and another dropped its `nonReentrant` guard — both mutations passed
-every other test in the suite at the time, because nothing had yet settled
-a fee-skimming token or attempted reentrancy through that particular entry
-point rather than the plain-ECDSA one.
+against a set of hostile or non-conforming token doubles:
+
+- A fee-skimming token, proving observed-delta crediting (Amendment 2,
+  above).
+- A token whose `receiveWithAuthorization` reenters
+  `settleAuthorization`/`settleAuthorizationWithSignature` mid-call, and one
+  whose `transfer` reenters `withdraw` mid-call — both must be rejected by
+  the `nonReentrant` guard.
+- A USDT-style token that returns no data at all from `transfer`, proving
+  `_safeTransfer`'s no-return-data tolerance actually *succeeds* a
+  withdrawal correctly, not merely fails to revert.
+- A token returning an explicit `false`, proving that's treated as a
+  failure.
+- A token made codeless after a merchant has already accrued a balance,
+  proving `withdraw` rejects it rather than silently succeeding against
+  empty bytecode.
+
+Two tests here exist because reviewers found real gaps in earlier versions
+of `settleAuthorizationWithSignature` specifically: one reviewer mutated it
+to credit `auth.value` directly instead of the observed delta, and another
+dropped its `nonReentrant` guard. Both mutations passed every other test in
+the suite at the time, because nothing had yet settled a fee-skimming token
+or attempted reentrancy through that particular entry point rather than the
+plain-ECDSA one.
 
 **`test/mocks/MockUSDC.t.sol`** (9 tests) is a guardrail suite on the token
 double itself, not on `Escrow` — it exists so that if `MockUSDC`'s own
 checks are ever weakened to make an `Escrow` test pass more easily, CI
-catches that here. This is where signature-malleability rejection lives:
+catches that here.
+
+This is where signature-malleability rejection lives:
 `test_revertsOnMalleableSignature_highS` proves a high-`s` signature (the
 "other" mathematically valid signature for the same message, producible
 from any low-`s` one by flipping both `s` and `v`) is rejected, matching the
 low-s convention real USDC enforces via OpenZeppelin's `ECDSA` library.
-Worth being precise about *where* this lives: `Escrow.sol` itself never
-calls `ecrecover` or validates a signature directly — it forwards `(v, r,
-s)` or the raw `signature` bytes straight through to `token
-.receiveWithAuthorization`. Signature verification, including malleability
-rejection, is entirely the token's responsibility; `Escrow`'s own
-contribution is the merchant-binding check that runs *before* the token is
-ever called.
+
+Worth being precise about *where* this lives: **`Escrow.sol` itself never
+calls `ecrecover` or validates a signature directly** — it forwards
+`(v, r, s)` or the raw `signature` bytes straight through to
+`token.receiveWithAuthorization`. Signature verification, including
+malleability rejection, is entirely the token's responsibility; `Escrow`'s
+own contribution is the merchant-binding check that runs *before* the token
+is ever called.
 
 **`test/EscrowInvariant.t.sol`** (1 invariant test, configured in
 `foundry.toml` for 256 runs × up to 500 calls each — 128,000 calls observed
 in practice) runs long random campaigns of settlements and withdrawals
 against a single pooled escrow backed by the same fee-skimming token used
-above, with a handler that deliberately attempts bad operations alongside
+above. Its handler deliberately attempts bad operations alongside
 legitimate ones: merchant-mismatched settlements, replayed nonces, and
-over-withdrawals. The handler's job is only to *attempt* every one of these;
-it's `Escrow`'s own checks, not any guard in the handler, that must reject
-them — `fail_on_revert = true` in `foundry.toml` means an unexpected revert
-from the handler itself is a hard failure, not a discarded call, so a future
+over-withdrawals.
+
+The handler's job is only to *attempt* every one of these; it's `Escrow`'s
+own checks, not any guard in the handler, that must reject them.
+`fail_on_revert = true` in `foundry.toml` means an unexpected revert from
+the handler itself is a hard failure, not a discarded call, so a future
 silent ghost-accounting bug can't hide in a swallowed exception across
-128,000 calls. Four properties are checked after every run: the pool's
-actual token balance always covers every merchant's net ledger credits
-(solvency, accounted from *observed* deltas on each merchant's own ledger
-row — never from the pool's own token balance, which would make the
-invariant compare a quantity to itself and could never fail); merchant
-binding is never broken, even under a long campaign that deliberately
-submits mismatched settlements; replay protection is never broken, even
-under deliberately repeated nonces; and no over-withdrawal ever succeeds —
-tracked as its own explicit property because pooled custody means a small
-over-withdrawal by one actor can be fully absorbed by other actors' pooled
-funds without the aggregate solvency check ever dipping below zero, which
-would otherwise let real theft hide behind a healthy-looking total.
+128,000 calls.
+
+Four properties are checked after every run:
+
+- **Solvency** — the pool's actual token balance always covers every
+  merchant's net ledger credits, accounted from *observed* deltas on each
+  merchant's own ledger row, never from the pool's own token balance (which
+  would make the invariant compare a quantity to itself and could never
+  fail).
+- **Merchant binding** is never broken, even under a long campaign that
+  deliberately submits mismatched settlements.
+- **Replay protection** is never broken, even under deliberately repeated
+  nonces.
+- **No over-withdrawal ever succeeds** — tracked as its own explicit
+  property because pooled custody means a small over-withdrawal by one
+  actor can be fully absorbed by other actors' pooled funds without the
+  aggregate solvency check ever dipping below zero, which would otherwise
+  let real theft hide behind a healthy-looking total.
+
 `afterInvariant` additionally asserts the campaign actually exercised all of
 this (non-zero settles, withdrawals, mismatches, replays, over-withdrawals,
 and credits across more than one distinct merchant) in every one of the 256
@@ -460,29 +511,35 @@ the post-decrement balance rather than a stale one.
 `call` rather than a typed `IERC20.transfer` call, specifically to tolerate
 non-standard tokens without pulling in a dependency: USDT-style tokens that
 return no data at all, and ordinary tokens that return an explicit `false`
-instead of reverting. On failure, it bubbles the callee's original revert
-reason via inline assembly rather than masking it behind a generic error —
-this matters for on-chain diagnosability, and because a caller further up
-the stack may need the real reason, not a generic one. `TransferFailed()` is
-reserved specifically for the cases that carry no reason of their own: an
-empty-data revert, a codeless `token` (a low-level call against an address
-with no code trivially "succeeds" with empty returndata, which a high-level
-call would have caught automatically via the compiler's implicit
-`extcodesize` check — the low-level call drops that check, so `_safeTransfer`
-restores it explicitly), a return shorter than one word, and an explicit
-`false`. The length check on the success path exists so `abi.decode` is
-never called on malformed, non-word-sized data — which would itself produce
-an unreasoned revert, the exact failure mode this helper exists to
-eliminate.
+instead of reverting.
+
+On failure, it bubbles the callee's original revert reason via inline
+assembly rather than masking it behind a generic error — this matters for
+on-chain diagnosability, and because a caller further up the stack may need
+the real reason, not a generic one.
+
+`TransferFailed()` is reserved specifically for the cases that carry no
+reason of their own: an empty-data revert, a codeless `token` (a low-level
+call against an address with no code trivially "succeeds" with empty
+returndata, which a high-level call would have caught automatically via the
+compiler's implicit `extcodesize` check — the low-level call drops that
+check, so `_safeTransfer` restores it explicitly), a return shorter than one
+word, and an explicit `false`.
+
+The length check on the success path exists so `abi.decode` is never called
+on malformed, non-word-sized data — which would itself produce an
+unreasoned revert, the exact failure mode this helper exists to eliminate.
 
 **Pooled custody, not per-merchant escrow.** One token balance per chain
 backs every merchant's ledger row on that chain. This is why the invariant
 suite's solvency check is `>=`, not `==` (a merchant withdrawing to the
 escrow's own address, see `withdraw` above, creates harmless unattributed
-surplus), and why `test_withdraw_attackerCannotDrainOtherMerchantsRow`
-exists as a real attack attempt rather than merely a well-behaved-withdrawal
-test — a merchant requesting more than their own row but no more than the
-pool's *total* physical balance is a genuinely different failure mode than
+surplus).
+
+It's also why `test_withdraw_attackerCannotDrainOtherMerchantsRow` exists as
+a real attack attempt rather than merely a well-behaved-withdrawal test — a
+merchant requesting more than their own row but no more than the pool's
+*total* physical balance is a genuinely different failure mode than
 requesting more than the pool holds at all, and only the ledger check (not
 the token's own balance check) can catch it.
 

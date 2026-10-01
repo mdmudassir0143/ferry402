@@ -1,11 +1,24 @@
 # @ferry402/facilitator
 
-The x402 facilitator: verifies and settles EIP-3009 payments into a per-chain
-`Escrow` on Base, and journals settled payments to a Hedera Consensus Service
-(HCS) topic for reconciliation. See
-`docs/superpowers/specs/2026-09-23-ferry402-design.md` at the repo root for
-the full design (including Amendments 2 and 3, both binding on the shapes
-below).
+A facilitator is the server a merchant's app calls to check and execute an
+x402 payment, so the merchant's own backend never has to hold a private key
+or submit a transaction. `@ferry402/facilitator` is ferry402's facilitator:
+it verifies EIP-3009 payment authorizations — a token standard that lets a
+payer sign a transfer off-chain for someone else to submit — settles them
+into a per-chain `Escrow` contract on Base, and journals every settled
+payment to a Hedera Consensus Service (HCS) topic (an ordered, independently
+queryable log) for reconciliation.
+
+**Not published to npm; `private: true`.** Running a facilitator means
+self-hosting it from this source — deliberately: nothing in ferry402
+requires trusting someone else's facilitator instance. Clone the repo and
+run `pnpm install` at the root (see the root README's "Try it in 30
+seconds"), then import `@ferry402/facilitator` from within the workspace as
+shown below.
+
+See `docs/superpowers/specs/2026-09-23-ferry402-design.md` at the repo root
+for the full design, including Amendments 2 and 3, both binding on the
+shapes below.
 
 ## Configuring `createFacilitatorApp`
 
@@ -30,47 +43,58 @@ const app = createFacilitatorApp({
 app.listen(3000)
 ```
 
-### The `escrows` option
+## The one thing to know: this facilitator only serves Base
 
-`POST /verify` and `POST /settle` are both **unauthenticated** endpoints that
-take `paymentRequirements` — including `payTo`, the escrow address a payment
-credits — straight from an anonymous HTTP caller. Without an operator-supplied
-allowlist, `payTo` is a value the *caller* controls, not this facilitator.
+This facilitator verifies and settles payments on `base` and `base-sepolia`
+only. The SDK's config type also allows `polygon`/`polygon-amoy`, but there
+is no Polygon support here — a merchant that advertises Polygon gets a 402
+no payment can satisfy (`invalid_network`). See `@ferry402/sdk`'s README for
+the merchant-side side of this same caveat.
+
+## The `escrows` option
+
+`POST /verify` and `POST /settle` are both **unauthenticated** endpoints
+that take `paymentRequirements` — including `payTo`, the escrow address a
+payment credits — straight from an anonymous HTTP caller. Without an
+operator-supplied allowlist, `payTo` is a value the *caller* controls, not
+this facilitator.
 
 `escrows` is that allowlist: a per-network map from `'base' | 'base-sepolia'`
 to the address of the `Escrow` contract *this facilitator operator actually
-deployed and trusts* for that network — the only value `payTo` is ever allowed
-to be. It is shaped exactly like `rpcUrls`, for the same reason: an operator
-already has to know its own RPC endpoints, and a self-hosting merchant knows
-its own deployed escrow address.
+deployed and trusts* for that network — the only value `payTo` is ever
+allowed to be. It is shaped exactly like `rpcUrls`, for the same reason: an
+operator already has to know its own RPC endpoints, and a self-hosting
+merchant knows its own deployed escrow address.
 
 **This is required, and it fails closed.** `escrows` is a required field on
 `FacilitatorAppOptions`, so a TypeScript caller that omits it does not
 compile; a JavaScript caller that omits it — or passes an empty map — gets a
-throw from `createFacilitatorApp()` itself, naming the option and showing the
-shape. That guard exists because the fallback behaviour, while correct, is
+throw from `createFacilitatorApp()` itself, naming the option and showing
+the shape.
+
+That guard exists because the fallback behaviour, while correct, is
 undiagnosable: a facilitator with no `escrows` rejects *every* request for
 that network (`/verify` returns `invalid_payment_requirements`, `/settle` a
 generic failure) rather than trusting whatever `payTo` the caller sent, and
 from the outside that is indistinguishable from a broken install.
 
-The per-request check is unchanged and still authoritative: a network present
-in the map but pointing at the wrong address, or a network absent from an
-otherwise-populated map, is rejected per request (see the
-`VerifyOptions.escrows` doc comment in `src/chains/base.ts`). If requests for
-one network come back `invalid_payment_requirements` in production while
-others succeed, check that network's entry first.
+The per-request check is unchanged and still authoritative: a network
+present in the map but pointing at the wrong address, or a network absent
+from an otherwise-populated map, is rejected per request (see the
+`VerifyOptions.escrows` doc comment in `src/chains/base.ts`). If requests
+for one network come back `invalid_payment_requirements` in production
+while others succeed, check that network's entry first.
 
-Populate it once you've deployed `Escrow.sol` per network (Task 10 covers
-deployment) — there is no default; an un-deployed or unconfigured network is
-supposed to be rejected, not guessed at.
+Populate it once you've deployed `Escrow.sol` per network (`@ferry402/contracts`'s
+README covers deployment) — there is no default; an un-deployed or
+unconfigured network is supposed to be rejected, not guessed at.
 
 ## The HCS journal writer (`src/journal.ts`)
 
-Every settled payment (`SettleResult` with `success: true`) should be recorded
-to an HCS topic so a merchant can reconcile on-chain escrow state against an
-ordered, mirror-node-queryable ledger. Typical wiring, after a successful
-`settlePayment` call:
+Every settled payment (`SettleResult` with `success: true`) should be
+recorded to an HCS topic so a merchant can reconcile on-chain escrow state
+against an ordered, mirror-node-queryable ledger. Typical wiring, after a
+successful `settlePayment` call:
 
 ```ts
 import { journalEntryForSettlement, writeEntry, createHederaTopicSubmitter } from '@ferry402/facilitator'
@@ -90,20 +114,21 @@ await writeEntry(entry, { topicId: process.env.HCS_TOPIC_ID!, submitter })
 ```
 
 - `merchant` and `merchantEvm` are **two different identifiers for the same
-  merchant** (Amendment 3) — the Hedera account id the clearing layer keys on,
-  and the per-chain EVM address the `Escrow` ledger row is keyed by. Both are
-  required on every entry so it can be reconciled against either system.
+  merchant** (Amendment 3) — the Hedera account id the clearing layer keys
+  on, and the per-chain EVM address the `Escrow` ledger row is keyed by.
+  Both are required on every entry so it can be reconciled against either
+  system.
 - `amount` is always the **observed** on-chain credit
   (`SettleResult.settledAmount`, sourced from the verified `PaymentSettled`
   log), never the amount an authorization requested (Amendment 2) — this
   matters under a fee-on-transfer token, where the two can differ.
-- For many small payments, prefer `encodeEntries`/`writeEntries`, which batch
-  multiple entries into as few HCS messages as the 1024-byte limit allows
-  (`ConsensusSubmitMessage` costs ~$0.0008 per message).
+- For many small payments, prefer `encodeEntries`/`writeEntries`, which
+  batch multiple entries into as few HCS messages as the 1024-byte limit
+  allows (`ConsensusSubmitMessage` costs ~$0.0008 per message).
 - `writeEntry`/`writeEntries` take an injectable `submitter` (a
-  `TopicSubmitter`) rather than constructing a Hedera client internally — this
-  is what makes the validation/batching logic testable without a live Hedera
-  account. `createHederaTopicSubmitter(client)` is the real,
+  `TopicSubmitter`) rather than constructing a Hedera client internally —
+  this is what makes the validation/batching logic testable without a live
+  Hedera account. `createHederaTopicSubmitter(client)` is the real,
   `@hashgraph/sdk`-backed implementation; provide your own fake in tests.
 - Live topic creation (`scripts/create-topic.ts`) and an end-to-end submit
   against Hedera testnet were proven for real in Task 10 — see
@@ -113,13 +138,13 @@ await writeEntry(entry, { topicId: process.env.HCS_TOPIC_ID!, submitter })
 ### Partial-batch failure semantics
 
 **HCS gives ordering, not deduplication.** If `writeEntries` submits several
-messages and one FAILS partway through, the messages that already landed are
-already immutable consensus history — there is no rollback, and nothing on
-the Hedera side prevents the same entries from being submitted again.
+messages and one FAILS partway through, the messages that already landed
+are already immutable consensus history — there is no rollback, and nothing
+on the Hedera side prevents the same entries from being submitted again.
 
 `writeEntries` never silently drops that fact. On a partial failure it
-rejects with `PartialBatchWriteError`, whose `committed` field is exactly the
-array of `{ topicId, sequenceNumber }` results `writeEntries` would have
+rejects with `PartialBatchWriteError`, whose `committed` field is exactly
+the array of `{ topicId, sequenceNumber }` results `writeEntries` would have
 returned had it stopped there (`error.cause` carries the underlying
 submitter error):
 
@@ -140,19 +165,21 @@ try {
 ```
 
 **Whose job deduping is: NOT this package's.** Retrying a failed
-`writeEntries` call is the caller's decision, not something this package does
-automatically — a caller that retries the FULL original `entries` array
+`writeEntries` call is the caller's decision, not something this package
+does automatically. A caller that retries the FULL original `entries` array
 (rather than only the ones after `err.committed.length`) will duplicate
-journal entries, and this package does nothing to stop that. Every
-`JournalEntry` carries `txHash` and `nonce` specifically so a downstream
-reader — a mirror-node consumer reconciling the journal, per this package's
-whole premise — can dedupe by `(txHash, nonce)` regardless of how many times
-an entry appears on the topic. That reader is the owner of dedup, not this
-package.
+journal entries, and this package does nothing to stop that.
+
+Every `JournalEntry` carries `txHash` and `nonce` specifically so a
+downstream reader — a mirror-node consumer reconciling the journal, per
+this package's whole premise — can dedupe by `(txHash, nonce)` regardless
+of how many times an entry appears on the topic. That reader is the owner
+of dedup, not this package.
 
 Today, nothing in this repository performs that dedup automatically —
 Task 10 (or whichever component first reads the journal back) owns building
-it before treating raw topic messages as an authoritative, once-each ledger.
+it before treating raw topic messages as an authoritative, once-each
+ledger.
 
 ## Environment variables
 
@@ -160,9 +187,10 @@ See `.env.example` at the repo root for the full list
 (`FACILITATOR_PRIVATE_KEY`, `BASE_SEPOLIA_RPC_URL`,
 `ESCROW_ADDRESS_BASE_SEPOLIA`, `HEDERA_ACCOUNT_ID`, `HEDERA_PRIVATE_KEY`,
 `HCS_TOPIC_ID`). None of them are read automatically by this package —
-`createFacilitatorApp`'s options and `journal.ts`'s injectable `submitter` are
-the actual configuration surface; an operator's own bootstrap code is
-responsible for reading `process.env` and passing values in, as shown above.
+`createFacilitatorApp`'s options and `journal.ts`'s injectable `submitter`
+are the actual configuration surface; an operator's own bootstrap code is
+responsible for reading `process.env` and passing values in, as shown
+above.
 
 ## Testing
 
@@ -187,15 +215,18 @@ RUN_E2E=1 pnpm --filter @ferry402/facilitator test:e2e
 ```
 
 The one test file in this package that touches real networks: a real
-deployed `Escrow` on Base Sepolia, a real payer-signed EIP-3009 authorization
-over real testnet USDC, a real settlement transaction, and a real HCS journal
-entry read back from the Hedera testnet mirror node. Gated behind
-`RUN_E2E=1` and excluded from the default `pnpm test`/`vitest run` (it spends
-real testnet funds on every run) — without it, the file is still collected
-(shows as **skipped**, not silently absent) but does no network I/O and needs
-no credentials, so importing it is safe with no `.env` present at all. See
-the root README's "Live end-to-end run" section for the most recent proof
-(transaction hash, Hashscan link, measured `gasUsed`).
+deployed `Escrow` on Base Sepolia, a real payer-signed EIP-3009
+authorization over real testnet USDC, a real settlement transaction, and a
+real HCS journal entry read back from the Hedera testnet mirror node.
+
+Gated behind `RUN_E2E=1` and excluded from the default
+`pnpm test`/`vitest run`, since it spends real testnet funds on every run.
+Without it, the file is still collected (shows as **skipped**, not silently
+absent) but does no network I/O and needs no credentials, so importing it
+is safe with no `.env` present at all.
+
+See the root README's "Live end-to-end run" section for the most recent
+proof (transaction hash, Hashscan link, measured `gasUsed`).
 
 ## More
 
@@ -203,7 +234,3 @@ the root README's "Live end-to-end run" section for the most recent proof
 - [Deployments](../../docs/deployments.md) — live addresses and every settlement transaction this facilitator has submitted.
 - [Troubleshooting](../../docs/troubleshooting.md) — the failure modes an operator actually hits.
 - [`SECURITY.md`](../../SECURITY.md) — what a malicious or failing facilitator can and cannot do.
-
-Note this package is `private: true` and is **not** published to npm. Running
-a facilitator means self-hosting from this source — which is deliberate:
-nothing in ferry402 requires trusting someone else's instance.

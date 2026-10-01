@@ -19,6 +19,14 @@ jobs:
       # committed, and what corepack uses locally.
       - uses: pnpm/action-setup@v4
 
+      # Foundry is needed in THIS job too, not just the `contracts` job below.
+      # packages/facilitator's tests spin up a real local chain by spawning
+      # `anvil` (see test/support/anvil.ts) rather than mocking an RPC, so
+      # without `anvil` on PATH `pnpm -r test` fails here while passing on any
+      # developer machine that has Foundry installed. That is exactly how this
+      # went unnoticed.
+      - uses: foundry-rs/foundry-toolchain@v1
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20.18.3'

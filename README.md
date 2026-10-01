@@ -1,45 +1,48 @@
 # ferry402
 
-`ferry402` lets an [x402](https://x402.org)-protected HTTP service accept a
-payment signed by a user on another chain, settling it into a non-custodial,
-per-chain `Escrow` contract the merchant can always withdraw from. Hedera is
-the clearing ledger: every settled payment is journaled, in order, to a
-Hedera Consensus Service (HCS) topic, giving a merchant or auditor a
-timestamped, mirror-node-queryable index to reconcile on-chain escrow state
-against — rather than taking the facilitator's word for what it settled.
+[![npm](https://img.shields.io/npm/v/@ferry402/sdk)](https://www.npmjs.com/package/@ferry402/sdk)
+[![CI](https://github.com/mdmudassir0143/ferry402/actions/workflows/ci.yaml/badge.svg)](https://github.com/mdmudassir0143/ferry402/actions/workflows/ci.yaml)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
-**Today that means Base and Base Sepolia.** The chain layer is an adapter
-boundary and the config types already name Polygon, but no Polygon adapter
-is written — see the `accept` row under "Configuration". Everything below
-was built and proven against Base Sepolia.
+**Charge for an HTTP endpoint, let anyone pay from another chain, and keep an
+auditable record of every payment on Hedera.**
 
-See [`docs/superpowers/specs/2026-09-23-ferry402-design.md`](docs/superpowers/specs/2026-09-23-ferry402-design.md)
-for the full design, including the three amendments that are load-bearing
-throughout this codebase (merchant binding, crediting the observed balance
-delta rather than the requested amount, and merchant identity being two
-separate identifiers).
+One line of Express middleware turns a route into a paid one. A caller pays in
+USDC on Base; the money lands in an escrow contract only you can withdraw
+from; and every settled payment is written to a Hedera Consensus Service
+topic, so you can prove what you were paid without trusting anyone's word for
+it.
 
-## Documentation
+Built on [x402](https://x402.org), the HTTP 402 payment standard.
 
-| Document | What's in it |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | How a payment moves end to end, the trust model, and the design decisions behind it. |
-| [`docs/deployments.md`](docs/deployments.md) | Every deployed address and every settlement transaction, with explorer links and commands to reproduce the reconciliation yourself. |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Real failure modes, the symptom you actually see, and the fix. |
-| [`SECURITY.md`](SECURITY.md) | Threat model, the attacks each property closes, known limitations, and how to report a vulnerability. |
-| [`AGENTS.md`](AGENTS.md) | Conventions for agents working on this repo, and a payer loop for autonomous agents paying for resources. |
-| [`examples/demo`](examples/demo) | A runnable, narrated demo against live Base Sepolia + Hedera testnet. |
+> **Status: testnet, unaudited.** Working and proven on Base Sepolia +
+> Hedera testnet across [seven live payments](#proof-its-real). No third-party
+> audit. Don't put mainnet money through it yet. See
+> [SECURITY.md](SECURITY.md).
 
-## Quickstart
+---
+
+## Try it in 30 seconds
 
 ```bash
 git clone https://github.com/mdmudassir0143/ferry402.git
-cd ferry402
-pnpm install
-pnpm -r build   # @ferry402/sdk publishes from dist/; facilitator resolves it through the workspace symlink
+cd ferry402/examples/demo
+npm install && npm run demo
 ```
 
-Guard a route — the one-line integration:
+That runs a real payment against live Base Sepolia and Hedera testnet and
+narrates every step — the 402 challenge, the signed authorization, the
+settlement transaction, the Hedera journal entry, and a three-way
+reconciliation. It then demonstrates three attacks being rejected. You'll need
+a funded `.env` ([see below](#environment-variables)).
+
+## Install
+
+```bash
+npm install @ferry402/sdk
+```
+
+Charge for a route:
 
 ```ts
 import express from 'express'
@@ -47,12 +50,12 @@ import { ferry402 } from '@ferry402/sdk'
 
 const app = express()
 
-app.get('/premium-endpoint', ferry402(config), (_req, res) => {
-  res.json({ data: 'this only serves once payment verifies' })
+app.get('/premium', ferry402(config), (_req, res) => {
+  res.json({ data: 'only served once payment verifies' })
 })
 ```
 
-Run the facilitator that `ferry402()` calls `/verify` against:
+Run the facilitator the middleware verifies against:
 
 ```ts
 import { createFacilitatorApp } from '@ferry402/facilitator'
@@ -66,106 +69,70 @@ const app = createFacilitatorApp({
 app.listen(3000)
 ```
 
-Both snippets above are copy-pasteable and run as-is (given a real `config`/
-`.env` — see "Configuration" below); `pnpm install && pnpm -r build && pnpm -r test`
-is what this repo's own CI-equivalent path runs, and every command in this
-README was run against this branch while writing it.
+**The middleware verifies; it doesn't collect.** After `next()` runs, your
+handler calls the facilitator's `/settle` to actually move the money and
+writes the journal entry. [`examples/demo/src/run.ts`](examples/demo/src/run.ts)
+shows the complete wiring, and
+[`packages/facilitator/README.md`](packages/facilitator/README.md) explains why
+it's split this way.
 
-`ferry402(config)` returns an Express `RequestHandler`. An unpaid request
-gets a `402` with an `accepts` array describing every chain this merchant
-takes payment on; a request carrying a valid `X-PAYMENT` header (a
-base64-encoded, signed EIP-3009 `ReceiveWithAuthorization` payload) is
-verified against the facilitator and, once approved, falls through to your
-own route handler via `next()`.
-
-**`ferry402()` only verifies — it does not itself call `/settle`.** Actually
-collecting the payment (submitting the authorization to `Escrow.sol`) and
-journaling it to HCS is the route handler's job, immediately after `next()`
-runs — see `packages/facilitator/README.md`'s "Typical wiring" section and
-`packages/facilitator/test/e2e.test.ts` for a complete, real-network example
-of that wiring end to end.
-
-## How a payment moves through the system
+## How a payment works
 
 ```
 402 ──▶ signed authorization ──▶ verify ──▶ serve ──▶ settle ──▶ HCS journal
 ```
 
-1. **402** — an unpaid `GET` gets a `PaymentRequirements` array, one entry
-   per accepted chain, each carrying a merchant-bound `paymentId`/nonce
-   derived stateless-ly from `(secret, merchantEvm, resource, time bucket)`.
-2. **Signed authorization** — the payer signs an EIP-3009
-   `ReceiveWithAuthorization` over that exact nonce and retries with an
-   `X-PAYMENT` header.
-3. **Verify** — `ferry402()` recomputes the nonce locally (proving resource
-   binding and TTL with no store lookup), then calls the facilitator's
-   `POST /verify`, which checks the signature and the payer's real on-chain
-   balance.
-4. **Serve** — once verified, the request falls through to your route
-   handler via `next()`. The resource is served here, *before* settlement —
-   this codebase is serve-then-settle, matching the trust model x402 itself
-   assumes (a verified signature is as good as cash for a $0.01 API call).
-5. **Settle** — your handler calls the facilitator's `POST /settle`, which
-   submits the authorization to `Escrow.sol` on the source chain. USDC moves
-   from the payer directly into the escrow, credited to the merchant's
-   ledger row — the facilitator never custodies funds.
-6. **HCS journal** — your handler journals the *observed* settled amount
-   (read back from the settlement transaction's `PaymentSettled` log, not
-   the amount merely requested) to a Hedera Consensus Service topic, giving
-   an ordered, mirror-node-queryable audit trail independent of trusting the
-   facilitator's word.
+**1 · The 402.** An unpaid request gets a list of payment options, one per
+chain you accept. Each carries a `paymentId` and nonce derived from
+`(secret, your EVM address, the resource, a 5-minute time bucket)` — computed
+on the fly, never stored.
 
-## Configuration
+**2 · The signature.** The payer signs an EIP-3009
+`ReceiveWithAuthorization` over that exact nonce and retries with an
+`X-PAYMENT` header. No gas, no transaction — just a signature.
 
-### `Ferry402Config` (merchant-side, `@ferry402/sdk`)
+**3 · Verify.** The middleware recomputes the nonce locally, which proves the
+payment was issued for *this* resource and is still inside its window with no
+database lookup. It then asks the facilitator to check the signature and the
+payer's real on-chain balance.
 
-| Field | Required | Notes |
-|---|---|---|
-| `secret` | **Yes** | **Minimum 32 bytes.** `ferry402(config)` throws synchronously at construction if missing or short — there is no fallback to a randomly-generated value. Every process/instance serving this merchant's traffic **must share the exact same `secret`**: it is what lets two independent `ferry402` instances validate each other's issued challenges with no shared store at all. A per-process random secret would not error — it would silently make every horizontally-scaled or rolling-restarted deployment reject legitimate payments under load, whenever a payer's retry landed on a different instance than the one that issued their 402. Generate once with `openssl rand -hex 32`; load from a secret store/env var; never commit it. |
-| `merchant` | Yes | Your **Hedera account id** (e.g. `"0.0.123456"`) — the clearing-layer identity the HCS journal keys on. |
-| `merchantEvm` | Yes | Per-chain **EVM address**, e.g. `{ 'base-sepolia': '0x...' }`. **Not the same identifier as `merchant`** — one is a Hedera account id, the other an EVM address, and the nonce binding (`keccak256(abi.encode(merchantEvm, paymentId))`) hashes the EVM address specifically. Mixing them up, or using the wrong chain's address, makes every settlement on that chain revert `MerchantNotBound`. |
-| `accept` | Yes | Which chains this merchant takes payment on. **The type allows `'base' \| 'base-sepolia' \| 'polygon' \| 'polygon-amoy'`, but the facilitator in this repo only serves `base` and `base-sepolia`.** Listing `polygon` or `polygon-amoy` produces a 402 advertising a chain no payment can complete on — every attempt comes back `invalid_network`. The Polygon entries are type scaffolding for a chain adapter that is not written yet. |
-| `escrows` | Yes | Per-chain `Escrow` contract address funds are paid into (`payTo` in the 402 response). |
-| `assets` | Yes | Per-chain USDC (v1 only supports USDC) contract address. |
-| `facilitator` | Yes | Base URL of the facilitator `ferry402()` calls `/verify` against. |
-| `price` | Yes | Decimal-dollar string, e.g. `"$0.01"`. Rejects (does not round) more than 6 fractional digits. |
-| `settleTo` | Yes | Always `'hedera'` in v1. |
+**4 · Serve.** Your handler runs. Note the resource is served *before*
+settlement — see [the honest caveat](#serve-then-settle).
 
-### `FacilitatorAppOptions` (`createFacilitatorApp`, `@ferry402/facilitator`)
+**5 · Settle.** Your handler calls `/settle`, which submits the authorization
+to `Escrow.sol`. USDC moves from the payer straight into escrow, credited to
+your ledger row. The facilitator never holds funds.
 
-| Field | Required | Notes |
-|---|---|---|
-| `escrows` | **Yes — fails closed** | A per-network map from `'base' \| 'base-sepolia'` to the `Escrow` address this facilitator operator actually deployed and trusts. `POST /verify` and `POST /settle` are both unauthenticated and otherwise take `payTo` straight from the caller — **`escrows` is the allowlist that stops an anonymous caller naming their own contract as the payment destination.** A facilitator started with **no `escrows` at all** (or missing an entry for a network) rejects **every** request for that network: `/verify` returns `invalid_payment_requirements`, `/settle` fails generically. If every request comes back rejected in production, check this first — it looks "up" from a health-check perspective while still refusing 100% of real traffic. |
-| `rpcUrls` | No | Per-network RPC override. Omitted networks fall back to viem's public `base`/`base-sepolia` endpoints — fine for development, not recommended for production (rate limits and availability of a public endpoint gate the whole payment path). |
-| `facilitatorPrivateKey` | No (defaults to `process.env.FACILITATOR_PRIVATE_KEY`) | Submits every settlement transaction to `Escrow.sol`. Needs gas on every chain it settles on. Never logged. |
+**6 · Journal.** Your handler writes the *observed* settled amount — read back
+from the transaction's `PaymentSettled` log, not the amount that was requested
+— to a Hedera topic.
 
-## Client compatibility: stock x402 clients cannot pay a ferry402 route
+Full detail in [docs/architecture.md](docs/architecture.md).
 
-**No client built against plain `x402@1.2.0`** (`x402-fetch`, `x402-axios`,
-or a hand-rolled client using that package's `createNonce()`) **can complete
-a ferry402 payment.** This is a deliberate consequence of closing a real
-vulnerability, not a bug:
+## The one thing that will trip you up
 
-- Amendment 1 (see the design doc) binds the EIP-3009 authorization `nonce`
-  to the merchant it was issued for — `nonce = keccak256(abi.encode(merchantEvm,
-  paymentId))` — so a signed payment can never be redirected to a merchant
-  other than the one whose 402 the payer actually saw.
-- `x402@1.2.0`'s own client helpers mint that nonce as **random bytes**
-  instead. A random nonce never equals either of ferry402's derived
-  candidates, so `ferry402`'s middleware rejects it with `invalid_payment`
-  — indistinguishable, from the client's side, from any other nonce
-  mismatch (an expired challenge included; ferry402 cannot tell the two
-  apart, since the validity window is enforced by the HMAC derivation
-  itself rather than a store it could inspect for a cause).
+**Stock x402 clients cannot pay a ferry402 route.** Not `x402-fetch`, not
+`x402-axios`, not anything built on plain `x402@1.2.0`.
 
-Use `createPaymentHeader` from `@ferry402/sdk` instead — it derives the
-correct nonce and signs the authorization for you:
+Those clients generate the authorization nonce as random bytes. ferry402
+*derives* it, binding it to the merchant who issued the 402:
+
+```
+nonce = keccak256(abi.encode(merchantEvm, paymentId))
+```
+
+That binding is what stops a signed payment being redirected to a different
+merchant — anyone who intercepted the signature could otherwise credit
+themselves. A random nonce never matches, so the payment is rejected. This is
+the security property working, not a bug.
+
+Use `createPaymentHeader` instead:
 
 ```ts
 import { createPaymentHeader } from '@ferry402/sdk'
 import { privateKeyToAccount } from 'viem/accounts'
 
-const res = await fetch('http://merchant.example/premium-endpoint')
+const res = await fetch('http://merchant.example/premium')
 const { accepts } = await res.json()
 
 const account = privateKeyToAccount(process.env.PAYER_PRIVATE_KEY as `0x${string}`)
@@ -173,145 +140,209 @@ const header = await createPaymentHeader(accepts[0], account, {
   tokenName: 'USDC', tokenVersion: '2', chainId: 84532,
 })
 
-await fetch('http://merchant.example/premium-endpoint', { headers: { 'X-PAYMENT': header } })
+await fetch('http://merchant.example/premium', { headers: { 'X-PAYMENT': header } })
 ```
 
-This is a lift of the exact signing logic proven against a real chain in
-`packages/facilitator/test/e2e.test.ts` — see `@ferry402/sdk`'s own README
-for the full option reference. There is currently no packaged, higher-level
-client (a fetch/axios wrapper that runs this loop automatically) — that is
-known future work, not something this repo ships today.
+There's no packaged fetch/axios wrapper that runs this loop for you yet.
+[AGENTS.md](AGENTS.md) has a complete payer loop for autonomous agents.
 
-## Security properties
-
-- **Merchant binding (Amendment 1).** The authorization nonce commits to
-  `(merchantEvm, paymentId)`. A signature cannot be redeemed by, or
-  redirected to, any merchant other than the one it was signed for —
-  enforced independently by `Escrow.settleAuthorization` on-chain and by
-  the facilitator's `/verify` off-chain, both recomputing the identical
-  hash.
-- **Replay defense, derived not stored.** Resource binding and the payment
-  window fall out of a keyed derivation
-  (`HMAC-SHA256(secret, merchantEvm ‖ resource ‖ timeBucket)`), not a
-  lookup table an attacker could exhaust — issuing a 402 costs zero storage,
-  for any volume of anonymous requests. "Never redeemed before" is the one
-  property derivation alone cannot prove, so a `ConsumedNonceStore` is
-  still consulted, but it is only written to once a request reaches the
-  point of actually being paid.
-- **Non-custodial withdrawal.** Every payment settles into a per-chain
-  `Escrow` contract the merchant can always `withdraw` from. There is no
-  admin path — not for the facilitator, not for `ferry402` itself — that
-  can move a merchant's credited funds anywhere else. A facilitator can
-  refuse service or misbehave, but it cannot drain escrow.
-- **Observed-delta crediting (Amendment 2).** Settlement credits the
-  *measured* balance change on the escrow contract, never the amount an
-  authorization merely requested — this matters under any token whose
-  transfer doesn't move exactly the requested amount.
-
-### Known limitations
-
-- **The default `InMemoryConsumedNonceStore` is per-process.** It is not
-  shared across horizontally-scaled instances, and a process restart clears
-  it — for the derivation window still open at restart time (up to
-  `2 * TIME_BUCKET_SECONDS` = 10 minutes by default), replay protection for
-  any nonce derived just before the restart is gone. Pass your own
-  `ConsumedNonceStore` (Redis, a database, ...) via
-  `ferry402(config, { consumedNonceStore })` for a production,
-  multi-instance deployment.
-- **No packaged payer-side client** beyond the `createPaymentHeader` helper
-  — see "Client compatibility" above.
-- **Consolidation/netting across chains, and a Hedera-side
-  `SettlementLedger.sol`,** are in the original design doc but not part of
-  this slice: this repo implements per-chain escrow and HCS journaling
-  only. A merchant reconciles by reading the journal directly.
-- **The HCS journal topic has no submit key.** The deployed topic
-  (`0.0.10719807`) was created with `submit_key: null`, so anyone can append
-  a message to it, and with `admin_key: null`, so it can never be
-  reconfigured or deleted. A journal entry is therefore *not* standalone
-  proof that a payment happened — it is an ordered, timestamped index. The
-  trustworthy check is the reconciliation: filter entries by `merchantEvm`
-  and verify each `txHash` against Base Sepolia, which is what the demo and
-  the e2e test both do. Set a submit key on your own topic if you want
-  append to be restricted.
-- **No third-party audit.** The contract has a 39-test Foundry suite
-  including fuzz and invariant runs, and the security properties below are
-  each tested, but nobody outside this project has reviewed it. Testnet
-  only.
-
-## The live proof
-
-Every claim above was exercised against real networks, not mocks.
-`packages/facilitator/test/e2e.test.ts` (gated behind `RUN_E2E=1`) and
-[`examples/demo`](examples/demo) both run genuine payments against Base
-Sepolia and Hedera testnet. As of 2026-10-01 there have been **seven live
-settlements**, every one of them `status: 1` on chain:
+## Documentation
 
 | | |
 |---|---|
-| `Escrow` on Base Sepolia | [`0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429`](https://sepolia.basescan.org/address/0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429) |
-| Deployment tx | [`0xcbca16cf…93819f25`](https://sepolia.basescan.org/tx/0xcbca16cf6820716b31f0e33ae68084f7d4835c0c80458da82d50f81293819f25) · block 47300767 · 1187384 gas |
+| [Architecture](docs/architecture.md) | How a payment moves, the trust model, the design decisions |
+| [Deployments](docs/deployments.md) | Every address and transaction, with commands to verify them yourself |
+| [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes, fixes |
+| [Security](SECURITY.md) | Threat model, what each property defends, how to report a vulnerability |
+| [Agents](AGENTS.md) | For agents contributing here, and for agents paying for resources |
+| [Contributing](CONTRIBUTING.md) | Setup, what a good change looks like |
+
+## Configuration
+
+Both config objects are fully documented in their own packages —
+[`@ferry402/sdk`](packages/sdk/README.md#configuration-reference) and
+[`@ferry402/facilitator`](packages/facilitator/README.md#configuring-createfacilitatorapp).
+The fields worth knowing before you start:
+
+| Field | Where | Notes |
+|---|---|---|
+| `secret` | SDK | Required, min 32 bytes. **Every instance must share it** — see below |
+| `merchant` | SDK | Your Hedera account id, e.g. `0.0.123456` |
+| `merchantEvm` | SDK | Per-chain EVM payout address. **A different identifier from `merchant`** |
+| `accept` | SDK | Chains you take payment on. **Base only today** — see below |
+| `escrows` | facilitator | Required allowlist of escrow addresses. **Fails closed** — see below |
+
+**`secret` must be identical across every instance** serving a merchant. It's
+what lets two processes validate each other's challenges with no shared
+database. Generate it once with `openssl rand -hex 32` and load it from your
+secret store. A per-process random value wouldn't throw — it would silently
+reject legitimate payments whenever a payer's retry landed on a different
+instance than the one that issued their 402.
+
+**`merchant` and `merchantEvm` are not interchangeable.** One is a Hedera
+account id, the other an EVM address, and the nonce binding hashes the EVM
+address specifically. Mixing them up makes every settlement revert
+`MerchantNotBound`.
+
+**`accept` only works for Base today.** The type names `'base' |
+'base-sepolia' | 'polygon' | 'polygon-amoy'`, but the facilitator in this repo
+only serves the two Base networks. Listing a Polygon network produces a 402
+that no payment can satisfy — every attempt returns `invalid_network`. The
+Polygon entries are scaffolding for an adapter nobody has written.
+
+**The facilitator's `escrows` option fails closed.** `/verify` and `/settle`
+are unauthenticated and otherwise take the payment destination straight from
+the caller, so this allowlist is what stops an anonymous caller naming their
+own contract. It's required: omit it and `createFacilitatorApp` throws at
+construction.
+
+## Proof it's real
+
+Seven live payments on Base Sepolia, every one `status: 1` on chain.
+
+| | |
+|---|---|
+| `Escrow` contract | [`0x99Cd…C429`](https://sepolia.basescan.org/address/0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429) |
+| Deployed in | [tx `0xcbca16cf…`](https://sepolia.basescan.org/tx/0xcbca16cf6820716b31f0e33ae68084f7d4835c0c80458da82d50f81293819f25) · block 47300767 · 1187384 gas |
 | Token | [Base Sepolia USDC](https://sepolia.basescan.org/address/0x036CbD53842c5426634e7929541eC2318f3dCF7e) (6 decimals) |
-| Most recent settlement | [`0x02f82398…7c381ffe`](https://sepolia.basescan.org/tx/0x02f82398c8ddedc1d93246081c5d92719772e990b76e50ff3b219bdb7c381ffe) · block 47538498 · 107712 gas |
-| HCS journal topic | [`0.0.10719807`](https://hashscan.io/testnet/topic/0.0.10719807) — 7 entries, one per settlement |
+| Latest settlement | [tx `0x02f82398…`](https://sepolia.basescan.org/tx/0x02f82398c8ddedc1d93246081c5d92719772e990b76e50ff3b219bdb7c381ffe) · block 47538498 · 107712 gas |
+| Hedera journal | [topic `0.0.10719807`](https://hashscan.io/testnet/topic/0.0.10719807) · 7 entries |
 
-**Three-way reconciliation, read live rather than asserted:** the HCS journal
-entries for this merchant sum to **70000**, `Escrow.balanceOf(merchantEvm)`
-reads **70000**, and the real `USDC.balanceOf(escrow)` on Base Sepolia also
-reads **70000**. The journal agrees with the ledger, and the ledger is fully
-backed by tokens the contract actually holds.
+**Three independent sources agree.** The Hedera journal entries sum to
+`70000`, `Escrow.balanceOf(merchantEvm)` reads `70000`, and the escrow's real
+`USDC.balanceOf` reads `70000`. The journal matches the ledger, and the ledger
+is fully backed by tokens the contract actually holds.
 
-A settlement costs **141900 gas** the first time a given merchant is paid and
-**~107700** every time after — the difference is the cold storage write on
-that merchant's balance slot.
-
-Reproduce the on-chain half yourself. These are public reads; no credentials,
-no API key:
+Check it yourself — these are public reads, no credentials or API key:
 
 ```bash
-cast call 0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429 "balanceOf(address)(uint256)" 0x86eEa3B06E6994eaF8Ce3Fcfde6A2F8Fb2Ba947b --rpc-url https://sepolia.base.org
-cast call 0x036CbD53842c5426634e7929541eC2318f3dCF7e "balanceOf(address)(uint256)" 0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429 --rpc-url https://sepolia.base.org
+cast call 0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429 "balanceOf(address)(uint256)" \
+  0x86eEa3B06E6994eaF8Ce3Fcfde6A2F8Fb2Ba947b --rpc-url https://sepolia.base.org
+cast call 0x036CbD53842c5426634e7929541eC2318f3dCF7e "balanceOf(address)(uint256)" \
+  0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429 --rpc-url https://sepolia.base.org
 curl -s "https://testnet.mirrornode.hedera.com/api/v1/topics/0.0.10719807/messages?limit=25&order=asc"
 ```
 
-[`docs/deployments.md`](docs/deployments.md) has the full table — all seven
-transactions with blocks, gas, amounts and consensus timestamps — plus the
-Hedera topic's configuration and what it means that the topic has no submit
-key.
+Gas: **141900** for a merchant's first payment, **~107700** after. The
+difference is the cold storage write on their balance slot.
 
-## Packages
+All seven transactions, with blocks, gas, amounts and consensus timestamps,
+are in [docs/deployments.md](docs/deployments.md).
 
-| Package | What it is |
+## What it defends against
+
+- **Merchant binding.** The nonce commits to `(merchantEvm, paymentId)`, so a
+  signature can't be redirected to another merchant. Enforced twice
+  independently: on-chain by `Escrow.settleAuthorization`, off-chain by the
+  facilitator, both recomputing the same hash.
+- **Replay, without an exhaustible store.** Resource binding and the payment
+  window fall out of an HMAC derivation, not a lookup table an attacker could
+  fill up with free requests. Issuing a 402 costs no storage at all. The one
+  thing derivation can't prove is "never redeemed before", so a
+  `ConsumedNonceStore` is consulted — but only written once a request is
+  actually being paid for.
+- **Non-custodial withdrawal.** Payments land in an escrow only the merchant
+  can withdraw from. There is no admin path — not for the facilitator, not for
+  ferry402 — that can move credited funds. A facilitator can refuse service;
+  it cannot drain escrow.
+- **Crediting what actually arrived.** Settlement credits the measured balance
+  change, never the amount an authorization requested. That matters for any
+  token whose transfer doesn't move exactly what was asked for.
+
+[SECURITY.md](SECURITY.md) has the full threat model.
+
+## Known limitations
+
+<a id="serve-then-settle"></a>
+**Serve-then-settle.** The resource is served once `/verify` passes, before
+settlement is on-chain. This is x402's own trust assumption — a verified
+signature treated as good as cash for a small payment — but the window is
+real: a payer could spend their balance elsewhere in the gap, or settlement
+could fail after you've handed over the resource. `/verify` checks live
+balance, a settlement-time buffer, and that the escrow's token matches, which
+narrows it as far as this architecture allows. The residual risk lands on the
+merchant.
+
+**Replay protection is per-process by default.** `InMemoryConsumedNonceStore`
+isn't shared between instances, and a restart clears it — losing replay
+protection for the window still open at that moment (up to 10 minutes). Pass
+your own store (Redis, a database) via
+`ferry402(config, { consumedNonceStore })` for anything multi-instance.
+
+**The Hedera topic has no submit key.** Topic `0.0.10719807` was created with
+`submit_key: null`, so anyone can append to it, and `admin_key: null`, so that
+can never change. A journal entry is therefore **not standalone proof of
+payment** — it's an ordered, timestamped index. The trustworthy check is the
+reconciliation: filter by `merchantEvm` and verify each `txHash` against the
+chain, which is what the demo and the e2e test both do. Set a submit key on
+your own topic if you want appends restricted.
+
+**No audit.** 39 Foundry tests including fuzz and invariant runs, and every
+property above is tested — but nobody outside this project has reviewed it.
+
+**No packaged payer client**, beyond `createPaymentHeader`.
+
+**Cross-chain netting and a Hedera-side `SettlementLedger.sol`** are in the
+design but not built. This repo does per-chain escrow and journaling; you
+reconcile by reading the journal.
+
+## Repo layout
+
+| | |
 |---|---|
-| [`packages/contracts`](packages/contracts) | `Escrow.sol` — the non-custodial per-chain vault. A standalone Foundry project (no `package.json` — it is **not** a pnpm workspace member; `forge test` runs it directly). |
-| [`@ferry402/sdk`](packages/sdk) | The `ferry402()` Express middleware, `createPaymentHeader`, `buildRequirements`, and the stateless-challenge/nonce primitives. Published as an ESM-only build from `dist/`. |
-| [`@ferry402/facilitator`](packages/facilitator) | `createFacilitatorApp()` — the `/verify` + `/settle` HTTP service, plus the HCS journal writer (`journal.ts`). Self-hostable; nothing requires trusting a hosted instance. Marked `private` — it is not yet packaged for standalone publishing. |
-| [`examples/demo`](examples/demo) | A runnable, narrated end-to-end demo against live Base Sepolia + Hedera testnet. Depends on the **published** `@ferry402/sdk` from npm, so it exercises what an integrator actually installs. |
+| [`packages/contracts`](packages/contracts) | `Escrow.sol`, the non-custodial vault. Standalone Foundry project — **not** a pnpm workspace member, so `pnpm -r` never touches it |
+| [`packages/sdk`](packages/sdk) | `@ferry402/sdk` — the middleware, `createPaymentHeader`, and the challenge/nonce primitives. ESM only |
+| [`packages/facilitator`](packages/facilitator) | `createFacilitatorApp()` — the `/verify` + `/settle` service and journal writer. `private`, so self-host from source |
+| [`examples/demo`](examples/demo) | The narrated live demo. Installs the **published** SDK from npm, so it tests what you'd actually get |
 
-## Prerequisites
+## Development
 
-- **Node >= 20.18.3** (see `engines` in every `package.json`)
-- **pnpm 9** (`packageManager` pins `9.15.9`)
-- **[Foundry](https://getfoundry.sh)** (`forge`/`cast`/`anvil`) — required to build/test `packages/contracts`, and to deploy `Escrow.sol`
-- A **funded Base Sepolia key** (or Base mainnet, for a real deployment) to deploy `Escrow.sol` and to run the facilitator's settlement wallet
-- A **Hedera testnet (or mainnet) account** — an account id and private key, used as the HCS journal's operator
+**You'll need** Node >= 20.18.3, pnpm 9 (pinned via `packageManager`, so
+`corepack enable` is enough), and [Foundry](https://getfoundry.sh) for the
+contracts.
 
-## Environment variables
+```bash
+pnpm install
+pnpm -r build   # required before testing: the facilitator resolves the SDK through dist/
+pnpm -r test    # sdk 138 · facilitator 92 (+1 skipped)
+```
 
-Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`**
-(it is gitignored, and must stay that way).
+Contract tests run separately, because `packages/contracts` has no
+`package.json` and isn't a workspace member:
 
-| Variable | Used by | Notes |
-|---|---|---|
-| `BASE_SEPOLIA_RPC_URL` | facilitator bootstrap, deploy script | Public RPC by default (`https://sepolia.base.org`); a production deployment should point this at a private RPC provider. |
-| `DEPLOYER_PRIVATE_KEY` | `forge create` (contract deployment only) | Testnet key. Needs Base Sepolia ETH for gas. Never read by the facilitator at runtime. |
-| `FACILITATOR_PRIVATE_KEY` | `@ferry402/facilitator`'s `/settle` | Submits every settlement transaction to `Escrow.sol`. Needs Base Sepolia ETH for gas. Never logged, anywhere. |
-| `PAYER_PRIVATE_KEY` | test/demo clients only | Signs the EIP-3009 authorization via `createPaymentHeader`. Needs USDC, **not ETH** — EIP-3009 is signed off-chain; the payer never submits a transaction or pays gas. |
-| `ESCROW_ADDRESS_BASE_SEPOLIA` | facilitator bootstrap (`escrows` option), merchant config | Set after deploying `Escrow.sol` (see below). **Not a secret** — this is the trusted-escrow allowlist entry an operator must pass explicitly to `createFacilitatorApp({ escrows: {...} })`; it is never read automatically. |
-| `HEDERA_ACCOUNT_ID` | HCS topic creation, journal writer | Hedera account id, e.g. `0.0.123456`. |
-| `HEDERA_PRIVATE_KEY` | HCS topic creation, journal writer | **If ECDSA (the common case for a fresh testnet account from the Hedera portal), it is DER-encoded — load with `PrivateKey.fromStringDer()` or `fromStringECDSA()`, never `fromStringED25519()`.** The ED25519 loader does not error on a mismatched key type; it silently derives the wrong key, and the resulting `INVALID_SIGNATURE` at submit time gives no indication why. |
-| `HCS_TOPIC_ID` | journal writer | Set after creating the topic (see below). **Not a secret.** |
+```bash
+cd packages/contracts && forge test   # 39 tests, including a 128k-call invariant run
+```
 
-### Deploying `Escrow.sol`
+None of that touches a network or spends anything.
+
+### The live end-to-end test
+
+```bash
+RUN_E2E=1 pnpm --filter @ferry402/facilitator test:e2e
+```
+
+One genuine payment against real networks. Excluded from `pnpm test` because
+it spends real testnet USDC and ETH every run. Without `RUN_E2E=1` the file is
+still collected and reported as **skipped** rather than silently missing, and
+needs no credentials.
+
+### Environment variables
+
+Copy `.env.example` to `.env`. **Never commit `.env`** — it's gitignored and
+must stay that way. `.env.example` documents every variable; the two that
+cause the most trouble:
+
+**`HEDERA_PRIVATE_KEY`** — a fresh ECDSA account from the Hedera portal gives
+you a DER-encoded key. Load it with `PrivateKey.fromStringDer()` or
+`fromStringECDSA()`, **never** `fromStringED25519()`. The ED25519 loader
+doesn't error on the wrong key type; it silently derives a different key, and
+the `INVALID_SIGNATURE` you get at submit time gives no hint why.
+
+**`PAYER_PRIVATE_KEY`** — needs USDC, not ETH. EIP-3009 is signed off-chain,
+so the payer never submits a transaction or pays gas.
+
+### Deploying your own
 
 ```bash
 cd packages/contracts
@@ -322,56 +353,26 @@ forge create src/Escrow.sol:Escrow \
   --constructor-args <USDC_ADDRESS>
 ```
 
-(`--constructor-args` must be the **last** flag — `forge create`'s variadic
-arg parser otherwise swallows a following flag like `--broadcast` into the
-constructor-args list and reports a bogus arg-count mismatch.)
+`--constructor-args` must come **last** — `forge create`'s variadic parser
+otherwise swallows the next flag into the constructor args and reports a bogus
+arg-count mismatch.
 
-### Creating the HCS journal topic
+Then create a journal topic:
 
 ```bash
 pnpm --filter @ferry402/facilitator exec tsx scripts/create-topic.ts
 ```
 
-Prints the new topic id (e.g. `0.0.10719807`) — set it as `HCS_TOPIC_ID`.
+It prints the topic id; set it as `HCS_TOPIC_ID`.
 
-## Testing
+## Design notes
 
-```bash
-pnpm install
-pnpm -r build   # builds @ferry402/sdk and @ferry402/facilitator
-pnpm -r test    # sdk: vitest (123 tests) · facilitator: vitest (92 passed, 1 skipped)
-```
+The [design doc](docs/superpowers/specs/2026-09-23-ferry402-design.md) records
+the full architecture, including three amendments that are load-bearing
+throughout the codebase: merchant binding, crediting the observed balance delta
+rather than the requested amount, and merchant identity being two separate
+identifiers.
 
-**`pnpm -r test` does NOT run the contract tests.** `packages/contracts` is a
-plain Foundry project with no `package.json`, so it is not a pnpm workspace
-member and `pnpm -r` never touches it. Run those separately:
-
-```bash
-cd packages/contracts
-forge test   # 39 tests, 6 suites, including a 128k-call invariant fuzz run
-```
-
-None of the above touches a real network or spends real funds.
-
-### Live end-to-end run
-
-`packages/facilitator/test/e2e.test.ts` runs one genuine payment against real
-networks: a real deployed `Escrow` on Base Sepolia, a real EIP-3009
-authorization over real (testnet) USDC, a real settlement transaction, and a
-real HCS journal entry read back from the Hedera testnet mirror node. It is
-**deliberately excluded from `pnpm test`** — it spends real testnet USDC and
-ETH on every run and depends on two live networks being reachable. Run it
-explicitly, with `.env` fully populated:
-
-```bash
-RUN_E2E=1 pnpm --filter @ferry402/facilitator test:e2e
-```
-
-Without `RUN_E2E=1` the file is still collected (so it shows up as
-**skipped**, never silently missing) but neither its setup nor its assertions
-run — importing it is safe even with no `.env` on disk at all. See "The live
-proof" above for the most recent run's results.
-
-## License
+## Licence
 
 MIT — see [LICENSE](LICENSE).
