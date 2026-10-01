@@ -107,7 +107,13 @@ describe('POST /verify', () => {
   })
 
   it('returns 400 with invalid_payload for a body that does not match VerifyRequestSchema', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app).post('/verify').send({ nonsense: true })
 
     expect(res.status).toBe(400)
@@ -141,7 +147,13 @@ describe('POST /verify', () => {
   // task 7 (proven by manual probe at the time, per the task-7 report) but
   // was never covered by an automated test until now.
   it('returns JSON (not an HTML stack trace) for a malformed JSON body', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app)
       .post('/verify')
       .set('Content-Type', 'application/json')
@@ -167,7 +179,13 @@ describe('POST /verify', () => {
   // status a caller might actually branch on, not flattened to a generic
   // bad-request.
   it('returns JSON (not an HTML stack trace) for a body over the size limit', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const oversized = 'a'.repeat(20_000)
     const res = await request(app)
       .post('/verify')
@@ -290,7 +308,13 @@ describe('POST /settle', () => {
   })
 
   it('returns 400 with success:false for a body that does not match SettleRequestSchema', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app).post('/settle').send({ nonsense: true })
 
     expect(res.status).toBe(400)
@@ -308,7 +332,13 @@ describe('POST /settle', () => {
   // and `''` is not a member of `SettleResponseSchema`'s network enum -- see
   // `safeNetworkOrPlaceholder`'s doc comment in server.ts.
   it('returns JSON (not an HTML stack trace) for a malformed JSON body', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app)
       .post('/settle')
       .set('Content-Type', 'application/json')
@@ -328,7 +358,13 @@ describe('POST /settle', () => {
   // as the caller sent it, is available to decide which response shape to
   // use.
   it.each(['/settle/', '/SETTLE'])('recognizes %s as the settle route for a malformed JSON body', async (path) => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app).post(path).set('Content-Type', 'application/json').send('{not valid json')
 
     expect(res.status).toBe(400)
@@ -341,7 +377,13 @@ describe('POST /settle', () => {
   // error response, recovered via `SettleResponseSchema`'s own enum check --
   // not silently discarded just because some OTHER field was missing.
   it('recovers a valid network from a body that otherwise fails SettleRequestSchema', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app)
       .post('/settle')
       .send({ paymentPayload: { network: 'base', scheme: 'exact' } })
@@ -355,12 +397,50 @@ describe('POST /settle', () => {
   // verbatim -- only a value that is ITSELF a valid member of
   // `SettleResponseSchema`'s network enum may ever appear in the response.
   it('never echoes an attacker-controlled non-string network back in an error response', async () => {
-    const app = createFacilitatorApp()
+    // `escrows` is required at construction (demo fix 2 -- see
+    // `assertHasTrustedEscrows` in src/server.ts) even though none of these
+    // requests ever reach verifyPayment/settlePayment far enough to care
+    // what it contains: a malformed/oversized/schema-invalid body is
+    // rejected before either function is ever called. `DEFAULT_ESCROWS` is
+    // passed purely to satisfy that constructor guard.
+    const app = createFacilitatorApp({ escrows: DEFAULT_ESCROWS })
     const res = await request(app)
       .post('/settle')
       .send({ paymentPayload: { network: { injected: '<script>evil()</script>' } } })
 
     expect(res.status).toBe(400)
     expect(res.body).toEqual({ success: false, errorReason: 'invalid_payload', transaction: '', network: 'base-sepolia' })
+  })
+})
+
+// Demo fix 2: a facilitator built with `escrows` missing entirely used to
+// construct successfully and then reject EVERY /verify and /settle request,
+// forever, with the same generic `invalid_payment_requirements` a caller
+// also sees for a genuinely wrong `payTo` -- correct (fail-closed), but
+// indistinguishable from a broken install from the outside, and exactly the
+// kind of thing that burns five minutes in front of a demo audience. These
+// tests pin the loud, synchronous, construction-time failure that replaces
+// that silent full-rejection mode -- see `assertHasTrustedEscrows` in
+// src/server.ts. The per-request fail-closed check itself is untouched and
+// still covered by `verify.test.ts`'s `escrows: {}` tests and
+// `settle.fork.test.ts`'s "rejects settlement when no escrow is configured
+// for the network at all" test, both of which call `verifyPayment`/
+// `settlePayment` directly rather than through `createFacilitatorApp` --
+// this constructor guard is additional, not a replacement.
+describe('createFacilitatorApp construction', () => {
+  it('throws when escrows is omitted entirely', () => {
+    expect(() => createFacilitatorApp()).toThrow(/escrows/i)
+  })
+
+  it('throws when escrows is an empty object', () => {
+    expect(() => createFacilitatorApp({ escrows: {} })).toThrow(/escrows/i)
+  })
+
+  it('names the option and shows the expected shape in the thrown message', () => {
+    expect(() => createFacilitatorApp()).toThrow(/createFacilitatorApp\({\s*\n\s*escrows: \{ 'base-sepolia'/)
+  })
+
+  it('does not throw when escrows has at least one entry', () => {
+    expect(() => createFacilitatorApp({ escrows: DEFAULT_ESCROWS })).not.toThrow()
   })
 })

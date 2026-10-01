@@ -1,0 +1,27 @@
+{
+  "name": "ferry402-demo",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Runnable, narrated end-to-end demo of ferry402 against live Base Sepolia + Hedera testnet.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.3"
+  },
+  "scripts": {
+    "demo": "tsx src/run.ts",
+    "start": "tsx src/run.ts"
+  },
+  "dependencies": {
+    "@ferry402/sdk": "0.1.0",
+    "@hashgraph/sdk": "2.81.0",
+    "express": "^5.2.1",
+    "viem": "^2.56.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.3"
+  }
+}

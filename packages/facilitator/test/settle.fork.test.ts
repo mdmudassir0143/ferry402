@@ -508,4 +508,66 @@ describe('settlePayment', () => {
       expect(receipt.status).toBe('reverted')
     })
   })
+
+  // Demo fix 1: `settlePayment` previously constructed its `WalletClient`'s
+  // account with a bare `privateKeyToAccount(key)` -- no `nonceManager`. Two
+  // `/settle` calls that race (the exact thing a demo audience triggers by
+  // double-clicking "pay") then each resolve the facilitator's account nonce
+  // via an INDEPENDENT `eth_getTransactionCount` read, because that is
+  // viem's own fallback whenever `account.nonceManager` is unset. Both reads
+  // can return the SAME pending nonce; one submission lands and the other is
+  // either replaced, rejected "nonce too low" at the RPC, or left to poll
+  // `waitForTransactionReceipt` for up to its 180s default with no receipt
+  // ever coming. See the fix itself -- `privateKeyToAccount(key, {
+  // nonceManager })` -- at its call site in `chains/base.ts` for the full
+  // mechanism (viem's exported `nonceManager` singleton serializes nonce
+  // assignment per `(address, chainId)` through one promise chain).
+  describe('concurrent settlements (nonce manager, demo fix 1)', () => {
+    it('settles two concurrent, independently-valid authorizations and both land with distinct tx hashes and nonces', async () => {
+      const paymentIdA = freshPaymentId()
+      const paymentIdB = freshPaymentId()
+      const authA = authFields(paymentIdA, { value: '5000' })
+      const authB = authFields(paymentIdB, { value: '7000' })
+      const [signatureA, signatureB] = await Promise.all([sign(authA), sign(authB)])
+      const payloadA = buildPayload({ network: 'base-sepolia', signature: signatureA, authorization: authA })
+      const payloadB = buildPayload({ network: 'base-sepolia', signature: signatureB, authorization: authB })
+      const reqsA = requirements(paymentIdA, { maxAmountRequired: '5000' })
+      const reqsB = requirements(paymentIdB, { maxAmountRequired: '7000' })
+
+      const balanceBefore = await merchantBalance()
+
+      // Fired together via `Promise.all`, not awaited one at a time: both
+      // `settlePayment` calls must reach `writeContract` before EITHER
+      // transaction is mined -- that overlap is the exact race window a
+      // per-call `privateKeyToAccount` with no `nonceManager` loses.
+      const [resultA, resultB] = await Promise.all([settle(payloadA, reqsA), settle(payloadB, reqsB)])
+
+      expect(resultA.success).toBe(true)
+      expect(resultB.success).toBe(true)
+      expect(resultA.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
+      expect(resultB.transaction).toMatch(/^0x[0-9a-fA-F]{64}$/)
+      // THE load-bearing assertion: two distinct transactions actually
+      // landed -- neither replaced nor silently dropped the other.
+      expect(resultA.transaction).not.toBe(resultB.transaction)
+
+      const [receiptA, receiptB] = await Promise.all([
+        publicClient.getTransactionReceipt({ hash: resultA.transaction as Hex }),
+        publicClient.getTransactionReceipt({ hash: resultB.transaction as Hex }),
+      ])
+      expect(receiptA.status).toBe('success')
+      expect(receiptB.status).toBe('success')
+
+      // Distinct, sequential nonces on the SAME facilitator account -- the
+      // direct evidence the nonce manager (not luck, not anvil's own
+      // leniency) is what kept these two submissions from colliding.
+      const [txA, txB] = await Promise.all([
+        publicClient.getTransaction({ hash: resultA.transaction as Hex }),
+        publicClient.getTransaction({ hash: resultB.transaction as Hex }),
+      ])
+      expect(txA.nonce).not.toBe(txB.nonce)
+
+      const balanceAfter = await merchantBalance()
+      expect(balanceAfter - balanceBefore).toBe(12_000n)
+    })
+  })
 })
