@@ -4,6 +4,7 @@ import request from 'supertest'
 import type { Request, Response, NextFunction } from 'express'
 import type { Server } from 'node:http'
 import { ferry402 } from '../src/index.js'
+import type { Ferry402Locals } from '../src/index.js'
 import { computeNonce } from '../src/nonce.js'
 import { MIN_SECRET_BYTES, TIME_BUCKET_SECONDS, timeBucket } from '../src/challengeDerivation.js'
 import type { ConsumedNonceStore } from '../src/challengeStore.js'
@@ -257,6 +258,72 @@ describe('ferry402 middleware', () => {
     })
   })
 
+  describe('construction-time chain validation (Fix 3, 0.2.0: merchantEvm/escrows/assets are Partial<Record<SupportedChain, ...>>)', () => {
+    // Loosening these three fields to `Partial` means a merchant accepting
+    // only `base-sepolia` no longer has to invent placeholder addresses for
+    // `base`/`polygon`/`polygon-amoy` just to satisfy the type. What
+    // TypeScript gave up, `assertChainsConfigured` (`middleware.ts`) takes
+    // back at RUNTIME: every chain actually named in `accept` must still have
+    // an entry in all three maps, checked once at construction rather than
+    // discovered later as an `undefined` silently reaching a
+    // `PaymentRequirements`.
+    const minimalConfig: Ferry402Config = {
+      price: '$0.01',
+      accept: ['base-sepolia'],
+      settleTo: 'hedera',
+      merchant: '0.0.123456',
+      merchantEvm: { 'base-sepolia': '0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa' },
+      facilitator: 'http://localhost:4000',
+      escrows: { 'base-sepolia': '0x1111111111111111111111111111111111111111' },
+      assets: { 'base-sepolia': '0x036CbD53842c5426634e7929541eC2318f3dCF7e' },
+      secret: SECRET,
+    }
+
+    it('constructs fine with only the accepted chain populated, in all three maps', () => {
+      expect(() => ferry402(minimalConfig)).not.toThrow()
+    })
+
+    it('throws, naming the chain and the field, when merchantEvm has no entry for an accepted chain', () => {
+      const broken: Ferry402Config = { ...minimalConfig, merchantEvm: {} }
+      expect(() => ferry402(broken)).toThrow(/base-sepolia/)
+      expect(() => ferry402(broken)).toThrow(/merchantEvm/)
+    })
+
+    it('throws, naming the chain and the field, when escrows has no entry for an accepted chain', () => {
+      const broken: Ferry402Config = { ...minimalConfig, escrows: {} }
+      expect(() => ferry402(broken)).toThrow(/base-sepolia/)
+      expect(() => ferry402(broken)).toThrow(/escrows/)
+    })
+
+    it('throws, naming the chain and the field, when assets has no entry for an accepted chain', () => {
+      const broken: Ferry402Config = { ...minimalConfig, assets: {} }
+      expect(() => ferry402(broken)).toThrow(/base-sepolia/)
+      expect(() => ferry402(broken)).toThrow(/assets/)
+    })
+
+    it('names every missing field together when more than one is absent for the same chain', () => {
+      const broken: Ferry402Config = { ...minimalConfig, merchantEvm: {}, assets: {} }
+      expect(() => ferry402(broken)).toThrow(/merchantEvm/)
+      expect(() => ferry402(broken)).toThrow(/assets/)
+    })
+
+    it('a chain populated in all three maps but NOT listed in accept is simply ignored, not an error', async () => {
+      const extra: Ferry402Config = {
+        ...minimalConfig,
+        merchantEvm: { ...minimalConfig.merchantEvm, polygon: '0x4444444444444444444444444444444444444e' },
+        escrows: { ...minimalConfig.escrows, polygon: '0x2222222222222222222222222222222222222222' },
+        assets: { ...minimalConfig.assets, polygon: '0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582' },
+      }
+      expect(() => ferry402(extra)).not.toThrow()
+
+      // Not just "didn't throw" - the unaccepted chain must not leak into
+      // the issued challenge either.
+      const server = buildApp(extra)
+      const res = await request(server).get('/premium')
+      expect((res.body.accepts as PaymentRequirements[]).map((r) => r.network)).toEqual(['base-sepolia'])
+    })
+  })
+
   describe('Task 12: stateless challenge derivation - core properties', () => {
     it('10,000 anonymous requests write ZERO entries to the consumed-nonce store (the availability bug this task fixes)', async () => {
       const store = new InMemoryConsumedNonceStore()
@@ -310,7 +377,7 @@ describe('ferry402 middleware', () => {
 
       const res = await request(server).get('/premium?resource=B').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
-      expect(res.body.error).toBe('payment_expired')
+      expect(res.body.error).toBe('invalid_payment')
       expect(fetchSpy).not.toHaveBeenCalled()
       // The rejection happened before ever reaching the consume step - no
       // store lookup, no store write, for either resource.
@@ -369,7 +436,7 @@ describe('ferry402 middleware', () => {
       vi.spyOn(Date, 'now').mockReturnValue(boundaryMs + TIME_BUCKET_SECONDS * 1000 + 500)
       const res = await request(server).get('/premium').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
-      expect(res.body.error).toBe('payment_expired')
+      expect(res.body.error).toBe('invalid_payment')
       expect(fetchSpy).not.toHaveBeenCalled()
     })
 
@@ -470,7 +537,7 @@ describe('ferry402 middleware', () => {
 
         const replay = await request(server).get('/premium').set('X-PAYMENT', header)
         expect(replay.status).toBe(402)
-        expect(replay.body.error).toBe('payment_expired')
+        expect(replay.body.error).toBe('invalid_payment')
         expect(fetchSpy).toHaveBeenCalledTimes(1)
       })
 
@@ -509,27 +576,38 @@ describe('ferry402 middleware', () => {
           .get('/premium')
           .set('X-PAYMENT', toHeader(makePayload(network, nonce, uppercaseFrom)))
         expect(replayDifferentCasing.status).toBe(402)
-        expect(replayDifferentCasing.body.error).toBe('payment_expired')
+        expect(replayDifferentCasing.body.error).toBe('invalid_payment')
         expect(fetchSpy).toHaveBeenCalledTimes(1)
       })
     })
   })
 
   describe('misconfigured merchantEvm (carry-forward from Task 12 review, round 1: fail loudly WITHOUT crashing the process)', () => {
-    // `types.ts`'s `Ferry402Config.merchantEvm` is `Record<SupportedChain,
-    // ...>` and is not partial, so this can only happen via a config that
-    // bypasses the type system (e.g. built from untyped JSON/env vars) -
-    // exactly the case worth defending against, since TypeScript itself will
-    // not catch it. The pre-Task-13 behavior here was `continue`, which left
+    // 0.2.0: `assertChainsConfigured` (see the "construction-time chain
+    // validation" describe block below) now catches a merchantEvm missing
+    // for an accepted chain at CONSTRUCTION time, with a much clearer error -
+    // a config built straight from untyped JSON/env vars, this describe
+    // block's original target, is caught there instead. What is still only
+    // reachable here is the SAME failure surfacing AFTER construction:
+    // `ferry402` closes over `config` by REFERENCE, not a snapshot, so
+    // nothing stops a long-lived config object from having an entry cleared
+    // out from under an already-running middleware (a mutable config wired
+    // to a hot-reloadable source, say). `issueChallenge`'s defensive throw -
+    // and the handler's own try/catch around it - is exactly what still
+    // catches that. The pre-Task-13 behavior here was `continue`, which left
     // `extra.paymentId` at `buildRequirements`' internal all-zero placeholder
     // and published THAT in the 402 body - indistinguishable from a real (if
-    // wrong) derived value. `issueChallenge` now throws instead - but the
+    // wrong) derived value. `issueChallenge` throws instead - but the
     // returned handler is `async`, so an uncaught throw there rejects the
     // HANDLER'S OWN returned promise, not just some inner one.
-    const brokenConfig = {
-      ...config,
-      merchantEvm: { ...config.merchantEvm, 'base-sepolia': undefined },
-    } as unknown as Ferry402Config
+    function brokenAfterConstruction(): Ferry402Config {
+      // Fully valid as constructed (passes `assertChainsConfigured`); the
+      // caller corrupts `merchantEvm['base-sepolia']` on the RETURNED object
+      // afterward, simulating a config object mutated post-construction. A
+      // fresh copy of `merchantEvm` per call, so tests never share mutable
+      // state through the module-level `config` fixture.
+      return { ...config, merchantEvm: { ...config.merchantEvm } }
+    }
 
     it('the handler itself NEVER rejects - it catches the throw and forwards it via next(err) instead', async () => {
       // THIS is the property that actually matters for Express 4 safety, and
@@ -545,7 +623,9 @@ describe('ferry402 middleware', () => {
       // crashes the WHOLE process. A handler whose promise always RESOLVES
       // cannot trigger that, regardless of which Express major is dispatching
       // it - which is exactly why this assertion is Express-version-agnostic.
+      const brokenConfig = brokenAfterConstruction()
       const handler = ferry402(brokenConfig)
+      brokenConfig.merchantEvm['base-sepolia'] = undefined // corrupted AFTER construction - see describe's doc comment
       const req = fakeGetReq('https://api.test/premium')
       const res = fakeRes()
       const next = vi.fn()
@@ -571,7 +651,9 @@ describe('ferry402 middleware', () => {
       // mutation-sensitive to the fix, and is Express-version-independent by
       // construction. Together they cover both "does it work" and "why it
       // works regardless of which Express major is installed."
+      const brokenConfig = brokenAfterConstruction()
       const server = buildApp(brokenConfig)
+      brokenConfig.merchantEvm['base-sepolia'] = undefined // corrupted AFTER construction - see describe's doc comment
       const brokenRes = await request(server).get('/premium')
       expect(brokenRes.status).toBeGreaterThanOrEqual(500)
 
@@ -628,7 +710,7 @@ describe('ferry402 middleware', () => {
 
       expect(res.status).toBe(402)
       expect(res.body.accepts).toHaveLength(2)
-      expect(res.body.error).toBe('payment_expired')
+      expect(res.body.error).toBe('invalid_payment')
       expect(fetchSpy).not.toHaveBeenCalled()
     })
   })
@@ -676,7 +758,7 @@ describe('ferry402 middleware', () => {
       // facilitator is ever called a second time.
       const second = await request(server).get('/premium').set('X-PAYMENT', header)
       expect(second.status).toBe(402)
-      expect(second.body.error).toBe('payment_expired')
+      expect(second.body.error).toBe('invalid_payment')
       expect(second.body.accepts).toHaveLength(2)
       expect(fetchSpy).toHaveBeenCalledTimes(1)
     })
@@ -759,8 +841,153 @@ describe('ferry402 middleware', () => {
       const secondPayload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', uppercaseNonce)
       const second = await request(server).get('/premium').set('X-PAYMENT', toHeader(secondPayload))
       expect(second.status).toBe(402)
-      expect(second.body.error).toBe('payment_expired')
+      expect(second.body.error).toBe('invalid_payment')
       expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('res.locals.x402.release (Fix 2, 0.2.0: let the route handler release a consumed nonce when its OWN /settle call fails)', () => {
+    // `ferry402()` only calls `/verify` - the route handler is what calls
+    // `/settle` (see middleware.ts's "KNOWN LIMITATIONS"). The (from, nonce)
+    // pair was already consumed before `next()` ran, so if the HANDLER'S OWN
+    // settlement fails, nothing upstream of it can release that pair on its
+    // behalf without this escape hatch. These tests drive the whole stack
+    // through a real Express app with a route handler that reads
+    // `res.locals.x402` as `Ferry402Locals` - no cast to `unknown` needed.
+    function buildAppWithSettleHandler(
+      routeHandler: (locals: Ferry402Locals, res: Response) => Promise<void>,
+      cfg: Ferry402Config = config,
+      options?: Parameters<typeof ferry402>[1],
+    ): Server {
+      const app = express()
+      app.use('/premium', ferry402(cfg, options))
+      app.get('/premium', async (_req, res) => {
+        await routeHandler(res.locals.x402 as Ferry402Locals, res)
+      })
+      const server = app.listen(0)
+      servers.push(server)
+      return server
+    }
+
+    it('releasing after a failed settlement lets the SAME (from, nonce) verify again, and a later attempt can then succeed', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      let settleAttempt = 0
+      const server = buildAppWithSettleHandler(async (locals, res) => {
+        settleAttempt++
+        if (settleAttempt === 1) {
+          // Simulate the route handler's OWN /settle call failing.
+          await locals.release()
+          res.status(402).json({ error: 'settlement_failed' })
+          return
+        }
+        res.status(200).json({ ok: true, payer: locals.payer })
+      })
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const first = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(first.status).toBe(402)
+      expect(first.body.error).toBe('settlement_failed')
+
+      // Same signed header, same nonce - without release() this would hit
+      // the already-consumed branch (`invalid_payment`) and /verify would
+      // never be called again. With it, ferry402() re-verifies and the
+      // handler is reached a second time.
+      const retry = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(retry.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('calling release() twice in the same request is safe - idempotent, never throws', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const server = buildAppWithSettleHandler(async (locals, res) => {
+        await locals.release()
+        await locals.release() // deliberate double call
+        res.status(200).json({ ok: true })
+      })
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(res.status).toBe(200) // the double release() call did not throw/crash the handler
+    })
+
+    it('a later release() call does not steal a slot a DIFFERENT, later request already re-consumed', async () => {
+      // The real hazard a NON-idempotent release() would create: this
+      // request releases its own nonce once (fine, lets a retry happen), but
+      // if release() were called again afterward it would free whatever
+      // CURRENTLY occupies that slot - even a completely different, later
+      // request that legitimately re-consumed the same (from, nonce) pair in
+      // between. That would reopen the exact replay window
+      // ConsumedNonceStore exists to close.
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      let firstLocals: Ferry402Locals | undefined
+      const server = buildAppWithSettleHandler(async (locals, res) => {
+        if (!firstLocals) {
+          firstLocals = locals
+          await locals.release() // release once, so the SAME header can be reused below
+        }
+        res.status(200).json({ ok: true })
+      })
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const first = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(first.status).toBe(200)
+
+      // A SECOND, independent request re-consumes the SAME (from, nonce) -
+      // only possible because the first request released it.
+      const second = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(second.status).toBe(200)
+
+      // Call the FIRST request's release() again. A non-idempotent
+      // implementation would free the pair the SECOND request is now relying
+      // on having consumed.
+      await firstLocals!.release()
+
+      const replayOfSecond = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(replayOfSecond.status).toBe(402)
+      expect(replayOfSecond.body.error).toBe('invalid_payment')
+    })
+
+    it('a ConsumedNonceStore whose release() rejects does not surface an error to the handler', async () => {
+      const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ isValid: true }), { status: 200 }))
+      globalThis.fetch = fetchSpy as any
+      const backing = new InMemoryConsumedNonceStore()
+      const rejectingReleaseStore: ConsumedNonceStore = {
+        consumeIfAbsent: (from, nonce, expiresAt) => backing.consumeIfAbsent(from, nonce, expiresAt),
+        release: async () => {
+          throw new Error('store unreachable')
+        },
+      }
+      const server = buildAppWithSettleHandler(
+        async (locals, res) => {
+          await locals.release() // must resolve cleanly even though the store's own release() rejects
+          res.status(200).json({ ok: true })
+        },
+        config,
+        { consumedNonceStore: rejectingReleaseStore },
+      )
+
+      const challengeRes = await request(server).get('/premium')
+      const requirement = challengeRes.body.accepts[0] as PaymentRequirements
+      const payload = makePayload(requirement.network as 'base-sepolia' | 'polygon-amoy', nonceFor(requirement))
+      const header = toHeader(payload)
+
+      const res = await request(server).get('/premium').set('X-PAYMENT', header)
+      expect(res.status).toBe(200)
     })
   })
 
@@ -777,12 +1004,15 @@ describe('ferry402 middleware', () => {
       // Same nonce, same everything - just a different resource string
       // (`resource` includes the query string). Task 6 reported this as
       // `invalid_payment_requirements` (an explicit lookup found a resource
-      // mismatch); Task 12 reports it as `payment_expired` because there is
-      // no longer a separate lookup to fail — the nonce simply never matches
-      // the derivation for this resource in the first place.
+      // mismatch); since Task 12 there is no longer a separate lookup to
+      // fail — the nonce simply never matches the derivation for this
+      // resource in the first place — and since 0.2.0 that is reported as
+      // `invalid_payment`, not `payment_expired`: a resource mismatch is not
+      // expiry, and this check cannot tell the two apart (see `middleware.ts`'s
+      // `matchChallenge` failure comment).
       const res = await request(server).get('/premium?id=999').set('X-PAYMENT', toHeader(payload))
       expect(res.status).toBe(402)
-      expect(res.body.error).toBe('payment_expired')
+      expect(res.body.error).toBe('invalid_payment')
       expect(res.body.accepts).toHaveLength(2)
       expect(fetchSpy).not.toHaveBeenCalled()
     })

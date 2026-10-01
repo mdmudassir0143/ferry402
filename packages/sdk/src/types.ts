@@ -53,14 +53,26 @@ export type Ferry402Config = {
    * rather than a single global address because a merchant may control a
    * different payout address on each chain — the settlement ledger maps one
    * Hedera account id to several per-chain payout addresses.
+   *
+   * `Partial` (0.2.0 — was `Record<SupportedChain, ...>`): a merchant
+   * accepting only `base-sepolia` should not have to invent placeholder
+   * addresses for `base`/`polygon`/`polygon-amoy` just to satisfy the type.
+   * An entry is still required for every chain actually listed in `accept`
+   * — `ferry402(config)` validates that at construction time (see
+   * `requirements.ts`'s `assertChainsConfigured`) and throws, naming the chain
+   * and field, rather than silently publishing an incomplete
+   * `PaymentRequirements`.
    */
-  merchantEvm: Record<SupportedChain, `0x${string}`>
+  merchantEvm: Partial<Record<SupportedChain, `0x${string}`>>
   /** Base URL of the facilitator that verifies/settles payments. */
   facilitator: string
-  /** Per-chain `Escrow` contract address funds are paid into. */
-  escrows: Record<SupportedChain, `0x${string}`>
-  /** Per-chain USDC (or other v1-supported asset) contract address. */
-  assets: Record<SupportedChain, `0x${string}`>
+  /** Per-chain `Escrow` contract address funds are paid into. `Partial` for
+   *  the same reason as `merchantEvm` above — see its doc comment. */
+  escrows: Partial<Record<SupportedChain, `0x${string}`>>
+  /** Per-chain USDC (or other v1-supported asset) contract address.
+   *  `Partial` for the same reason as `merchantEvm` above — see its doc
+   *  comment. */
+  assets: Partial<Record<SupportedChain, `0x${string}`>>
   /**
    * The HMAC key `ferry402` derives every challenge's `paymentId`/`nonce`
    * from (Task 12: stateless challenge derivation — see

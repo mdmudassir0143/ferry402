@@ -7,8 +7,8 @@
  * Before Task 12, this file's `ChallengeStore` recorded one entry per
  * challenge ISSUED — every anonymous GET wrote to it, for free, which is
  * exactly what let ~5,000 anonymous requests evict 10,000 legitimate
- * outstanding challenges and hand every in-flight honest payer
- * `payment_expired` (see the task-12 report). `challengeDerivation.ts`
+ * outstanding challenges and reject every in-flight honest payer
+ * (see the task-12 report). `challengeDerivation.ts`
  * removes that store entirely: issuing a challenge is now a pure
  * computation with no read or write of any kind.
  *
@@ -104,9 +104,9 @@ export interface ConsumedNonceStore {
    * `X-PAYMENT` attempt (with THAT payer's own `from`) with an otherwise
    * well-formed authorization — turning a transient nuisance into a total,
    * and much cheaper, denial of service. Best-effort: if a remote store
-   * can't be reached to release the entry, the payer sees `payment_expired`
-   * on retry rather than a clean retry — still fail-closed, just less
-   * convenient.
+   * can't be reached to release the entry, the payer sees `invalid_payment`
+   * (the already-consumed branch in `middleware.ts`) on retry rather than a
+   * clean retry — still fail-closed, just less convenient.
    */
   release(from: `0x${string}`, nonce: `0x${string}`): Promise<void>
 }

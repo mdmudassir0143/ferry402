@@ -95,6 +95,49 @@ export interface BuildRequirementsOptions {
 const ZERO_PAYMENT_ID_PLACEHOLDER: `0x${string}` = `0x${'0'.repeat(64)}`
 
 /**
+ * Every chain listed in `config.accept` must have an entry in all three
+ * per-chain maps. Enforced here rather than by the type system because
+ * `merchantEvm`/`escrows`/`assets` are `Partial` as of 0.2.0 (see
+ * `types.ts`) — a merchant accepting only `base-sepolia` should not have to
+ * invent placeholder addresses for chains it never serves.
+ *
+ * Without this check a missing entry fails silently and late: the map lookup
+ * below yields `undefined`, that flows into the returned
+ * `PaymentRequirements`, `JSON.stringify` drops the key from the 402 body
+ * entirely, and a payer who gets that far fails the facilitator's schema
+ * parse with a generic rejection that never names the merchant's actual
+ * mistake.
+ *
+ * Called from two places on purpose. `ferry402()` calls it once at
+ * construction, so a misconfigured merchant finds out at boot rather than on
+ * first traffic. `buildRequirements` calls it per invocation, because it is a
+ * public export documented for callers issuing their own 402s — they bypass
+ * the constructor entirely, and the casts below would otherwise hand them a
+ * silent `undefined` typed as `0x${string}`. The per-request cost is three
+ * property lookups per accepted chain, against the HMACs this same path
+ * already computes.
+ */
+export function assertChainsConfigured(config: Ferry402Config): void {
+  for (const chain of config.accept) {
+    const missing = (['merchantEvm', 'escrows', 'assets'] as const).filter((field) => !config[field][chain])
+    if (missing.length === 0) continue
+    throw new Error(
+      `ferry402: config.accept includes "${chain}", but ${missing.join(', ')} ` +
+        `${missing.length > 1 ? 'have' : 'has'} no entry for it. Every chain listed in "accept" needs ` +
+        'an entry in merchantEvm, escrows, AND assets - a chain your merchant does not accept can ' +
+        'simply be left out of all three. Example:\n\n' +
+        '  ferry402({\n' +
+        `    accept: ['${chain}'],\n` +
+        `    merchantEvm: { '${chain}': '0xYourPayoutAddress' },\n` +
+        `    escrows: { '${chain}': '0xYourDeployedEscrowAddress' },\n` +
+        `    assets: { '${chain}': '0xUSDCAddress' },\n` +
+        '    ...\n' +
+        '  })\n',
+    )
+  }
+}
+
+/**
  * Builds one `PaymentRequirements` entry per chain in `config.accept`, all
  * describing the same payment request (same `resource`, same price, same
  * `paymentId`) so a client can pay on whichever accepted chain it prefers.
@@ -121,6 +164,7 @@ export function buildRequirements(
   if (!PAYMENT_ID_RE.test(paymentId)) {
     throw new Error(`invalid paymentId: expected 0x-prefixed 32-byte hex, got ${paymentId}`)
   }
+  assertChainsConfigured(config)
 
   return config.accept.map((network: SupportedChain) => ({
     scheme: 'exact' as const,
@@ -129,9 +173,9 @@ export function buildRequirements(
     resource,
     description: `Payment for ${resource}`,
     mimeType: 'application/json',
-    payTo: config.escrows[network],
+    payTo: config.escrows[network] as `0x${string}`,
     maxTimeoutSeconds: 300,
-    asset: config.assets[network],
+    asset: config.assets[network] as `0x${string}`,
     extra: {
       settleTo: config.settleTo,
       merchant: config.merchant,

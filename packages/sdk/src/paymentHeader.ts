@@ -15,8 +15,11 @@ import type { PaymentRequirements } from './types.js'
  * `x402/client`) cannot pay a ferry402 route: they sign whatever nonce they
  * mint themselves, `ferry402`'s `matchChallenge` never sees it match either
  * derivation candidate, and every attempt fails closed with
- * `payment_expired` — indistinguishable, from the client's side, from an
- * expired challenge.
+ * `invalid_payment` (0.2.0: no longer `payment_expired` — a stock client's
+ * self-invented nonce is one of several indistinguishable mismatch causes,
+ * not a known expiry; see `middleware.ts`'s `matchChallenge` failure
+ * comment) — indistinguishable, from the client's side, from any other
+ * rejected nonce.
  *
  * `createPaymentHeader` is the replacement: it derives the SAME nonce
  * `ferry402`'s middleware and `Escrow.settleAuthorization` derive, signs the

@@ -1,5 +1,73 @@
 # @ferry402/sdk
 
+## 0.2.0
+
+### Breaking
+
+- **Two rejection codes changed value: both the `matchChallenge`-failure and
+  the already-consumed-nonce branches in `ferry402()`'s middleware now reply
+  `invalid_payment` instead of `payment_expired`.** This is a behavior
+  change, not just a docs fix, and a client or test that pattern-matches on
+  the literal string `payment_expired` from either path must be updated.
+  Why: a `matchChallenge` mismatch has at least three indistinguishable
+  causes — genuine expiry, a nonce derived for the wrong resource/merchant,
+  or a stock x402 client's self-invented nonce — and the validity window is
+  enforced by the HMAC derivation itself, not a store with timestamps to
+  inspect, so there was never a record to confirm expiry specifically from.
+  `payment_expired` asserted a cause this middleware could not actually
+  establish; `invalid_payment` (a real x402 `ErrorReasons` member) says only
+  what is known. The already-consumed branch is a definitively known replay,
+  not expiry either, so it gets the same honest code. `verdict.invalidReason
+  ?? 'invalid_payment'` (the facilitator's own generic-rejection fallback)
+  was already `invalid_payment` and is unchanged — all three now share one
+  code for "payment unacceptable, fetch a fresh 402," which is what a client
+  ends up doing in every case regardless.
+
+### Changed
+
+- **`Ferry402Config.merchantEvm`, `.escrows`, and `.assets` are now
+  `Partial<Record<SupportedChain, \`0x${string}\`>>`** (previously
+  `Record<SupportedChain, ...>`, which forced every merchant — even one
+  accepting only `base-sepolia` — to supply placeholder addresses for every
+  other `SupportedChain` just to satisfy the type). This is a type-only
+  loosening and not breaking for existing callers: a config that already
+  populated all four chains still type-checks and behaves identically.
+  `ferry402(config)` now also validates, at construction time, that every
+  chain listed in `config.accept` has an entry in all three maps, and throws
+  — naming the chain and which field(s) are missing — if not. Previously a
+  missing entry for an accepted chain was not an error at all: it silently
+  produced a `PaymentRequirements` with `payTo`/`asset` set to `undefined`,
+  which `JSON.stringify` then drops from the 402 response entirely, so the
+  first visible symptom was an opaque rejection from a payer's client or the
+  facilitator's own schema parser — never a message naming the actual
+  misconfiguration.
+
+  **`buildRequirements` performs the same validation.** It is a public export
+  documented for callers issuing their own 402s outside the middleware, and
+  those callers never run `ferry402()`'s constructor. Before this release the
+  total `Record` types protected them: a config missing an entry could not be
+  constructed at all. Loosening to `Partial` gave that up, so the check runs
+  on every `buildRequirements` call as well — otherwise a direct caller would
+  silently receive `payTo`/`asset` as `undefined` cast to `` `0x${string}` ``.
+  The construction-time check in `ferry402()` is kept on top of it so a
+  misconfigured merchant fails at boot rather than on first request.
+
+### Added
+
+- `res.locals.x402.release(): Promise<void>` — lets a route handler release
+  the `(from, nonce)` pair `ferry402()` already consumed, for when the
+  handler's OWN `/settle` call fails. `ferry402()` only calls `/verify`; the
+  handler calls `/settle` after `next()`, and until now it had no way to undo
+  the consume step if that settlement failed, leaving that payer's nonce
+  burned for the rest of the derivation window (up to
+  `2 * TIME_BUCKET_SECONDS`) even though no payment ever completed.
+  Best-effort (never throws, even if the underlying `ConsumedNonceStore`'s
+  own `release` rejects) and idempotent (safe to call more than once, or
+  after the window has passed).
+- `Ferry402Locals` — exported type for the exact shape `ferry402()` writes to
+  `res.locals.x402` (`payload`, `requirements`, `payer`, `release`), so a
+  handler can type it directly instead of casting through `unknown`.
+
 ## 0.1.0
 
 ### Breaking

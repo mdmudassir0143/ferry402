@@ -182,8 +182,9 @@ hold. A stock `x402@1.2.0` client (`x402-fetch`, `x402-axios`, or anything
 using `x402/client`'s `createNonce()`) mints its own nonce as random bytes.
 A random 32 bytes will never equal the two values `ferry402`'s
 `matchChallenge` actually checks against (the current and previous
-derivation window), so the request fails closed with `payment_expired` —
-indistinguishable, from your side, from a stale challenge. There is no
+derivation window), so the request fails closed with `invalid_payment` —
+indistinguishable, from your side, from any other nonce mismatch (a
+genuinely stale challenge included). There is no
 configuration flag that makes a random nonce work; you must derive the
 nonce the way the merchant's middleware will recompute it, which means
 using `@ferry402/sdk`'s own `createPaymentHeader` (or re-implementing
@@ -259,7 +260,7 @@ cause**, which matters for deciding whether to retry:
 |---|---|---|---|
 | `invalid_payload` | Local (malformed base64/JSON, non-EVM payload shape) or facilitator (missing `extra.merchantEvm`/`paymentId`, bad address shape) | The `X-PAYMENT` header you sent isn't structurally valid, or you built it from a stale/foreign `accepts` entry | Fetch a fresh 402 from *this* URL and rebuild the header from that response |
 | `invalid_network` | Local: you claimed a `network` this merchant has no entry for. Facilitator: unsupported network. | Typo, or you picked a chain the merchant doesn't accept | Re-read `accepts[].network` verbatim |
-| **`payment_expired`** | **Collapses three distinct causes**: (1) genuinely expired challenge (past the ~10-minute derivation window), (2) a nonce derived for the wrong resource or merchant address, (3) a nonce already consumed — including by your own earlier identical request | The nonce you presented doesn't match what this server would derive right now, for any one of three reasons the client can't distinguish | **Always fetch a brand-new 402 and sign fresh.** Retrying the identical header is pointless for causes (2) and (3), and cause (1) needs a fresh derivation anyway |
+| **`invalid_payment`** | **Collapses four distinct causes, local except the last**: (1) genuinely expired challenge (past the ~10-minute derivation window), (2) a nonce derived for the wrong resource or merchant address, (3) a stock-client nonce that was never derived at all, (4) a nonce already consumed — including by your own earlier identical request; facilitator responses with `isValid: false` and no specific `invalidReason` also surface as this code | The nonce you presented doesn't match what this server would derive right now (or the facilitator rejected the payment without naming a more specific reason), for any one of several reasons the client can't distinguish | **Always fetch a brand-new 402 and sign fresh.** Retrying the identical header is pointless for causes (2)-(4), and cause (1) needs a fresh derivation anyway. *(Before 0.2.0 this code was `payment_expired`, which asserted expiry specifically — a claim ferry402 was never actually in a position to make, since the window is enforced by HMAC derivation, not a store with timestamps to inspect. `invalid_payment`, a real x402 `ErrorReasons` member, says only what is actually known.)* |
 | `invalid_exact_evm_payload_authorization_value` | Local or facilitator | You signed `value` below `maxAmountRequired` | Re-read the price off a fresh 402 and sign that amount |
 | `invalid_exact_evm_payload_recipient_mismatch` | Local, facilitator, or on-chain (`Escrow.RecipientMismatch`, surfaced by the facilitator as this same code) | `authorization.to` doesn't equal `payTo` | Use `requirement.payTo` verbatim as `to` |
 | `invalid_exact_evm_payload_authorization_valid_after` / `_valid_before` | Local or facilitator (facilitator adds a 10-second settlement buffer on top of the raw check) | Your signed time window hasn't started, or is too close to expiring to safely settle | Let `createPaymentHeader`'s defaults set the window; don't sign a `validBefore` only a few seconds out |
@@ -273,7 +274,7 @@ A merchant's own route handler can also surface `/settle`-time failures
 report them — these aren't part of `ferry402()`'s own 402 vocabulary, since
 `/settle` only ever runs after a resource was already served. If you see one
 of these from a merchant's custom error field, treat it the same as
-`payment_expired`: get a fresh 402.
+`invalid_payment`: get a fresh 402.
 
 ### Idempotency and retries
 
@@ -283,7 +284,7 @@ challenge, not the same signed header.** The specifics, read directly off
 
 - If the nonce reaches a genuine double-spend check (the same `(from,
   nonce)` pair was already recorded) or fails the resource/merchant/TTL
-  match, you get `payment_expired` and the nonce was **never released** —
+  match, you get `invalid_payment` and the nonce was **never released** —
   because it was never newly consumed by this request in the first place.
   Retrying the identical header will fail the identical way forever. Get a
   new 402.

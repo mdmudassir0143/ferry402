@@ -10,13 +10,14 @@ examples reference. Cross-references go back to the root
 [`README.md`](../README.md) where it already covers the same ground in more
 depth.
 
-## A stock x402 client gets `payment_expired` against every request
+## A stock x402 client gets `invalid_payment` against every request
 
 **Symptom:** You're using `x402-fetch`, `x402-axios`, or anything built on
 plain `x402@1.2.0`'s `createNonce()`. Every attempt to pay a `ferry402` route
-comes back `402` with `error: "payment_expired"` — indistinguishable, from
-the client's side, from a genuinely expired challenge, no matter how fast you
-retry.
+comes back `402` with `error: "invalid_payment"` — indistinguishable, from
+the client's side, from any other nonce mismatch, no matter how fast you
+retry. (Before 0.2.0 this was reported as `payment_expired`; see the "Cause"
+below for why that was replaced.)
 
 **Cause:** This is by design, not a bug. `ferry402` binds the EIP-3009
 authorization `nonce` to the merchant it was issued for —
@@ -26,10 +27,13 @@ be redirected to a merchant other than the one whose `402` the payer actually
 saw (Amendment 1, see [`docs/architecture.md`](architecture.md#design-decisions-the-three-amendments)).
 `x402@1.2.0`'s own client helpers mint that nonce as random bytes instead. A
 random nonce will never equal either of `matchChallenge`'s derived candidates
-(`packages/sdk/src/challengeDerivation.ts`), so the middleware rejects it —
-and the rejection reason is `payment_expired`, because from the server's side
-a nonce that doesn't match either the current or previous time bucket's
-derivation is indistinguishable from one that genuinely expired.
+(`packages/sdk/src/challengeDerivation.ts`), so the middleware rejects it.
+The rejection reason is `invalid_payment`, not `payment_expired`: a mismatch
+here could equally be a genuinely expired challenge, a nonce derived for the
+wrong resource or merchant, or (as here) a self-invented nonce — the window
+is enforced by the HMAC derivation itself, not a store with timestamps to
+inspect, so there is nothing to look back at and tell those apart. Claiming
+expiry specifically would assert a cause ferry402 has no way to establish.
 
 **Fix:** Use `createPaymentHeader()` from `@ferry402/sdk` instead of a generic
 x402 client:

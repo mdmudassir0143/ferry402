@@ -228,8 +228,10 @@ Hedera account id in `PaymentRequirements.extra` makes the nonce
 uncomputable by any client (the contract hashes an `address`, not a dotted
 account id), so every payment would fail `MerchantNotBound`. The fix is
 `Ferry402Config` carrying both: `merchant` (Hedera account id) and
-`merchantEvm` (a `Record<SupportedChain, 0x...>`, one address per chain, since
-a merchant may use a different payout address per chain). Every
+`merchantEvm` (a `Partial<Record<SupportedChain, 0x...>>`, one address per
+accepted chain, since a merchant may use a different payout address per
+chain — only the chains actually listed in `config.accept` need an entry;
+`ferry402()` validates that at construction time). Every
 `JournalEntry` carries both too, so a reader can join a Hedera-side record
 back to the exact on-chain `Escrow` row it reconciles against.
 

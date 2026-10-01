@@ -188,7 +188,7 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       } from '@ferry402/sdk'
       import type {
         Ferry402Config, SupportedChain, PaymentRequirements,
-        BuildRequirementsOptions, Ferry402Options, ConsumedNonceStore, DerivedChallenge,
+        BuildRequirementsOptions, Ferry402Options, Ferry402Locals, ConsumedNonceStore, DerivedChallenge,
         EIP3009Signer, CreatePaymentHeaderOptions,
       } from '@ferry402/sdk'
 
@@ -228,6 +228,16 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       const headerOpts: CreatePaymentHeaderOptions = { tokenName: 'USDC', tokenVersion: '2', chainId: 84532 }
       const headerPromise: Promise<string> = createPaymentHeader(reqs[0], fakeSigner, headerOpts)
 
+      // Fix 2, 0.2.0: Ferry402Locals types res.locals.x402 without a cast to
+      // unknown - resolved here against the INSTALLED package's own .d.ts,
+      // same proof-of-resolution as every other type above.
+      const locals: Ferry402Locals = {
+        payload: {} as any, // PaymentPayload isn't re-exported by this package; shape doesn't matter here
+        requirements: reqs[0],
+        payer: undefined,
+        release: async () => {},
+      }
+
       void handler
       void opts
       void store
@@ -235,6 +245,7 @@ describe('consuming the BUILT, PACKED @ferry402/sdk from plain Node, outside the
       void MIN_SECRET_BYTES
       void TIME_BUCKET_SECONDS
       void headerPromise
+      void locals
     `
     writeFileSync(join(consumerDir, 'types-check.ts'), tsScript)
     writeFileSync(

@@ -2,7 +2,7 @@ export type { Ferry402Config, SupportedChain, PaymentRequirements } from './type
 export { buildRequirements, parsePrice, generatePaymentId } from './requirements.js'
 export type { BuildRequirementsOptions } from './requirements.js'
 export { ferry402 } from './middleware.js'
-export type { Ferry402Options } from './middleware.js'
+export type { Ferry402Options, Ferry402Locals } from './middleware.js'
 export { computeNonce, normalizeNonce, normalizeAddress } from './nonce.js'
 export { InMemoryConsumedNonceStore } from './challengeStore.js'
 export type { ConsumedNonceStore } from './challengeStore.js'

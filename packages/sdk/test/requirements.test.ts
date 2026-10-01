@@ -149,6 +149,69 @@ describe('buildRequirements', () => {
   })
 })
 
+describe('assertChainsConfigured via buildRequirements (0.2.0)', () => {
+  // `buildRequirements` is a PUBLIC export, documented for callers issuing
+  // their own 402s outside the middleware. Those callers never run
+  // `ferry402()`'s constructor, so the constructor-time guard does not
+  // protect them. Before 0.2.0 the type system did: the three per-chain maps
+  // were total `Record`s, so a config missing an entry could not be
+  // constructed at all. Making them `Partial` gave that up, which is exactly
+  // why this path needs its own check -- otherwise `payTo`/`asset` come back
+  // `undefined` cast to `0x${string}`, JSON.stringify drops the keys, and the
+  // 402 goes out structurally broken with nothing naming the cause.
+  it('throws when an accepted chain has no escrows entry', () => {
+    const broken: Ferry402Config = { ...config, escrows: { 'base-sepolia': config.escrows['base-sepolia'] } }
+    expect(() => buildRequirements(broken, 'https://api.test/x')).toThrow(/polygon-amoy.*escrows/s)
+  })
+
+  it('throws when an accepted chain has no assets entry', () => {
+    const broken: Ferry402Config = { ...config, assets: { 'base-sepolia': config.assets['base-sepolia'] } }
+    expect(() => buildRequirements(broken, 'https://api.test/x')).toThrow(/polygon-amoy.*assets/s)
+  })
+
+  it('names every missing field at once, not just the first', () => {
+    const broken: Ferry402Config = {
+      ...config,
+      merchantEvm: { 'base-sepolia': config.merchantEvm['base-sepolia'] },
+      escrows: { 'base-sepolia': config.escrows['base-sepolia'] },
+      assets: { 'base-sepolia': config.assets['base-sepolia'] },
+    }
+    expect(() => buildRequirements(broken, 'https://api.test/x')).toThrow(/merchantEvm, escrows, assets/)
+  })
+
+  it('a Partial config still yields fully-populated payTo and asset', () => {
+    // Asserted on the OUTPUT, not on a thrown message, so this survives any
+    // rewording of the error. Uses a config whose maps omit three of the four
+    // chains -- the whole point of the 0.2.0 `Partial` change -- rather than
+    // the complete fixture above, which would pass whether or not the guard
+    // and the lookups work.
+    const lean: Ferry402Config = {
+      ...config,
+      accept: ['base-sepolia'],
+      merchantEvm: { 'base-sepolia': config.merchantEvm['base-sepolia'] },
+      escrows: { 'base-sepolia': config.escrows['base-sepolia'] },
+      assets: { 'base-sepolia': config.assets['base-sepolia'] },
+    }
+    const reqs = buildRequirements(lean, 'https://api.test/x')
+    expect(reqs).toHaveLength(1)
+    expect(reqs[0]!.payTo).toMatch(EVM_ADDRESS_RE)
+    expect(reqs[0]!.asset).toMatch(EVM_ADDRESS_RE)
+    expect(reqs[0]!.extra!.merchantEvm).toMatch(EVM_ADDRESS_RE)
+  })
+
+  it('accepts a config that configures only the chains it accepts', () => {
+    const lean: Ferry402Config = {
+      ...config,
+      accept: ['base-sepolia'],
+      merchantEvm: { 'base-sepolia': config.merchantEvm['base-sepolia'] },
+      escrows: { 'base-sepolia': config.escrows['base-sepolia'] },
+      assets: { 'base-sepolia': config.assets['base-sepolia'] },
+    }
+    expect(() => buildRequirements(lean, 'https://api.test/x')).not.toThrow()
+    expect(buildRequirements(lean, 'https://api.test/x')).toHaveLength(1)
+  })
+})
+
 describe('config fixture integrity', () => {
   // Guards Minor 2 from review: the merchantEvm placeholders for the two
   // unaccepted chains (base, polygon) were previously 38 hex chars, not 40 -

@@ -152,8 +152,11 @@ vulnerability, not a bug:
   other than the one whose 402 the payer actually saw.
 - `x402@1.2.0`'s own client helpers mint that nonce as **random bytes**
   instead. A random nonce never equals either of ferry402's derived
-  candidates, so `ferry402`'s middleware rejects it with `payment_expired`
-  — indistinguishable, from the client's side, from an expired challenge.
+  candidates, so `ferry402`'s middleware rejects it with `invalid_payment`
+  — indistinguishable, from the client's side, from any other nonce
+  mismatch (an expired challenge included; ferry402 cannot tell the two
+  apart, since the validity window is enforced by the HMAC derivation
+  itself rather than a store it could inspect for a cause).
 
 Use `createPaymentHeader` from `@ferry402/sdk` instead — it derives the
 correct nonce and signs the authorization for you:

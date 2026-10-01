@@ -34,9 +34,9 @@ clones `ferry402` and self-hosts the facilitator would do.
 
 Then three security checks against that same payment:
 
-- Replaying the identical `X-PAYMENT` header → rejected (`payment_expired`).
+- Replaying the identical `X-PAYMENT` header → rejected (`invalid_payment`).
 - Presenting the `/api/quote` challenge at a different route
-  (`/api/quote/premium`) → rejected (`payment_expired` — nonce derivation is
+  (`/api/quote/premium`) → rejected (`invalid_payment` — nonce derivation is
   resource-bound).
 - A payment signed by a brand-new, never-funded key → rejected at `/verify`
   with `insufficient_funds`, **before** anything is served.

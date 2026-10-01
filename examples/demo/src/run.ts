@@ -265,20 +265,21 @@ async function main(): Promise<void> {
   })
   const facilitatorBaseUrl = `http://127.0.0.1:${(facilitatorServer.address() as AddressInfo).port}`
 
+  // `merchantEvm`/`escrows`/`assets` are `Partial<Record<SupportedChain,
+  // ...>>` (0.2.0) — this demo only ever accepts `base-sepolia`, so that's
+  // the only entry each map needs. `ferry402()` validates at construction
+  // time that every chain in `accept` has one; the other three
+  // `SupportedChain` values are simply absent here rather than filled with
+  // placeholders that would never actually be served.
   const config: Ferry402Config = {
     price: '$0.01',
     accept: ['base-sepolia'],
     settleTo: 'hedera',
     merchant: hederaAccountId,
-    merchantEvm: { 'base-sepolia': merchantEvm, base: merchantEvm, polygon: merchantEvm, 'polygon-amoy': merchantEvm },
+    merchantEvm: { 'base-sepolia': merchantEvm },
     facilitator: facilitatorBaseUrl,
-    escrows: { 'base-sepolia': escrowAddress, base: escrowAddress, polygon: escrowAddress, 'polygon-amoy': escrowAddress },
-    assets: {
-      'base-sepolia': USDC_ADDRESS_BASE_SEPOLIA,
-      base: USDC_ADDRESS_BASE_SEPOLIA,
-      polygon: USDC_ADDRESS_BASE_SEPOLIA,
-      'polygon-amoy': USDC_ADDRESS_BASE_SEPOLIA,
-    },
+    escrows: { 'base-sepolia': escrowAddress },
+    assets: { 'base-sepolia': USDC_ADDRESS_BASE_SEPOLIA },
     secret: randomBytes(32).toString('hex'),
   }
 

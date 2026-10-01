@@ -1,7 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
 import { PaymentPayloadSchema, VerifyResponseSchema } from 'x402/types'
 import type { PaymentPayload, VerifyResponse } from 'x402/types'
-import { buildRequirements } from './requirements.js'
+import { assertChainsConfigured, buildRequirements } from './requirements.js'
 import { normalizeAddress, normalizeNonce } from './nonce.js'
 import { assertValidSecret, deriveChallenge, matchChallenge, TIME_BUCKET_SECONDS } from './challengeDerivation.js'
 import { InMemoryConsumedNonceStore } from './challengeStore.js'
@@ -48,6 +48,36 @@ export interface Ferry402Options {
    * `ferry402`'s signature does not need to change to fix that.
    */
   consumedNonceStore?: ConsumedNonceStore
+}
+
+/**
+ * The exact shape `ferry402()` writes to `res.locals.x402` once a payment
+ * verifies, so a route handler can read it with `res.locals.x402 as
+ * Ferry402Locals` instead of `as unknown as { ... }`.
+ *
+ * `release` (Fix 2, 0.2.0) exists because `ferry402()` only calls `/verify`
+ * — the route handler is what calls `/settle` (see this file's "KNOWN
+ * LIMITATIONS" note) — and the `(from, nonce)` pair was already consumed
+ * BEFORE `next()` ran, to close the same race the facilitator round trip
+ * itself cannot close atomically. If the handler's OWN `/settle` call then
+ * fails, nothing upstream of the handler can know that and release the pair
+ * on its behalf; without this escape hatch that payer's nonce stays burned
+ * for the rest of the derivation window (up to `2 * TIME_BUCKET_SECONDS`)
+ * even though no payment actually completed. Calling it is entirely
+ * optional (the happy path never needs it) and safe: best-effort, never
+ * throws, and idempotent — see `releaseOnce`.
+ */
+export interface Ferry402Locals {
+  /** The payer's decoded, verified `PaymentPayload`. */
+  payload: PaymentPayload
+  /** The exact `PaymentRequirements` entry `/verify` approved — pass this,
+   *  byte-for-byte, to `/settle`. */
+  requirements: PaymentRequirements
+  /** The payer address the facilitator recovered from the signature. */
+  payer: string | undefined
+  /** Releases the `(from, nonce)` pair this request consumed. Call it from a
+   *  `/settle` failure branch; see this interface's doc comment. */
+  release: () => Promise<void>
 }
 
 /**
@@ -155,6 +185,7 @@ export interface Ferry402Options {
  */
 export function ferry402(config: Ferry402Config, options: Ferry402Options = {}): RequestHandler {
   assertValidSecret(config.secret)
+  assertChainsConfigured(config)
   const consumedNonceStore = options.consumedNonceStore ?? new InMemoryConsumedNonceStore()
 
   /**
@@ -175,10 +206,11 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
     for (const requirement of requirements) {
       const merchantEvm = requirement.extra?.merchantEvm as `0x${string}` | undefined
       if (!merchantEvm) {
-        // Defensive: `types.ts`'s `Ferry402Config.merchantEvm` is a
-        // `Record<SupportedChain, ...>`, not partial, so `buildRequirements`
-        // always sets this in practice — reaching here means config itself
-        // is broken. The old behavior was `continue`, which left this
+        // Defensive, now effectively a second layer behind
+        // `assertChainsConfigured` (0.2.0: `types.ts`'s
+        // `Ferry402Config.merchantEvm` became `Partial`, so TypeScript alone
+        // no longer rules this out) — reaching here means config itself is
+        // broken. The old behavior was `continue`, which left this
         // entry's `extra.paymentId` at `buildRequirements`'
         // `skipPaymentIdGeneration` all-zero placeholder and published THAT
         // in the 402 body — strictly worse than the random `paymentId` a
@@ -238,8 +270,29 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
       await consumedNonceStore.release(from, nonce)
     } catch {
       // Best effort — see ConsumedNonceStore.release's doc comment. A failed
-      // release just means the payer sees `payment_expired` on retry rather
-      // than a clean one; still fail-closed, never fail-open.
+      // release just means the payer sees `invalid_payment` (the
+      // already-consumed branch below) on retry rather than a clean one;
+      // still fail-closed, never fail-open.
+    }
+  }
+
+  /**
+   * Fix 2 (0.2.0): wraps `release` with a one-shot guard, for
+   * `res.locals.x402.release` — the handle a route handler calls when ITS
+   * OWN `/settle` call fails, so the nonce this middleware already consumed
+   * doesn't stay burned for the rest of the derivation window over a payment
+   * that never actually completed. Without the guard, a SECOND call after
+   * the pair has already been re-consumed by a legitimate retry would
+   * release THAT retry's slot too — reopening the exact replay window
+   * `ConsumedNonceStore` exists to close. `released` is captured per call
+   * (one closure per request), so it cannot leak between requests.
+   */
+  function releaseOnce(from: `0x${string}`, nonce: `0x${string}`): () => Promise<void> {
+    let released = false
+    return async () => {
+      if (released) return
+      released = true
+      await release(from, nonce)
     }
   }
 
@@ -313,7 +366,19 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
       // there is no store here to consult either way.
       const matched = matchChallenge(config.secret, merchantEvm, resource, presentedNonce)
       if (!matched) {
-        send402(res, requirements, 'payment_expired')
+        // `invalid_payment`, NOT `payment_expired`: a mismatch here has at
+        // least three distinct possible causes — the nonce genuinely expired,
+        // it was derived for a different resource or merchant, or the client
+        // (every stock x402 client — see paymentHeader.ts) signed a random
+        // nonce it invented itself — and this check has no way to tell which
+        // one happened. The validity WINDOW is enforced by the HMAC
+        // derivation itself (challengeDerivation.ts), not a store with
+        // timestamps to inspect, so there is no record here to look back at
+        // and classify the cause from. Reporting `payment_expired` would
+        // assert a specific cause (expiry) we have not established;
+        // `invalid_payment` — a real x402 `ErrorReasons` member — says only
+        // what is actually known: the presented nonce does not match.
+        send402(res, requirements, 'invalid_payment')
         return
       }
 
@@ -383,8 +448,11 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
         // PAYER. A different payer presenting the same nonce is a different
         // pair and is never rejected here (see ConsumedNonceStore's doc
         // comment). Rejected locally; the facilitator is never called a
-        // second time for it.
-        send402(res, requirements, 'payment_expired')
+        // second time for it. `invalid_payment`, not `payment_expired`: unlike
+        // the matchChallenge branch above, this IS a definitively known
+        // cause — a recorded replay, not expiry — so there is nothing
+        // ambiguous left to hedge about.
+        send402(res, requirements, 'invalid_payment')
         return
       }
 
@@ -404,7 +472,15 @@ export function ferry402(config: Ferry402Config, options: Ferry402Options = {}):
       // Never log `paymentPayload` (carries the payer's signature) or the raw
       // X-PAYMENT header anywhere on this path — see the task-6 judgement
       // notes. res.locals is request-scoped app state, not a log sink.
-      res.locals.x402 = { payload: paymentPayload, requirements: requirementForVerify, payer: verdict.payer }
+      // `release` (Fix 2, 0.2.0) closes over THIS request's own (from, nonce)
+      // — see `Ferry402Locals`'s doc comment for why the handler needs it.
+      const locals: Ferry402Locals = {
+        payload: paymentPayload,
+        requirements: requirementForVerify,
+        payer: verdict.payer,
+        release: releaseOnce(presentedFrom, presentedNonce),
+      }
+      res.locals.x402 = locals
       next()
     } catch (err) {
       // This handler's own returned promise must never reject — Express 5

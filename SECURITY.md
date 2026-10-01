@@ -187,8 +187,8 @@ anonymous traffic.
 **The attack this closes, and the one it reopens differently:** the
 predecessor design stored every *issued* challenge in a bounded map. Roughly
 5,000 anonymous, unpaid GETs (two entries each, against a 10,000-entry cap)
-would evict every outstanding legitimate challenge, handing every in-flight
-honest payer `payment_expired` — a cheap, total denial of service funded
+would evict every outstanding legitimate challenge, rejecting every
+in-flight honest payer — a cheap, total denial of service funded
 entirely by free requests. Deriving the challenge removes that cost
 entirely: resource binding and the time window fall out of the HMAC
 preimage and `Date.now()` arithmetic, not a lookup anyone can exhaust by
