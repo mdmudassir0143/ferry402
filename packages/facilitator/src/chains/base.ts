@@ -1551,28 +1551,16 @@ export async function settlePayment(
   let merchantEvmAddress: Address
   let authTuple: AuthTuple
   try {
-    // `nonceManager` (viem's own singleton, imported once above) — NOT a
-    // bare `privateKeyToAccount(facilitatorPrivateKey)`. Without it, every
-    // `writeContract` call below resolves the facilitator's own account
-    // nonce via a fresh `eth_getTransactionCount` RPC read (viem's default
-    // when `account.nonceManager` is unset). Two `/settle` calls that arrive
-    // concurrently — the exact thing a demo audience does when someone
-    // double-clicks "pay" — then race: both read the SAME pending nonce,
-    // one transaction lands and the other is either replaced, rejected with
-    // "nonce too low", or left to time out waiting 180s for a receipt that
-    // never comes (`SETTLE_TRANSPORT_OPTIONS`'s unbounded
-    // `waitForTransactionReceipt` poll). `nonceManager` serializes this:
-    // `privateKeyToAccount(key, { nonceManager })` wires `account.nonceManager`
-    // into viem's `sendTransaction`/`prepareTransactionRequest` path (see
-    // `nonceManager.consume`), which queues concurrent nonce requests for the
-    // SAME `(address, chainId)` key through one promise chain instead of
-    // issuing N independent RPC reads — so two concurrent settlements of two
-    // DIFFERENT authorizations get two DISTINCT, correctly-sequenced nonces
-    // and both land, rather than one silently vanishing. A fresh account
-    // value is still constructed on every call (cheap — it does not itself
-    // hold any nonce state), but every one of them shares this same
-    // module-level `nonceManager` singleton, which is what actually tracks
-    // the per-address nonce sequence across calls.
+    // `nonceManager` matters here. Without it viem resolves this account's
+    // nonce with a fresh `eth_getTransactionCount` on every `writeContract`,
+    // so two `/settle` calls arriving concurrently both read the same pending
+    // nonce: one transaction lands and the other is replaced, rejected as
+    // "nonce too low", or left waiting out the 180s receipt poll. Passing
+    // viem's module-level `nonceManager` singleton queues nonce requests for
+    // the same (address, chainId) through one promise chain, so concurrent
+    // settlements of different authorizations get distinct, sequential nonces
+    // and both land. A fresh `account` value per call is fine -- it holds no
+    // nonce state itself; the shared singleton is what tracks the sequence.
     account = privateKeyToAccount(facilitatorPrivateKey, { nonceManager })
     escrowAddress = getAddress(requirements.payTo)
     merchantEvmAddress = getAddress(merchantEvm)

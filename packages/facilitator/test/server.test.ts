@@ -429,7 +429,15 @@ describe('POST /settle', () => {
 // this constructor guard is additional, not a replacement.
 describe('createFacilitatorApp construction', () => {
   it('throws when escrows is omitted entirely', () => {
-    expect(() => createFacilitatorApp()).toThrow(/escrows/i)
+    // @ts-expect-error -- `escrows` is a REQUIRED field, so a TypeScript
+    // caller never reaches this. The runtime guard is what catches a
+    // JavaScript caller, and this test is what proves the guard is real
+    // rather than load-bearing on the type alone.
+    // Asserts the INSTRUCTIVE message, not merely the word "escrows" --
+    // a bare `TypeError: Cannot read properties of undefined (reading
+    // 'escrows')` also contains that word, so /escrows/i alone passes even
+    // when the guard never ran.
+    expect(() => createFacilitatorApp()).toThrow(/the "escrows" option is required/)
   })
 
   it('throws when escrows is an empty object', () => {
@@ -437,6 +445,7 @@ describe('createFacilitatorApp construction', () => {
   })
 
   it('names the option and shows the expected shape in the thrown message', () => {
+    // @ts-expect-error -- see above: deliberately calling the JS-caller path.
     expect(() => createFacilitatorApp()).toThrow(/createFacilitatorApp\({\s*\n\s*escrows: \{ 'base-sepolia'/)
   })
 

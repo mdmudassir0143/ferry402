@@ -80,7 +80,40 @@ export interface FacilitatorAppOptions {
    * `VerifyOptions.escrows` for the fail-closed behavior this threads
    * through to.
    */
-  escrows?: Partial<Record<'base' | 'base-sepolia', Address>>
+  escrows: Partial<Record<'base' | 'base-sepolia', Address>>
+}
+
+/**
+ * An early, loud failure for the one misconfiguration that is otherwise
+ * invisible. This does NOT replace `verifyPayment`/`settlePayment`'s own
+ * per-request fail-closed check (see `VerifyOptions.escrows` in
+ * `chains/base.ts`) — that check stays, and still rejects any network with
+ * no configured escrow.
+ *
+ * The problem it solves is diagnosability, not safety. A facilitator built
+ * with `escrows` absent entirely rejects every `/verify` and every `/settle`
+ * with the same `invalid_payment_requirements` a caller gets for a genuinely
+ * wrong `payTo`. From the outside that is indistinguishable from a broken
+ * install. Failing at construction, naming the option and showing its shape,
+ * turns a confusing outage into a stack trace that says what to pass.
+ *
+ * `escrows` is also required in `FacilitatorAppOptions`, so TypeScript
+ * callers are caught at compile time; this guard is what catches JavaScript
+ * callers, and callers passing an empty map.
+ */
+function assertHasTrustedEscrows(escrows: FacilitatorAppOptions['escrows']): void {
+  if (escrows && Object.keys(escrows).length > 0) return
+  throw new Error(
+    'createFacilitatorApp: the "escrows" option is required, and must name at least one ' +
+      'network -> the Escrow contract address this facilitator operator deployed and trusts. ' +
+      'Without it every /verify and /settle is rejected fail-closed, which looks like a broken ' +
+      'install rather than a missing field. Example:\n\n' +
+      '  createFacilitatorApp({\n' +
+      "    escrows: { 'base-sepolia': '0xYourDeployedEscrowAddress' },\n" +
+      "    rpcUrls: { 'base-sepolia': process.env.BASE_SEPOLIA_RPC_URL },\n" +
+      '    facilitatorPrivateKey: process.env.FACILITATOR_PRIVATE_KEY,\n' +
+      '  })\n',
+  )
 }
 
 /**
@@ -102,44 +135,13 @@ export interface FacilitatorAppOptions {
  * settlement failure, but never the signature, the payload, or the
  * facilitator's private key — see its own doc comments.
  */
-/**
- * A demo- and ops-facing early guard, NOT a replacement for
- * `verifyPayment`/`settlePayment`'s own per-request fail-closed check (see
- * `VerifyOptions.escrows`'s doc comment in `chains/base.ts`). That check is
- * already correct — a request for a network with no configured trusted
- * escrow is rejected, every time, with no exception — but it is correct in a
- * way that is nearly impossible to diagnose from the outside: a facilitator
- * built with `escrows` entirely absent (the single most likely way to
- * misconfigure this, e.g. forgetting to read `ESCROW_ADDRESS_BASE_SEPOLIA`
- * from `.env` at all) rejects EVERY `/verify` and EVERY `/settle` call,
- * forever, with the same generic `invalid_payment_requirements` a caller
- * also sees for a genuinely wrong `payTo`. In front of an audience that
- * looks identical to a broken install, and the five minutes it costs to
- * figure out "oh, I never passed `escrows`" is the whole failure mode this
- * guard exists to delete: fail at `createFacilitatorApp(...)` itself, loudly
- * and synchronously, naming the exact option and showing its shape, before a
- * single request is ever accepted.
- */
-function assertHasTrustedEscrows(escrows: FacilitatorAppOptions['escrows']): void {
-  if (escrows && Object.keys(escrows).length > 0) return
-  throw new Error(
-    'createFacilitatorApp: the "escrows" option is required and must name at least one ' +
-      'network -> trusted Escrow contract address. Every /verify and /settle request is ' +
-      'rejected fail-closed (invalid_payment_requirements) for any network with no entry here ' +
-      '(see VerifyOptions.escrows in src/chains/base.ts) -- without this check, a facilitator ' +
-      'built with escrows missing entirely rejects every single request with no indication why, ' +
-      'which looks exactly like a broken install rather than a one-line missing config. Pass the ' +
-      'address(es) of your own deployed Escrow contract(s), e.g.:\n\n' +
-      '  createFacilitatorApp({\n' +
-      "    escrows: { 'base-sepolia': '0xYourDeployedEscrowAddress...' },\n" +
-      "    rpcUrls: { 'base-sepolia': process.env.BASE_SEPOLIA_RPC_URL },\n" +
-      '    facilitatorPrivateKey: process.env.FACILITATOR_PRIVATE_KEY,\n' +
-      '  })\n',
-  )
-}
-
-export function createFacilitatorApp(options: FacilitatorAppOptions = {}): Express {
-  assertHasTrustedEscrows(options.escrows)
+export function createFacilitatorApp(options: FacilitatorAppOptions): Express {
+  // `options?.`, not `options.`: the parameter is required at the type
+  // level, but a JavaScript caller can still invoke this with no argument
+  // at all. Reading `options.escrows` directly would hand them a bare
+  // `TypeError: Cannot read properties of undefined` -- which defeats the
+  // entire point of the guard below.
+  assertHasTrustedEscrows(options?.escrows)
   const app = express()
   app.use(express.json({ limit: MAX_REQUEST_BODY_SIZE }))
 

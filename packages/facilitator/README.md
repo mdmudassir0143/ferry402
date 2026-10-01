@@ -44,15 +44,22 @@ to be. It is shaped exactly like `rpcUrls`, for the same reason: an operator
 already has to know its own RPC endpoints, and a self-hosting merchant knows
 its own deployed escrow address.
 
-**This fails closed.** `createFacilitatorApp()` called with no `escrows` (or
-with a network missing from the map) rejects *every* request for that
-network — `/verify` returns `invalid_payment_requirements`, `/settle` a
-generic failure — rather than silently trusting whatever `payTo` the caller
-sent. This is deliberate (see the `VerifyOptions.escrows` doc comment in
-`src/chains/base.ts`), but it means a facilitator that looks "up" from a
-health-check perspective can still reject 100% of real traffic if `escrows`
-was never wired up. If every request comes back `invalid_payment_requirements`
-in production, check this first.
+**This is required, and it fails closed.** `escrows` is a required field on
+`FacilitatorAppOptions`, so a TypeScript caller that omits it does not
+compile; a JavaScript caller that omits it — or passes an empty map — gets a
+throw from `createFacilitatorApp()` itself, naming the option and showing the
+shape. That guard exists because the fallback behaviour, while correct, is
+undiagnosable: a facilitator with no `escrows` rejects *every* request for
+that network (`/verify` returns `invalid_payment_requirements`, `/settle` a
+generic failure) rather than trusting whatever `payTo` the caller sent, and
+from the outside that is indistinguishable from a broken install.
+
+The per-request check is unchanged and still authoritative: a network present
+in the map but pointing at the wrong address, or a network absent from an
+otherwise-populated map, is rejected per request (see the
+`VerifyOptions.escrows` doc comment in `src/chains/base.ts`). If requests for
+one network come back `invalid_payment_requirements` in production while
+others succeed, check that network's entry first.
 
 Populate it once you've deployed `Escrow.sol` per network (Task 10 covers
 deployment) — there is no default; an un-deployed or unconfigured network is
