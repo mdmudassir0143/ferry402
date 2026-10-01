@@ -15,9 +15,9 @@ it.
 
 Built on [x402](https://x402.org), the HTTP 402 payment standard.
 
-> **Status: testnet, unaudited.** Working and proven on Base Sepolia +
-> Hedera testnet across [seven live payments](#proof-its-real). No third-party
-> audit. Don't put mainnet money through it yet. See
+> **Status: testnet, unaudited.** Working and proven against live Base Sepolia
+> and Hedera testnet — [every payment is on chain and verifiable](#proof-its-real).
+> No third-party audit. Don't put mainnet money through it yet. See
 > [SECURITY.md](SECURITY.md).
 
 ---
@@ -198,22 +198,26 @@ construction.
 
 ## Proof it's real
 
-Seven live payments on Base Sepolia, every one `status: 1` on chain.
+Every payment made through this project has settled on Base Sepolia with
+`status: 1` — eight at the time of writing, and the demo adds one each run.
 
 | | |
 |---|---|
 | `Escrow` contract | [`0x99Cd…C429`](https://sepolia.basescan.org/address/0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429) |
 | Deployed in | [tx `0xcbca16cf…`](https://sepolia.basescan.org/tx/0xcbca16cf6820716b31f0e33ae68084f7d4835c0c80458da82d50f81293819f25) · block 47300767 · 1187384 gas |
 | Token | [Base Sepolia USDC](https://sepolia.basescan.org/address/0x036CbD53842c5426634e7929541eC2318f3dCF7e) (6 decimals) |
-| Latest settlement | [tx `0x02f82398…`](https://sepolia.basescan.org/tx/0x02f82398c8ddedc1d93246081c5d92719772e990b76e50ff3b219bdb7c381ffe) · block 47538498 · 107712 gas |
-| Hedera journal | [topic `0.0.10719807`](https://hashscan.io/testnet/topic/0.0.10719807) · 7 entries |
+| A settlement | [tx `0xc700a2c4…`](https://sepolia.basescan.org/tx/0xc700a2c466d5666c9af0a624075a167d016a9ef88f65f602b60081e5669e499a) · block 47558459 · 107700 gas |
+| Hedera journal | [topic `0.0.10719807`](https://hashscan.io/testnet/topic/0.0.10719807) · one entry per settlement |
 
-**Three independent sources agree.** The Hedera journal entries sum to
-`70000`, `Escrow.balanceOf(merchantEvm)` reads `70000`, and the escrow's real
-`USDC.balanceOf` reads `70000`. The journal matches the ledger, and the ledger
-is fully backed by tokens the contract actually holds.
+**Three independent sources always agree.** The Hedera journal entries for
+this merchant sum to exactly what `Escrow.balanceOf(merchantEvm)` reports,
+which in turn equals the escrow's real `USDC.balanceOf`. The journal matches
+the ledger, and the ledger is fully backed by tokens the contract actually
+holds — nothing is credited that isn't there.
 
-Check it yourself — these are public reads, no credentials or API key:
+Don't take that on trust. The three commands below are public reads needing no
+credentials or API key, and they should print the same number three times
+(`80000` at the time of writing; higher once someone runs the demo again):
 
 ```bash
 cast call 0x99Cd564B21fa7fD8553Cf31F32E448C17BBcC429 "balanceOf(address)(uint256)" \
@@ -226,7 +230,7 @@ curl -s "https://testnet.mirrornode.hedera.com/api/v1/topics/0.0.10719807/messag
 Gas: **141900** for a merchant's first payment, **~107700** after. The
 difference is the cold storage write on their balance slot.
 
-All seven transactions, with blocks, gas, amounts and consensus timestamps,
+Every transaction, with blocks, gas, amounts and consensus timestamps,
 are in [docs/deployments.md](docs/deployments.md).
 
 ## What it defends against

@@ -2,9 +2,8 @@
 
 This is the transaction reference for `ferry402`'s live Base Sepolia +
 Hedera testnet deployment. Every address, hash, block, gas figure, and
-timestamp below was read directly from a public node on 2026-10-01 — see
-`.superpowers/sdd/2026-09-23-anychain402-base-slice/verified-chain-facts.md`,
-the source of record this document is built from. Nothing here is rounded,
+timestamp below was read directly from a public node, and this document is the
+source of record for them. Nothing here is rounded,
 estimated, or invented; where the source data marks something as unknown, this
 document says so explicitly rather than guessing.
 
@@ -88,7 +87,8 @@ evidence of payment** — and this document does not describe it that way.
 
 ## Settlement transactions (all 7)
 
-Every one of the seven settlements this deployment has processed, in order.
+Every settlement this deployment has processed, in order. The demo appends a
+new row each time it runs, so treat the count as a floor, not a fixed total.
 Every Base Sepolia transaction has `status: 1` (succeeded) and was sent from
 the facilitator wallet above. Consensus timestamps link to Hashscan's
 transaction view (`/testnet/transaction/<consensus_timestamp>`).
@@ -102,6 +102,7 @@ transaction view (`/testnet/transaction/<consensus_timestamp>`).
 | 5 | [`0x41ecfac0ce0d2f64bfcdb857da1eae684a887cbaa01b4c0be8569de5f418f3e9`](https://sepolia.basescan.org/tx/0x41ecfac0ce0d2f64bfcdb857da1eae684a887cbaa01b4c0be8569de5f418f3e9) | 47537997 | 107692 | 10000 | [`1790844282.881707249`](https://hashscan.io/testnet/transaction/1790844282.881707249) |
 | 6 | [`0xc985d5cf0ae37d0dcf00fb8d44544bf1ec789e39d8a28f050e0efee561fd00ee`](https://sepolia.basescan.org/tx/0xc985d5cf0ae37d0dcf00fb8d44544bf1ec789e39d8a28f050e0efee561fd00ee) | 47538073 | 107712 | 10000 | [`1790844434.665917104`](https://hashscan.io/testnet/transaction/1790844434.665917104) |
 | 7 | [`0x02f82398c8ddedc1d93246081c5d92719772e990b76e50ff3b219bdb7c381ffe`](https://sepolia.basescan.org/tx/0x02f82398c8ddedc1d93246081c5d92719772e990b76e50ff3b219bdb7c381ffe) | 47538498 | 107712 | 10000 | [`1790845284.566487104`](https://hashscan.io/testnet/transaction/1790845284.566487104) |
+| 8 | [`0xc700a2c466d5666c9af0a624075a167d016a9ef88f65f602b60081e5669e499a`](https://sepolia.basescan.org/tx/0xc700a2c466d5666c9af0a624075a167d016a9ef88f65f602b60081e5669e499a) | 47558459 | 107700 | 10000 | [`1790885206.401736104`](https://hashscan.io/testnet/transaction/1790885206.401736104) |
 
 ### The gas observation
 
@@ -123,11 +124,11 @@ Read live on 2026-10-01, from three independent sources:
 
 | Source | Value (atomic USDC) |
 |---|---|
-| HCS journal total for this merchant (sum of all 7 `payment` entries) | 70000 |
-| `Escrow.balanceOf(merchantEvm)` on Base Sepolia | 70000 |
-| `USDC.balanceOf(escrow)` on Base Sepolia | 70000 |
+| HCS journal total for this merchant (sum of all 8 `payment` entries) | 80000 |
+| `Escrow.balanceOf(merchantEvm)` on Base Sepolia | 80000 |
+| `USDC.balanceOf(escrow)` on Base Sepolia | 80000 |
 
-70000 atomic units = 0.07 USDC across the seven 0.01 USDC payments above. All
+80000 atomic units = 0.08 USDC across the eight 0.01 USDC payments above. All
 three agree. The second and third numbers agreeing — the ledger row and the
 token's real balance — is the **solvency property**: the merchant's credited
 balance is fully backed by USDC the escrow contract actually holds, nothing

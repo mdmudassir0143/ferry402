@@ -10,7 +10,7 @@ documents extend it rather than repeat it:
   the ledger.
 - **[`deployments.md`](deployments.md)** — the live Base Sepolia + Hedera
   testnet transaction record: every address, the Escrow deployment, all
-  seven settlements, the three-way reconciliation, and how to deploy your
+  every settlement, the three-way reconciliation, and how to deploy your
   own.
 - **[`troubleshooting.md`](troubleshooting.md)** — real failure modes with
   real symptoms, grounded in the actual error paths in `packages/sdk` and

@@ -382,10 +382,10 @@ concurrently against the same merchant.
 The price is published in the 402 itself (`maxAmountRequired`), as a
 decimal-string **atomic unit** amount — never a dollar figure you compute
 yourself. USDC uses 6 decimals, so `"10000"` is $0.01. This project's own
-live settlements on Base Sepolia are all exactly this: seven real
-settlements of `10000` atomic units ($0.01) each (see
-`.superpowers/sdd/2026-09-23-anychain402-base-slice/verified-chain-facts.md`
-for the verified on-chain figures).
+live settlements on Base Sepolia are all exactly this: real settlements of
+`10000` atomic units ($0.01) each. See
+[`docs/deployments.md`](docs/deployments.md) for every one of them, with
+on-chain figures you can verify yourself.
 
 You never need ETH for the payment itself — EIP-3009 authorizations are
 signed off-chain and the facilitator's own wallet pays the gas to submit

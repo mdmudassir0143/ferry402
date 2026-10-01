@@ -28,7 +28,7 @@ import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
 import { baseSepolia } from 'viem/chains'
 import { Client, AccountId, PrivateKey } from '@hashgraph/sdk'
 import { ferry402, createPaymentHeader, computeNonce } from '@ferry402/sdk'
-import type { Ferry402Config, PaymentRequirements } from '@ferry402/sdk'
+import type { Ferry402Config, Ferry402Locals, PaymentRequirements } from '@ferry402/sdk'
 // @ferry402/facilitator is never published to npm (private package) — run
 // straight from this monorepo's own source, the same way a merchant who
 // clones the repo and self-hosts the facilitator would. Requires `pnpm
@@ -289,7 +289,9 @@ async function main(): Promise<void> {
   // a payment moves through the system").
   function makePaidRoute(app: Express, routePath: string, quote: Record<string, unknown>): void {
     app.get(routePath, ferry402(config), async (_req, res) => {
-      const { payload, requirements } = res.locals.x402 as { payload: unknown; requirements: unknown }
+      // `Ferry402Locals` (0.2.0) — the typed shape of res.locals.x402, so this
+      // handler reads it directly instead of casting through `unknown`.
+      const { payload, requirements, release } = res.locals.x402 as Ferry402Locals
 
       const settleRes = await fetch(`${facilitatorBaseUrl}/settle`, {
         method: 'POST',
@@ -298,6 +300,15 @@ async function main(): Promise<void> {
       })
       const settleJson = (await settleRes.json()) as { success: boolean; errorReason?: string; transaction: string; network: string; payer: string }
       if (!settleJson.success) {
+        // `release()` (0.2.0) — the middleware consumed this (payer, nonce)
+        // pair BEFORE handing off to us, so that a concurrent duplicate could
+        // not slip through while /verify was in flight. Settlement just
+        // failed, which means no payment happened; without releasing it, this
+        // payer would be locked out of retrying for the rest of the
+        // derivation window (up to 10 minutes) over a payment that never
+        // completed. Best-effort and one-shot: it never throws, and a second
+        // call is a no-op rather than releasing some later retry's slot.
+        await release()
         res.status(402).json({ error: settleJson.errorReason ?? 'settlement_failed' })
         return
       }
@@ -306,6 +317,9 @@ async function main(): Promise<void> {
       const settledLogs = parseEventLogs({ abi: escrowReadAbi, eventName: 'PaymentSettled', logs: receipt.logs })
       const settled = settledLogs[0]
       if (!settled) {
+        // Same reasoning as the branch above: the settlement call reported
+        // success but produced no PaymentSettled log, so nothing was credited.
+        await release()
         res.status(500).json({ error: 'no_settlement_log' })
         return
       }

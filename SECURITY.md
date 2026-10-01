@@ -12,9 +12,8 @@ security document at all.
 
 **Testnet only.** Every deployed contract, every live transaction, and every
 HCS topic this project has exercised is on Base Sepolia and Hedera testnet
-— see
-`.superpowers/sdd/2026-09-23-anychain402-base-slice/verified-chain-facts.md`
-for the verified addresses and transactions. **No third-party security
+— see [`docs/deployments.md`](docs/deployments.md) for the verified addresses
+and transactions. **No third-party security
 audit has been performed** on `Escrow.sol`, the SDK, or the facilitator.
 Treat everything below as this project's own reasoning about its own
 design, not an external guarantee.
@@ -259,6 +258,20 @@ raw-bytes level matches the token's own strictness exactly, rather than
 being independently stricter or looser.
 
 ## Known limitations — stated plainly
+
+- **Known dependency advisories, inherited and currently unfixable.**
+  `npm audit` reports high-severity advisories against `@grpc/grpc-js`
+  (`<=1.13.5`) and moderate ones against `protobufjs` and
+  `decode-uri-component`. None are in ferry402's own code: they arrive
+  transitively through `@hashgraph/sdk`, which is required to write the HCS
+  journal. We are already on the latest `@hashgraph/sdk` (2.81.0) and it pins
+  `@grpc/grpc-js@1.12.6` itself, so there is no newer release to upgrade to —
+  `npm audit fix --force` would *downgrade* the Hedera SDK, not fix anything.
+  The exposure is in gRPC request handling on a client that talks only to
+  Hedera's own nodes, so an attacker would need to be the Hedera endpoint; it
+  is not reachable from a payer or from HTTP traffic. We will pick up the fix
+  when `@hashgraph/sdk` ships one. A merchant who wants it sooner can supply
+  its own journal `submitter` and avoid `@hashgraph/sdk` entirely.
 
 - **The default `InMemoryConsumedNonceStore` is per-process, and a restart
   loses it.**
