@@ -210,6 +210,13 @@ usable payment window is up to `2 * TIME_BUCKET_SECONDS` (10 minutes).
 
 ## Known limitations
 
+- **The same payer cannot buy the same URL twice within the ~5-minute
+  derivation window.** The nonce derives from `(merchantEvm, resource,
+  timeBucket)` with no per-purchase component, so an identical repeat purchase
+  produces an identical nonce and is rejected as a replay (`invalid_payment`).
+  Vary the URL per request — a query parameter is enough — if your endpoint
+  takes no parameters and is called repeatedly.
+
 - **Replay protection is per-process by default.** `InMemoryConsumedNonceStore`
   clears on restart, losing protection for the derivation window still open at
   that moment, and it is not shared across horizontally-scaled instances. Pass

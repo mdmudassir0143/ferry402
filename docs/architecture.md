@@ -131,7 +131,7 @@ Step by step:
    the facilitator's own trusted-escrow allowlist, recovers and validates the
    signature (ECDSA or EIP-1271), confirms the escrow's bound token matches
    the requirement's `asset`, and reads the payer's live USDC balance — see
-   ["What `/verify` has to prove"](#what-verify-has-to-prove) for why.
+   ["Serve-then-settle"](#serve-then-settle-say-it-plainly) for why.
 6. **Resource served.** On `isValid: true`, `ferry402()` calls `next()` and
    your route handler runs — **before** anything has touched the chain.
 7. **`/settle` on-chain.** Your route handler (not `ferry402()` itself — see

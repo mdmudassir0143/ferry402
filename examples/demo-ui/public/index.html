@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ferry402 — live payment demo</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⛴️</text></svg>" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">ferry402</span>
+      <span class="brand-sub">live payment demo</span>
+    </div>
+    <div class="live-pill" title="Every action on this page hits real Base Sepolia and Hedera testnet — nothing here is simulated.">
+      <span class="live-dot"></span> LIVE — Base Sepolia + Hedera Testnet
+    </div>
+  </header>
+
+  <main>
+    <section class="panel state-panel" id="state-panel" aria-label="Starting position">
+      <div class="state-panel-head">
+        <h2>Starting position</h2>
+        <button class="btn btn-ghost" id="refresh-state-btn" type="button">Refresh</button>
+      </div>
+      <div class="state-grid">
+        <div class="state-tile">
+          <span class="state-label">Escrow ledger row</span>
+          <span class="state-value mono" id="state-ledger">—</span>
+          <span class="state-unit">atomic USDC, this merchant</span>
+        </div>
+        <div class="state-tile">
+          <span class="state-label">Escrow USDC balance</span>
+          <span class="state-value mono" id="state-balance">—</span>
+          <span class="state-unit">atomic USDC, contract total</span>
+        </div>
+        <div class="state-tile">
+          <span class="state-label">HCS journal total</span>
+          <span class="state-value mono" id="state-journal">—</span>
+          <span class="state-unit">atomic USDC, this merchant</span>
+        </div>
+      </div>
+      <p class="state-meta mono" id="state-meta"></p>
+    </section>
+
+    <section class="panel run-panel" aria-label="Run a payment">
+      <div class="run-panel-head">
+        <div>
+          <h2>Run a real payment</h2>
+          <p class="muted">Challenge → sign → serve → settle → ledger read → HCS journal → reconcile. About 21 seconds, end to end.</p>
+        </div>
+        <div class="run-controls">
+          <span class="elapsed mono" id="run-elapsed"></span>
+          <button class="btn btn-primary btn-large" id="run-btn" type="button">Run payment</button>
+        </div>
+      </div>
+      <p class="error-banner" id="run-error" hidden></p>
+    </section>
+
+    <section class="steps" aria-label="Payment flow steps">
+      <!-- STEP 1 -->
+      <article class="step card" id="step-challenge" data-step="1">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">1</span> Challenge — HTTP 402</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">The merchant's <code>/api/quote</code> route, requested with no payment. Waiting to run.</p>
+        </div>
+      </article>
+
+      <!-- STEP 2 -->
+      <article class="step card" id="step-signed" data-step="2">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">2</span> Signed — EIP-3009 authorization</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">The payer signs a <code>ReceiveWithAuthorization</code> locally via <code>createPaymentHeader()</code> — no private key ever leaves this process, let alone reaches this page.</p>
+        </div>
+      </article>
+
+      <!-- STEP 3 -->
+      <article class="step card" id="step-served" data-step="3">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">3</span> Served — HTTP 200</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">Retried with <code>X-PAYMENT</code>. The resource is served the moment the facilitator verifies the payment.</p>
+        </div>
+      </article>
+
+      <!-- STEP 4 -->
+      <article class="step card" id="step-settled" data-step="4">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">4</span> Settled — on-chain transaction</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">The facilitator submits the EIP-3009 transfer into the non-custodial <code>Escrow</code> contract on Base Sepolia.</p>
+        </div>
+      </article>
+
+      <!-- STEP 5 -->
+      <article class="step card" id="step-ledger" data-step="5">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">5</span> Escrow ledger — before / after</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">The merchant's row in the <code>Escrow</code> contract's internal ledger, read directly from the chain.</p>
+        </div>
+      </article>
+
+      <!-- STEP 6 -->
+      <article class="step card" id="step-journal" data-step="6">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">6</span> HCS journal — mirror-node read-back</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">The settlement is journaled to a Hedera Consensus Service topic, then read back independently from the public mirror node.</p>
+        </div>
+      </article>
+
+      <!-- STEP 7 — climax -->
+      <article class="step card card-climax" id="step-reconciled" data-step="7">
+        <header class="card-head">
+          <div class="card-title"><span class="step-num">7</span> Reconciliation</div>
+          <div class="card-status-wrap">
+            <span class="timing mono" data-field="timing"></span>
+            <span class="status-badge" data-field="status">pending</span>
+          </div>
+        </header>
+        <div class="card-body" data-field="body">
+          <p class="placeholder">Three independent sources of truth — the HCS journal, the escrow contract's internal ledger, and its real USDC balance — should always agree.</p>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel security-panel" aria-label="Security checks">
+      <h2>Security checks</h2>
+      <p class="muted">Each of these sends a payment ferry402 is designed to reject. A rejection here is the correct, intended outcome — styled green, not red.</p>
+      <div class="checks-grid">
+        <div class="check" id="check-replay">
+          <div class="check-head">
+            <h3>Replay</h3>
+            <button class="btn btn-secondary" data-check="replay" type="button">Run check</button>
+          </div>
+          <p class="check-desc">Present the exact same <code>X-PAYMENT</code> header a second time.</p>
+          <div class="check-result" data-field="result"><span class="placeholder">Not run yet.</span></div>
+        </div>
+        <div class="check" id="check-cross-route">
+          <div class="check-head">
+            <h3>Cross-route</h3>
+            <button class="btn btn-secondary" data-check="cross-route" type="button">Run check</button>
+          </div>
+          <p class="check-desc">Present a header signed for <code>/api/quote</code> at <code>/api/quote/premium</code> instead.</p>
+          <div class="check-result" data-field="result"><span class="placeholder">Not run yet.</span></div>
+        </div>
+        <div class="check" id="check-zero-balance">
+          <div class="check-head">
+            <h3>Zero-balance</h3>
+            <button class="btn btn-secondary" data-check="zero-balance" type="button">Run check</button>
+          </div>
+          <p class="check-desc">A brand-new, never-funded key signs a valid-looking authorization.</p>
+          <div class="check-result" data-field="result"><span class="placeholder">Not run yet.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="page-footer">
+      <p class="muted">No private key, or anything derived from one beyond a public address, is ever sent to this page. Source: <code>examples/demo-ui</code>.</p>
+    </footer>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

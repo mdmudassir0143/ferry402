@@ -267,6 +267,23 @@ balance, a settlement-time buffer, and that the escrow's token matches, which
 narrows it as far as this architecture allows. The residual risk lands on the
 merchant.
 
+**The same payer can't buy the same URL twice within 5 minutes.** The
+challenge is derived from `(merchantEvm, resource, time bucket)` with no
+per-purchase component, so a repeat purchase of an identical URL by the same
+payer derives an identical nonce — which the consumed-nonce store has already
+seen. The second payment is rejected with `invalid_payment`, and the 402 it
+gets back carries the *same* `paymentId`, so retrying doesn't help; that payer
+is blocked on that URL for up to 10 minutes.
+
+In practice most metered endpoints vary by path or query parameter, which
+yields a distinct resource and a distinct nonce. But an endpoint that takes no
+parameters and is polled repeatedly — an autonomous agent hitting the same
+quote endpoint, say — hits this immediately. The workaround is to vary the URL
+per request; [`examples/demo-ui`](examples/demo-ui) does exactly that and
+shows the URL it used. A real fix needs a per-purchase value in the derivation,
+transmitted alongside the payment, which is a protocol change rather than a
+config one.
+
 **Replay protection is per-process by default.** `InMemoryConsumedNonceStore`
 isn't shared between instances, and a restart clears it — losing replay
 protection for the window still open at that moment (up to 10 minutes). Pass

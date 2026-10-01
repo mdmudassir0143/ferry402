@@ -259,6 +259,20 @@ being independently stricter or looser.
 
 ## Known limitations — stated plainly
 
+- **The same payer cannot buy the same URL twice inside the derivation
+  window.** `paymentId` is `HMAC(secret, merchantEvm | resource | timeBucket)`
+  — there is no per-purchase component — so an identical repeat purchase
+  derives an identical nonce, which the consumed-nonce store rejects as a
+  replay. This is the replay defence behaving exactly as designed; it just
+  cannot distinguish "the same payment presented twice" from "a second,
+  genuine purchase of the same thing". The rejection is `invalid_payment` and
+  the accompanying 402 repeats the same `paymentId`, so a retry cannot
+  succeed until the bucket rolls over (up to 10 minutes). It is a correctness
+  and availability limitation, not a security hole — nobody gains access or
+  funds — but for a parameterless endpoint polled repeatedly it is severe.
+  Varying the URL per request avoids it; a proper fix requires a per-purchase
+  value in the derivation, transmitted with the payment.
+
 - **Known dependency advisories, inherited and currently unfixable.**
   `npm audit` reports high-severity advisories against `@grpc/grpc-js`
   (`<=1.13.5`) and moderate ones against `protobufjs` and

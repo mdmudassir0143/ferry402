@@ -10,6 +10,7 @@ cause in the code, and the fix.
 | Symptom | Section |
 |---|---|
 | A stock x402 client (`x402-fetch`, `x402-axios`, plain `x402@1.2.0`) always gets `invalid_payment` | [A stock x402 client gets `invalid_payment` against every request](#a-stock-x402-client-gets-invalid_payment-against-every-request) |
+| The *first* payment works, a second for the same URL is rejected `invalid_payment` | [A second payment for the same URL is rejected](#a-second-payment-for-the-same-url-is-rejected) |
 | `createFacilitatorApp(...)` throws immediately, before listening | [`createFacilitatorApp` throws about `"escrows"`](#createfacilitatorapp-throws-about-escrows) |
 | Every single payment attempt is rejected with `invalid_payment_requirements` | [Every request returns `invalid_payment_requirements`](#every-request-returns-invalid_payment_requirements) |
 | A correctly-signed payment is rejected with `insufficient_funds` | [`insufficient_funds` from `/verify`](#insufficient_funds-from-verify) |
@@ -75,6 +76,53 @@ It derives the same nonce the server will check for and signs against it.
 There is currently no packaged, higher-level client (a fetch/axios wrapper
 that runs the 402 → sign → retry loop automatically) — see the root README's
 "Client compatibility" section.
+
+## A second payment for the same URL is rejected
+
+**Symptom:** The first payment succeeds and the resource is served. A second
+payment from the same payer, for the same URL, within a few minutes, comes
+back `402` with `error: "invalid_payment"`. The 402 body carries the *same*
+`extra.paymentId` as the first one, so retrying never works. After about ten
+minutes it starts working again on its own.
+
+**Cause:** The challenge is derived, not stored:
+
+```
+paymentId = HMAC-SHA256(secret, merchantEvm | resource | timeBucket)
+nonce     = keccak256(abi.encode(merchantEvm, paymentId))
+```
+
+There is no per-purchase component in that preimage. Same merchant, same
+resource string, same 5-minute bucket produces the same nonce every time — and
+the `ConsumedNonceStore`, keyed `(from, nonce)`, has already recorded it from
+the first purchase. The middleware cannot tell a genuine second purchase apart
+from the same payment replayed, so it rejects it. That is the replay defence
+working correctly; it just cannot see the difference.
+
+Note this is per payer: a *different* payer buying the same resource in the
+same window is fine, because the store is keyed on `(from, nonce)` rather than
+the nonce alone.
+
+**Fix:** Make each purchase a distinct resource. The nonce derives from the
+full request URL, so any varying component is enough:
+
+```
+GET /api/quote?request=0f3c9a            →  distinct nonce
+GET /api/quote?request=7b21ee            →  distinct nonce
+```
+
+Most metered APIs get this for free, since calls differ by path or parameters.
+A parameterless endpoint that gets polled — an autonomous agent hitting the
+same quote URL in a loop — does not, and will hit this on its second call.
+[`examples/demo-ui`](../examples/demo-ui) appends a unique query string for
+exactly this reason, and displays the URL it used rather than the bare route.
+
+**What would fix it properly:** a per-purchase value mixed into the
+derivation and transmitted alongside the payment, so each 402 yields a unique
+nonce without the merchant having to vary the URL. EIP-3009 signs only six
+fields and the nonce is the only free one, so that value has to travel outside
+the signature — a protocol change, not a configuration one. It is not
+implemented.
 
 ## `createFacilitatorApp` throws about `"escrows"`
 

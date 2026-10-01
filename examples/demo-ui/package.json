@@ -1,0 +1,27 @@
+{
+  "name": "ferry402-demo-ui",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "A local, screen-recordable web UI for the real ferry402 payment flow against live Base Sepolia + Hedera testnet.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.3"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@ferry402/sdk": "0.2.1",
+    "@hashgraph/sdk": "2.81.0",
+    "express": "^5.2.1",
+    "viem": "^2.56.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.3"
+  }
+}
