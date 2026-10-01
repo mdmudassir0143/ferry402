@@ -24,17 +24,35 @@ Built on [x402](https://x402.org), the HTTP 402 payment standard.
 
 ## Try it in 30 seconds
 
+No wallet, no funded account, no blockchain connection:
+
 ```bash
 git clone https://github.com/mdmudassir0143/ferry402.git
-cd ferry402/examples/demo
-npm install && npm run demo
+cd ferry402/examples/quickstart
+npm install && npm start
 ```
 
-That runs a real payment against live Base Sepolia and Hedera testnet and
-narrates every step — the 402 challenge, the signed authorization, the
-settlement transaction, the Hedera journal entry, and a three-way
-reconciliation. It then demonstrates three attacks being rejected. You'll need
-a funded `.env` ([see below](#environment-variables)).
+```bash
+curl -s http://localhost:3000/quote | jq
+```
+
+You get an HTTP **402** carrying a machine-readable bill — chain, token,
+amount, destination. Issuing that costs nothing but an HMAC, which is why
+there is no challenge database to exhaust.
+See [`examples/quickstart`](examples/quickstart).
+
+## Then watch a real payment
+
+```bash
+cd examples/demo    && npm install && npm run demo    # terminal, narrated
+cd examples/demo-ui && npm install && npm start       # browser, step by step
+```
+
+Both run genuine payments against live Base Sepolia and Hedera testnet — the
+402, the signed authorization, the settlement transaction, the Hedera journal
+entry, a three-way reconciliation, and three attacks being correctly
+rejected. About 12 seconds end to end. These settle real testnet USDC, so
+they need a funded `.env` ([see below](#environment-variables)).
 
 ## Install
 
@@ -314,7 +332,9 @@ reconcile by reading the journal.
 | [`packages/contracts`](packages/contracts) | `Escrow.sol`, the non-custodial vault. Standalone Foundry project — **not** a pnpm workspace member, so `pnpm -r` never touches it |
 | [`packages/sdk`](packages/sdk) | `@ferry402/sdk` — the middleware, `createPaymentHeader`, and the challenge/nonce primitives. ESM only |
 | [`packages/facilitator`](packages/facilitator) | `createFacilitatorApp()` — the `/verify` + `/settle` service and journal writer. `private`, so self-host from source |
+| [`examples/quickstart`](examples/quickstart) | The smallest integration — one route, one middleware. Runs with zero setup; shows the 402 but cannot settle |
 | [`examples/demo`](examples/demo) | The narrated live demo. Installs the **published** SDK from npm, so it tests what you'd actually get |
+| [`examples/demo-ui`](examples/demo-ui) | The same flow in a browser, one card per step. Local-only: it needs your signing keys, so it is not and cannot be a hosted page |
 
 ## Development
 

@@ -1,0 +1,25 @@
+{
+  "name": "ferry402-quickstart",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "The smallest possible ferry402 integration: one Express route, charged per call.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.3"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "quickstart": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@ferry402/sdk": "0.2.1",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.3"
+  }
+}
