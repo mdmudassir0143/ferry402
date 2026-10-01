@@ -1,5 +1,18 @@
 # @ferry402/sdk
 
+## 0.2.1
+
+Documentation only. No code, no types, no behaviour change — the `dist/` output
+is byte-identical to 0.2.0.
+
+This release exists because npm renders the README from the published tarball
+and cannot update it without a version bump. 0.2.0 shipped the README as it
+stood at publish time; it was rewritten shortly afterwards for readability
+(plain-language opening, no table cell over 120 characters, the
+`createPaymentHeader` requirement and the Base-only limitation both made
+prominent rather than buried). Publishing that rewrite is the only way to put
+it on the package page.
+
 ## 0.2.0
 
 ### Breaking
