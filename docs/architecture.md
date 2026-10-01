@@ -11,23 +11,29 @@ these steps fails.
 
 ## The problem, and what actually crosses a chain boundary
 
-An x402-protected merchant route lives on one chain's USDC. A payer may hold
-USDC on a different chain, or the merchant may simply not want to write
-chain-specific settlement code for every chain they're willing to accept from.
-`ferry402` lets a merchant advertise payment acceptance across multiple EVM
-chains (`'base' | 'base-sepolia' | 'polygon' | 'polygon-amoy'` in the SDK's
-`SupportedChain` type) from one Express middleware call, while keeping Hedera
-as a clearing-layer ledger that is authoritative across all of them.
+An **x402** route — one where an unpaid request gets back an HTTP `402
+Payment Required` naming a price instead of data — normally lives on one
+chain's USDC. A payer may hold USDC on a different chain, or the merchant may
+simply not want to write chain-specific settlement code for every chain
+they're willing to accept from. `ferry402` lets a merchant advertise payment
+acceptance across multiple EVM chains (`'base' | 'base-sepolia' | 'polygon' |
+'polygon-amoy'` in the SDK's `SupportedChain` type) from one Express
+middleware call, while keeping Hedera as a clearing-layer ledger that is
+authoritative across all of them.
 
 The one fact to hold onto while reading the rest of this document: **value
 never bridges per payment.** A payer's USDC moves exactly once, on the chain
 it already lives on — from the payer's wallet into that chain's `Escrow.sol`
-contract, via the same `receiveWithAuthorization` call any EIP-3009 transfer
-uses. Nothing is wrapped, bridged, or re-minted on another chain. What *does*
-cross to Hedera is a small JSON record of the fact that the payment happened —
-written as one Hedera Consensus Service (HCS) message, via
-`ConsensusSubmitMessage` — not the money itself. Hedera carries the journal;
-the source chain carries the money.
+contract, via the same `receiveWithAuthorization` call any **EIP-3009**
+transfer uses (EIP-3009 is the token standard that lets a holder sign a
+transfer off-chain for someone else to submit on-chain, so the payer never
+pays gas directly). Nothing is wrapped, bridged, or re-minted on another
+chain.
+
+What *does* cross to Hedera is a small JSON record of the fact that the
+payment happened — written as one Hedera Consensus Service (HCS) message,
+via `ConsensusSubmitMessage` — not the money itself. Hedera carries the
+journal; the source chain carries the money.
 
 This matters because it's also the boundary of what this slice implements.
 `packages/facilitator/src/chains/base.ts` has exactly one chain adapter today
@@ -35,10 +41,13 @@ This matters because it's also the boundary of what this slice implements.
 `polygon-amoy` are real members of the SDK's `SupportedChain` type —
 `buildRequirements` will happily build a `PaymentRequirements` entry for
 them — but a `/verify` or `/settle` call naming either network has no adapter
-to run against and is rejected as `invalid_network`. The config surface is
-ahead of the settlement implementation on purpose (so the merchant-facing API
-doesn't need to change shape when a chain is added); don't configure
-`accept: ['polygon']` today and expect it to work. See the design doc's
+to run against and is rejected as `invalid_network`.
+
+The config surface is ahead of the settlement implementation on purpose, so
+the merchant-facing API doesn't need to change shape when a chain is added —
+but don't configure `accept: ['polygon']` today and expect it to work: you'd
+be advertising a network that **no payment can actually satisfy**, and every
+attempt comes back a `402` with `invalid_network`. See the design doc's
 [Arbitrum/Polygon chain-adapter build sequence](superpowers/specs/2026-09-23-ferry402-design.md#build-sequence)
 for where that's headed.
 
@@ -121,9 +130,8 @@ Step by step:
    re-runs the merchant-binding check independently, confirms `payTo` is on
    the facilitator's own trusted-escrow allowlist, recovers and validates the
    signature (ECDSA or EIP-1271), confirms the escrow's bound token matches
-   the requirement's `asset`, and reads the payer's live USDC balance. See
-   ["What `/verify` has to prove"](#what-verify-has-to-prove) below for why
-   this check list is longer than "is the signature valid."
+   the requirement's `asset`, and reads the payer's live USDC balance — see
+   ["What `/verify` has to prove"](#what-verify-has-to-prove) for why.
 6. **Resource served.** On `isValid: true`, `ferry402()` calls `next()` and
    your route handler runs — **before** anything has touched the chain.
 7. **`/settle` on-chain.** Your route handler (not `ferry402()` itself — see
@@ -159,34 +167,38 @@ closes each of the concrete ways that can happen:
   pass every other check and get a free resource, repeatably, for the cost of
   generating a keypair.
 - **Settlement-time buffer.** `authorization.validBefore` must still have at
-  least `VERIFY_SETTLEMENT_BUFFER_SECONDS` (10 seconds) of life left at
-  `/verify` time, not merely be unexpired right now. `receiveWithAuthorization`
-  enforces `validBefore` at redemption time, and the RPC round trip, mempool
-  inclusion, and `/settle`'s own retry/timeout budget can eat several seconds
-  before the authorization actually lands — an authorization that passed
-  `/verify` with one second left could legitimately expire before `/settle`
-  ever submits it.
+  least `VERIFY_SETTLEMENT_BUFFER_SECONDS` (10 seconds) of life left when
+  `/verify` runs — not merely be unexpired right now.
+  - Why: `receiveWithAuthorization` enforces `validBefore` at redemption
+    time, and the RPC round trip, mempool inclusion, and `/settle`'s own
+    retry/timeout budget can eat several seconds before the authorization
+    actually lands. One that passed `/verify` with one second left could
+    legitimately expire before `/settle` ever submits it.
 - **Escrow-asset binding.** `requirements.payTo` being on the trusted-escrow
-  allowlist proves `payTo` is a real `Escrow.sol` this facilitator operates;
-  it proves nothing about whether `requirements.asset` is the *same* token
-  that escrow will actually try to pull from. `getEscrowToken` reads
-  `escrow.token()` live (memoized — it's immutable on-chain) and rejects a
-  mismatch. Without this, a misconfigured `assets[chain]` would verify a
-  signature against the wrong token's EIP-712 domain, pass every other check,
-  and then revert at `/settle` on every single request.
+  allowlist only proves `payTo` is a real `Escrow.sol` this facilitator
+  operates — it proves nothing about whether `requirements.asset` is the
+  *same* token that escrow will actually try to pull from.
+  - `getEscrowToken` closes that gap: it reads `escrow.token()` live
+    (memoized, since it's immutable on-chain) and rejects a mismatch.
+    Without it, a misconfigured `assets[chain]` would verify a signature
+    against the wrong token's EIP-712 domain, pass every other check, and
+    then revert at `/settle` on every single request.
 - **Merchant binding**, covered below, closes the "redirect to a different
   merchant" case specifically.
 
 What all of that does **not** close: a verified, solvent, correctly-bound
 authorization can still fail to settle for reasons outside `/verify`'s
 control — another transaction spending the payer's balance in the gap, a
-reorg, or the facilitator's own wallet running low on gas. The residual risk
-of serve-then-settle is real, not eliminated; `/verify`'s job is to make
-every *predictable* way an accepted payment fails to settle as narrow as
-possible, not to make settlement a certainty. A merchant serving an
-expensive resource for a correspondingly large payment should weigh that
-residual window explicitly; it's the same trade-off x402 asks of every
-`exact`-scheme integration, not something `ferry402` introduces.
+reorg, or the facilitator's own wallet running low on gas. **The residual
+risk of serve-then-settle is real, not eliminated, and it lands on the
+merchant.**
+
+`/verify`'s job is to make every *predictable* way an accepted payment fails
+to settle as narrow as possible, not to make settlement a certainty. A
+merchant serving an expensive resource for a correspondingly large payment
+should weigh that residual window explicitly — it's the same trade-off x402
+asks of every `exact`-scheme integration, not something `ferry402`
+introduces.
 
 ## Design decisions: the three amendments
 
@@ -202,12 +214,14 @@ credited." An early design passed `merchant` as a separate, caller-supplied
 argument to a permissionless `settleAuthorization`, which meant *anyone*
 holding a valid `(auth, v, r, s)` tuple — the resource server, the
 facilitator, any proxy in between — could call `settleAuthorization(attacker,
-auth, v, r, s)` and redirect the credit. The fix folds the beneficiary into
-the nonce itself: `nonce = keccak256(abi.encode(merchantEvm, paymentId))`.
-Changing the merchant changes the nonce, which invalidates the payer's
-signature. `Escrow.settleAuthorization` recomputes this and reverts
-`MerchantNotBound` on a mismatch; `/verify` recomputes the identical hash
-off-chain so a redirect attempt fails before any gas is spent.
+auth, v, r, s)` and redirect the credit.
+
+The fix folds the beneficiary into the nonce itself: `nonce =
+keccak256(abi.encode(merchantEvm, paymentId))`. Changing the merchant changes
+the nonce, which invalidates the payer's signature. `Escrow.settleAuthorization`
+recomputes this and reverts `MerchantNotBound` on a mismatch; `/verify`
+recomputes the identical hash off-chain so a redirect attempt fails before
+any gas is spent.
 
 **Amendment 2 — credit the observed delta.** `Escrow.sol` credits
 `token.balanceOf(address(this))` measured before and after the
@@ -226,14 +240,15 @@ ledger row — and the nonce's `merchantEvm` preimage — keys on an EVM address
 An early design conflated the two under one `merchant` field; emitting the
 Hedera account id in `PaymentRequirements.extra` makes the nonce
 uncomputable by any client (the contract hashes an `address`, not a dotted
-account id), so every payment would fail `MerchantNotBound`. The fix is
-`Ferry402Config` carrying both: `merchant` (Hedera account id) and
+account id), so every payment would fail `MerchantNotBound`.
+
+The fix is `Ferry402Config` carrying both: `merchant` (Hedera account id) and
 `merchantEvm` (a `Partial<Record<SupportedChain, 0x...>>`, one address per
 accepted chain, since a merchant may use a different payout address per
 chain — only the chains actually listed in `config.accept` need an entry;
-`ferry402()` validates that at construction time). Every
-`JournalEntry` carries both too, so a reader can join a Hedera-side record
-back to the exact on-chain `Escrow` row it reconciles against.
+`ferry402()` validates that at construction time). Every `JournalEntry`
+carries both too, so a reader can join a Hedera-side record back to the
+exact on-chain `Escrow` row it reconciles against.
 
 ## Trust model
 
@@ -242,17 +257,19 @@ Precisely, and without overclaiming:
 - **A malicious or merely broken facilitator can refuse service, or fail to
   settle a verified payment.** `/verify` and `/settle` are the facilitator's
   only two endpoints, and nothing stops an operator from going offline, lying
-  about `isValid`, or never calling `/settle` at all. A merchant depending on
-  a third-party-hosted facilitator should treat this as an availability risk,
-  not a custody risk — which is the next point.
+  about `isValid`, or never calling `/settle` at all.
+  - Treat this as an availability risk, not a custody risk, for a merchant
+    depending on a third-party-hosted facilitator — custody is the next
+    point.
 - **A malicious facilitator cannot steal from escrow, and cannot redirect a
   payment to another merchant.** `Escrow.withdraw` only ever moves
   `_balances[msg.sender]` — there is no admin or facilitator-privileged
-  withdrawal path in `Escrow.sol` at all. And because the nonce the payer
-  signs is bound to a specific `merchantEvm` (Amendment 1), the facilitator
-  cannot substitute a different beneficiary when it calls
-  `settleAuthorization` — the contract's own `MerchantNotBound` check,
-  independent of anything the facilitator claims, enforces this on-chain.
+  withdrawal path in `Escrow.sol` at all.
+  - And because the nonce the payer signs is bound to a specific
+    `merchantEvm` (Amendment 1), the facilitator cannot substitute a
+    different beneficiary when it calls `settleAuthorization` — the
+    contract's own `MerchantNotBound` check, independent of anything the
+    facilitator claims, enforces this on-chain.
 - **The facilitator operator chooses which escrow contracts it trusts**, via
   the `escrows` option `createFacilitatorApp` requires. This is the one
   allowlist standing between an anonymous caller's self-declared `payTo` and
@@ -262,11 +279,12 @@ Precisely, and without overclaiming:
   not silently trusted.
 - **The merchant (via `ferry402()`) controls `config.secret`, `merchantEvm`,
   `escrows`, and `assets`.** A merchant who misconfigures any of these can
-  break their own payment path (every settlement reverting
-  `MerchantNotBound`, for instance) but cannot thereby give an attacker
-  access to funds that would not otherwise be exposed — the structural
-  guarantees above hold independent of merchant-side config mistakes, up to
-  and including the merchant simply being unable to get paid.
+  break their own payment path — every settlement reverting
+  `MerchantNotBound`, for instance.
+  - But misconfiguration cannot thereby give an attacker access to funds
+    that would not otherwise be exposed: the structural guarantees above
+    hold independent of merchant-side config mistakes, up to and including
+    the merchant simply being unable to get paid.
 - **The payer controls their own signature and nothing else.** A payer can
   decline to sign, or sign and never submit. They cannot forge a signature
   for funds they don't control, and (because of merchant binding) cannot have
@@ -286,20 +304,20 @@ Two properties this design actually needs, not generic blockchain appeal:
   settlement needs one durable, ordered record a merchant or auditor can
   replay independent of trusting the facilitator's own database. HCS gives
   each submitted message a global sequence number and a consensus timestamp
-  for about **$0.0008 per `ConsensusSubmitMessage`** — see the design doc's
-  cost note: against even a small payment that's a trivial fraction of the
-  amount moved, and cheap enough to write one entry per settlement rather
-  than batching out of cost necessity.
+  for about **$0.0008 per `ConsensusSubmitMessage`**.
+  - Against even a small payment that's a trivial fraction of the amount
+    moved — cheap enough to write one entry per settlement rather than
+    batching out of cost necessity. See the design doc's cost note.
 - **A message size that happens to fit the journal entry.** HCS caps a
   `ConsensusSubmitMessage` at **1024 bytes**
-  (`packages/facilitator/src/journal.ts`'s `HCS_MAX_MESSAGE_BYTES`). A
-  `JournalEntry` — schema version, type, a Hedera account id, an EVM address,
-  a source chain name, `"USDC"`, a decimal amount string, a payer address, a
-  transaction hash, a 32-byte nonce, and an ISO-8601 timestamp — comfortably
-  fits inside that limit as a single JSON object; `encodeEntries` exists to
-  batch *multiple* entries into one message when that's cheaper, and to
-  reject (never silently truncate or chunk) any single entry that can't fit
-  even alone.
+  (`packages/facilitator/src/journal.ts`'s `HCS_MAX_MESSAGE_BYTES`).
+  - A `JournalEntry` — schema version, type, a Hedera account id, an EVM
+    address, a source chain name, `"USDC"`, a decimal amount string, a payer
+    address, a transaction hash, a 32-byte nonce, and an ISO-8601 timestamp —
+    comfortably fits inside that limit as a single JSON object.
+  - `encodeEntries` exists to batch *multiple* entries into one message when
+    that's cheaper, and to reject (never silently truncate or chunk) any
+    single entry that can't fit even alone.
 
 Hedera never holds the money in this design — it holds the record of where
 the money went, ordered and timestamped in a way the facilitator cannot
@@ -316,14 +334,16 @@ but explicitly out of scope for this slice:
   built. Today a merchant reconciles and withdraws per chain, directly from
   that chain's `Escrow.sol`; nothing in this repo moves value *between*
   chains on the merchant's behalf.
-- **`SettlementLedger.sol` on Hedera.** The design doc specifies a
-  Hedera-side contract holding the merchant registry and authoritative net
-  position per `(merchant, sourceChain)`, verified against the HCS journal.
-  This repo implements the journal writer (`packages/facilitator/src/journal.ts`)
-  and per-chain `Escrow.sol`, but no Hedera-side contract — a merchant
-  reconciles by reading the journal and cross-checking it against chain
-  state directly (see [`docs/deployments.md`](deployments.md) for exactly
-  how), not by querying a Hedera contract for a pre-computed net position.
+- **`SettlementLedger.sol` on Hedera — designed, but not built.** The design
+  doc specifies a Hedera-side contract holding the merchant registry and
+  authoritative net position per `(merchant, sourceChain)`, verified against
+  the HCS journal. This repo implements the journal writer
+  (`packages/facilitator/src/journal.ts`) and per-chain `Escrow.sol`, but no
+  Hedera-side contract.
+  - A merchant instead reconciles by reading the journal and cross-checking
+    it against chain state directly (see [`docs/deployments.md`](deployments.md)
+    for exactly how), not by querying a Hedera contract for a pre-computed
+    net position.
 
 Also worth restating from above since it's easy to miss: `polygon` and
 `polygon-amoy` are accepted by the SDK's config types but have no facilitator

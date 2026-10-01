@@ -57,15 +57,16 @@ touch a merchant's own balance. A merchant:
   though see "Known limitations" below for why a leaked `secret` is lower
   severity than it sounds.
 - **Depends on whichever facilitator they configured** (self-hosted or
-  third-party) to actually submit settlements. Because this codebase is
-  serve-then-settle (the resource is handed over the moment `/verify`
-  passes, *before* `/settle` has redeemed anything on-chain), a facilitator
-  that accepts a request at `/verify` and then never calls `/settle` — or
-  fails to — leaves the merchant having given away a resource for nothing.
-  This is a real, uncorrected risk a merchant takes on by choosing a
-  facilitator; it costs the merchant, not the payer (who paid nothing, since
-  nothing was ever redeemed) and not other merchants using a different
-  facilitator instance.
+  third-party) to actually submit settlements.
+  - Because this codebase is serve-then-settle — the resource is handed
+    over the moment `/verify` passes, *before* `/settle` has redeemed
+    anything on-chain — a facilitator that accepts a request at `/verify`
+    and then never calls `/settle`, or fails to, leaves the merchant having
+    given away a resource for nothing.
+  - This is a real, uncorrected risk a merchant takes on by choosing a
+    facilitator. It costs the merchant, not the payer (who paid nothing,
+    since nothing was ever redeemed) and not other merchants using a
+    different facilitator instance.
 
 ### The facilitator
 
@@ -124,10 +125,12 @@ submit a message to it, including one shaped to look exactly like a
 legitimate `payment` entry for a merchant it has no connection to. Its
 `admin_key` is also `null`, so the topic's configuration can never be
 changed or revoked by anyone, including this project — a permanence
-guarantee, not a write-access one. **The journal is an ordered index that
-must be cross-checked against on-chain state; it is never, by itself, proof
-that a payment happened.** See "Known limitations" below for the full
-reasoning and how this project's own demo reconciles it correctly.
+guarantee, not a write-access one.
+
+**The journal is an ordered index that must be cross-checked against
+on-chain state; it is never, by itself, proof that a payment happened.** See
+"Known limitations" below for the full reasoning and how this project's own
+demo reconciles it correctly.
 
 ## The security properties, and the attacks each one closes
 
@@ -141,15 +144,18 @@ off-chain (`verifyPayment`) and on-chain (`Escrow._checkBinding`).
 binds the payer's signature to exactly six fields — `from, to, value,
 validAfter, validBefore, nonce` — and none of them name who gets *credited*
 in a pooled-custody escrow, since `to` is the Escrow contract itself, the
-same for every merchant. Before this fix, `merchant` was a plain,
-caller-supplied argument to a permissionless `settleAuthorization`. Anyone
-holding the signed tuple `(auth, v, r, s)` — which, in x402's own flow,
-travels through the resource server and the facilitator, both of whom are
-outside the payer's control — could call `settleAuthorization(attacker,
-auth, v, r, s)` and have the credit land in `attacker`'s own balance row
-instead of the merchant's. This silently converted "non-custodial escrow"
-into "trust the resource server and the facilitator not to redirect your
-payment", which is exactly the dependency escrow was supposed to remove.
+same for every merchant.
+
+Before this fix, `merchant` was a plain, caller-supplied argument to a
+permissionless `settleAuthorization`. Anyone holding the signed tuple
+`(auth, v, r, s)` — which, in x402's own flow, travels through the resource
+server and the facilitator, both of whom are outside the payer's control —
+could call `settleAuthorization(attacker, auth, v, r, s)` and have the
+credit land in `attacker`'s own balance row instead of the merchant's. This
+silently converted "non-custodial escrow" into "trust the resource server
+and the facilitator not to redirect your payment," which is exactly the
+dependency escrow was supposed to remove.
+
 Binding the merchant into the nonce means a payer's signature can only ever
 settle to the one merchant it was actually signed for — changing the
 merchant argument changes the nonce, which invalidates the signature.
@@ -168,14 +174,16 @@ deflationary, or rebasing token, that assumption is false, and because
 `Escrow` is pooled custody (many merchants' balances live against one
 shared token balance), over-crediting against a token that delivers less
 than requested is a real path to insolvency — first-come-first-served, once
-withdrawals start outpacing what the contract actually holds. The
-facilitator's own `/settle` re-checks this a second time (`settlePayment`'s
-"Payer solvency"/observed-delta checks in `chains/base.ts`): a settlement
-that reverts, or that mines successfully but credits less than
-`maxAmountRequired`, is reported as a failure rather than silently accepted.
-v1's "USDC only" is project policy, not a code-enforced guarantee — the
-constructor accepts any ERC-20-shaped address — which is exactly why this
-defense exists at the contract layer rather than being assumed away.
+withdrawals start outpacing what the contract actually holds.
+
+The facilitator's own `/settle` re-checks this a second time
+(`settlePayment`'s "Payer solvency"/observed-delta checks in
+`chains/base.ts`): a settlement that reverts, or that mines successfully but
+credits less than `maxAmountRequired`, is reported as a failure rather than
+silently accepted. v1's "USDC only" is project policy, not a code-enforced
+guarantee — the constructor accepts any ERC-20-shaped address — which is
+exactly why this defense exists at the contract layer rather than being
+assumed away.
 
 ### Derived-challenge replay defense, and why it isn't an exhaustible store
 
@@ -185,23 +193,26 @@ costs no memory at all — no per-request store entry, for any volume of
 anonymous traffic.
 
 **The attack this closes, and the one it reopens differently:** the
-predecessor design stored every *issued* challenge in a bounded map. Roughly
-5,000 anonymous, unpaid GETs (two entries each, against a 10,000-entry cap)
-would evict every outstanding legitimate challenge, rejecting every
-in-flight honest payer — a cheap, total denial of service funded
-entirely by free requests. Deriving the challenge removes that cost
-entirely: resource binding and the time window fall out of the HMAC
-preimage and `Date.now()` arithmetic, not a lookup anyone can exhaust by
-asking for free. What derivation *cannot* prove is "never redeemed before"
-— a statement about the past — so a `ConsumedNonceStore` still exists, but
-it is written to only once a request reaches the point of actually
-attempting payment (after every local check passes, immediately before
-calling the facilitator), and released again if that attempt fails. This
-narrows, but does not eliminate, the exhaustion surface: a concurrency-bound
-attacker can still occupy slots transiently with locally-valid-looking but
-ultimately bogus signed payloads up to `InMemoryConsumedNonceStore`'s
-100,000-entry cap — see "Known limitations" for what this store does and
-doesn't survive.
+predecessor design stored every *issued* challenge in a bounded map.
+Roughly 5,000 anonymous, unpaid GETs (two entries each, against a
+10,000-entry cap) would evict every outstanding legitimate challenge,
+rejecting every in-flight honest payer — a cheap, total denial of service
+funded entirely by free requests.
+
+Deriving the challenge removes that cost entirely: resource binding and the
+time window fall out of the HMAC preimage and `Date.now()` arithmetic, not
+a lookup anyone can exhaust by asking for free. What derivation *cannot*
+prove is "never redeemed before" — a statement about the past — so a
+`ConsumedNonceStore` still exists, but it is written to only once a request
+reaches the point of actually attempting payment (after every local check
+passes, immediately before calling the facilitator), and released again if
+that attempt fails.
+
+This narrows, but does not eliminate, the exhaustion surface: a
+concurrency-bound attacker can still occupy slots transiently with
+locally-valid-looking but ultimately bogus signed payloads up to
+`InMemoryConsumedNonceStore`'s 100,000-entry cap — see "Known limitations"
+for what this store does and doesn't survive.
 
 ### Signature-malleability rejection
 
@@ -222,19 +233,22 @@ recipient contract (here, `Escrow` itself) can ever submit it.
 be relayable by *anyone* who observes the signed tuple, which is exactly
 the property that let Amendment 1's attack exist in the first place (a
 third party holding the signature submitting it on the payer's behalf,
-crediting whoever that third party names). Choosing the `receiveWithAuthorization`
-variant closes this at the token layer; Amendment 1 is the fix for where
-the Escrow contract reintroduced an equivalent hole one layer up, at the
-`merchant` argument.
+crediting whoever that third party names).
+
+Choosing the `receiveWithAuthorization` variant closes this at the token
+layer; Amendment 1 is the fix for where the Escrow contract reintroduced an
+equivalent hole one layer up, at the `merchant` argument.
 
 ### EIP-1271 handling
 
 A payer whose `from` address has on-chain code (a smart-contract wallet)
 takes a completely different signature-verification path, chosen *before*
 looking at the signature's shape — `from`'s code presence is checked first,
-unconditionally — mirroring real USDC's own `SignatureChecker.isValidSignatureNow`,
-which both `receiveWithAuthorization` overloads collapse onto. The
-facilitator calls `from.isValidSignature(digest, signature)` via a raw
+unconditionally — mirroring real USDC's own
+`SignatureChecker.isValidSignatureNow`, which both `receiveWithAuthorization`
+overloads collapse onto.
+
+The facilitator calls `from.isValidSignature(digest, signature)` via a raw
 `eth_call` and compares the **entire returned 32-byte word**, not a typed
 `bytes4` ABI decode of just the leading 4 bytes — a typed decode would
 silently accept the correct magic value followed by non-zero garbage
@@ -247,49 +261,55 @@ being independently stricter or looser.
 ## Known limitations — stated plainly
 
 - **The default `InMemoryConsumedNonceStore` is per-process, and a restart
-  loses it.** Replay protection for the still-open derivation window (up to
-  `2 * TIME_BUCKET_SECONDS` = 10 minutes by default) is gone the moment a
-  process restarts or a request lands on a different horizontally-scaled
-  instance than the one that issued it — a nonce consumed on instance A will
-  not be recognized as consumed by instance B. This is not a theoretical
-  gap: it is the literal default every `ferry402(config)` call gets unless
-  you pass your own `ConsumedNonceStore` (`ferry402(config,
-  { consumedNonceStore })`) backed by something shared — Redis, a database.
-  Any multi-instance or auto-restarting deployment needs this.
+  loses it.**
+  - Replay protection for the still-open derivation window (up to `2 *
+    TIME_BUCKET_SECONDS` = 10 minutes by default) is gone the moment a
+    process restarts or a request lands on a different horizontally-scaled
+    instance than the one that issued it — a nonce consumed on instance A
+    will not be recognized as consumed by instance B.
+  - This is not a theoretical gap: it is the literal default every
+    `ferry402(config)` call gets unless you pass your own
+    `ConsumedNonceStore` (`ferry402(config, { consumedNonceStore })`)
+    backed by something shared — Redis, a database. Any multi-instance or
+    auto-restarting deployment needs this.
 - **Serve-then-settle has a residual window.** The resource is served the
   moment `/verify` passes — a live signature and balance check — before
-  `/settle` has actually redeemed anything on-chain. This matches x402's own
-  trust assumption (a verified signature is treated as good as cash for a
-  small payment), but it means a payer could, in principle, spend their
-  balance elsewhere in the gap between the balance check and the actual
-  on-chain redemption, or a transient RPC/chain issue could cause settlement
-  to fail after the resource was already handed over. The facilitator
-  re-verifies the authorization from scratch immediately before submitting
-  it (`settlePayment`'s first step), which narrows this window as much as
-  this architecture allows, but does not close it to zero. This risk lands
-  on the merchant (a resource given away for nothing), not the payer and
-  not other merchants.
+  `/settle` has actually redeemed anything on-chain.
+  - This matches x402's own trust assumption (a verified signature is
+    treated as good as cash for a small payment), but it means a payer
+    could, in principle, spend their balance elsewhere in the gap between
+    the balance check and the actual on-chain redemption, or a transient
+    RPC/chain issue could cause settlement to fail after the resource was
+    already handed over.
+  - The facilitator re-verifies the authorization from scratch immediately
+    before submitting it (`settlePayment`'s first step), which narrows this
+    window as much as this architecture allows, but does not close it to
+    zero. **This risk lands on the merchant** (a resource given away for
+    nothing), not the payer and not other merchants.
 - **The HCS topic has `submit_key: null`.** Read directly: any Hedera
-  account can append a message to the live journal topic
-  (`0.0.10719807`), including a fabricated one shaped like a legitimate
-  `payment` entry for a merchant it has nothing to do with. `admin_key` is
-  also `null`, so this can never be changed after the fact. **The journal
-  must never be treated as standalone proof of payment.** It is an ordered,
-  timestamped index — useful for cheaply finding candidate transactions —
-  that has to be cross-checked against the real chain (matching each
-  entry's `txHash` and `merchantEvm` against `Escrow`'s own ledger row and
-  the token's real balance) before it means anything. This project's own
-  demo (`examples/demo/src/run.ts`'s closing reconciliation step) does
-  exactly that cross-check rather than trusting the journal sum alone.
+  account can append a message to the live journal topic (`0.0.10719807`),
+  including a fabricated one shaped like a legitimate `payment` entry for a
+  merchant it has nothing to do with. `admin_key` is also `null`, so this
+  can never be changed after the fact.
+  - **The journal must never be treated as standalone proof of payment.**
+    It is an ordered, timestamped index — useful for cheaply finding
+    candidate transactions — that has to be cross-checked against the real
+    chain (matching each entry's `txHash` and `merchantEvm` against
+    `Escrow`'s own ledger row and the token's real balance) before it means
+    anything.
+  - This project's own demo (`examples/demo/src/run.ts`'s closing
+    reconciliation step) does exactly that cross-check rather than trusting
+    the journal sum alone.
 - **A leaked `secret` is lower-severity than it looks, but not zero.** Since
   a 402 response already publishes `extra.paymentId` to any anonymous
   requester, knowing `secret` ahead of time doesn't let an attacker derive
-  anything they couldn't already read off a live request. What it does
-  expose: anyone holding a merchant's `secret` could stand up their own
-  `ferry402()` instance that validates — and could be tricked into
-  accepting payments against — that merchant's exact challenges, which
-  matters if you're relying on `secret`'s confidentiality as an access
-  boundary between instances rather than purely a derivation key.
+  anything they couldn't already read off a live request.
+  - What it does expose: anyone holding a merchant's `secret` could stand
+    up their own `ferry402()` instance that validates — and could be
+    tricked into accepting payments against — that merchant's exact
+    challenges. That matters if you're relying on `secret`'s
+    confidentiality as an access boundary between instances rather than
+    purely a derivation key.
 - **No third-party audit, testnet only.** Stated in "Status" above; repeated
   here because it bears on every claim in this document — all of the above
   is this project's own reasoning about its own code, not independently
@@ -305,21 +325,22 @@ being independently stricter or looser.
   `paymentRequirements.payTo` straight from the caller. `createFacilitatorApp`
   fails closed if `escrows` is missing or empty, and rejects any network
   with no matching entry — this is the allowlist that stops an anonymous
-  caller from naming their own contract as the payment destination. Never
-  rely on `payTo`-equals-`requirements.payTo` consistency checks alone; they
-  only prove two caller-supplied values agree with each other, never that
-  either one is real.
+  caller from naming their own contract as the payment destination.
+  - Never rely on `payTo`-equals-`requirements.payTo` consistency checks
+    alone; they only prove two caller-supplied values agree with each
+    other, never that either one is real.
 - **Use a shared `ConsumedNonceStore` the moment you run more than one
   facilitator/merchant process.** See "Known limitations" above — the
   default is explicitly not safe for that.
 - **Key handling.** `FACILITATOR_PRIVATE_KEY` needs gas on every chain it
   settles on and is never logged anywhere in this codebase; treat it with
-  the same care as a hot wallet, because it is one. `HEDERA_PRIVATE_KEY`
-  from a fresh Hedera testnet account is typically ECDSA, DER-encoded — load
-  it with `PrivateKey.fromStringDer()`, never `fromStringED25519()` (the
-  ED25519 loader does not error on a mismatched key type; it silently
-  derives a different, wrong key, and the resulting `INVALID_SIGNATURE` at
-  submit time gives no indication why).
+  the same care as a hot wallet, because it is one.
+  - `HEDERA_PRIVATE_KEY` from a fresh Hedera testnet account is typically
+    ECDSA, DER-encoded — load it with `PrivateKey.fromStringDer()`, never
+    `fromStringED25519()` (the ED25519 loader does not error on a
+    mismatched key type; it silently derives a different, wrong key, and
+    the resulting `INVALID_SIGNATURE` at submit time gives no indication
+    why).
 - **Verify the escrow you point at.** The facilitator already checks that
   `Escrow.token()` matches your configured asset before trusting a signing
   domain against it — but that only proves internal consistency of what you

@@ -3,12 +3,27 @@
 Real failure modes, grounded in the actual error paths in
 `packages/sdk/src/` and `packages/facilitator/src/` — not guesses at what
 might go wrong. Each entry gives the symptom as you'll actually see it, the
-cause in the code, and the fix. See [`docs/architecture.md`](architecture.md)
-for how the pieces these failures touch fit together, and
-[`docs/deployments.md`](deployments.md) for the live deployment these
-examples reference. Cross-references go back to the root
-[`README.md`](../README.md) where it already covers the same ground in more
-depth.
+cause in the code, and the fix.
+
+**Find your symptom in this table, then jump to its section:**
+
+| Symptom | Section |
+|---|---|
+| A stock x402 client (`x402-fetch`, `x402-axios`, plain `x402@1.2.0`) always gets `invalid_payment` | [A stock x402 client gets `invalid_payment` against every request](#a-stock-x402-client-gets-invalid_payment-against-every-request) |
+| `createFacilitatorApp(...)` throws immediately, before listening | [`createFacilitatorApp` throws about `"escrows"`](#createfacilitatorapp-throws-about-escrows) |
+| Every single payment attempt is rejected with `invalid_payment_requirements` | [Every request returns `invalid_payment_requirements`](#every-request-returns-invalid_payment_requirements) |
+| A correctly-signed payment is rejected with `insufficient_funds` | [`insufficient_funds` from `/verify`](#insufficient_funds-from-verify) |
+| Concurrent `/settle` calls look like they might race, or already have | [Settlements race under concurrent load — what's covered and what isn't](#settlements-race-under-concurrent-load--whats-covered-and-what-isnt) |
+| Loading `HEDERA_PRIVATE_KEY` throws, or signs but submit fails with `INVALID_SIGNATURE` | [A Hedera private key fails to load, or produces `INVALID_SIGNATURE`](#a-hedera-private-key-fails-to-load-or-produces-invalid_signature) |
+| A balance or journal entry reads stale immediately after a successful `/settle` | [A balance or journal read comes back stale right after `/settle`](#a-balance-or-journal-read-comes-back-stale-right-after-settle) |
+| GitHub Actions fails with `Multiple versions of pnpm specified` | [CI fails with `Multiple versions of pnpm specified`](#ci-fails-with-multiple-versions-of-pnpm-specified) |
+| `npm install @ferry402/facilitator` fails or installs something unexpected | [`@ferry402/facilitator` cannot be installed from npm](#ferry402facilitator-cannot-be-installed-from-npm) |
+
+See [`docs/architecture.md`](architecture.md) for how the pieces these
+failures touch fit together, and [`docs/deployments.md`](deployments.md) for
+the live deployment these examples reference. Cross-references go back to
+the root [`README.md`](../README.md) where it already covers the same ground
+in more depth.
 
 ## A stock x402 client gets `invalid_payment` against every request
 
@@ -25,9 +40,12 @@ authorization `nonce` to the merchant it was issued for —
 (`packages/sdk/src/nonce.ts`'s `computeNonce`) — so a signed payment can never
 be redirected to a merchant other than the one whose `402` the payer actually
 saw (Amendment 1, see [`docs/architecture.md`](architecture.md#design-decisions-the-three-amendments)).
-`x402@1.2.0`'s own client helpers mint that nonce as random bytes instead. A
-random nonce will never equal either of `matchChallenge`'s derived candidates
-(`packages/sdk/src/challengeDerivation.ts`), so the middleware rejects it.
+`x402@1.2.0`'s own client helpers mint that nonce as random bytes instead.
+
+A random nonce will never equal either of `matchChallenge`'s derived
+candidates (`packages/sdk/src/challengeDerivation.ts`), so the middleware
+rejects it.
+
 The rejection reason is `invalid_payment`, not `payment_expired`: a mismatch
 here could equally be a genuinely expired challenge, a nonce derived for the
 wrong resource or merchant, or (as here) a self-invented nonce — the window
@@ -197,11 +215,13 @@ scaled** — more than one process or container, all configured with the same
 `facilitatorPrivateKey` — each process has its own, independent in-memory
 `nonceManager` state. Two processes submitting at the same moment can still
 both read the same on-chain nonce and race, exactly as if `nonceManager`
-weren't there at all. The fix wired today solves in-process concurrency, not
-multi-instance concurrency with a shared signing key. If you need to scale
-the facilitator horizontally, either give each instance its own funded
-settlement key (so there's no shared nonce sequence to race on), or put a
-single-writer queue in front of `/settle` submissions.
+weren't there at all.
+
+**`nonceManager` fixes in-process settlement concurrency only — it does
+nothing for horizontally-scaled facilitators sharing one signing key.** If
+you need to scale the facilitator horizontally, either give each instance
+its own funded settlement key (so there's no shared nonce sequence to race
+on), or put a single-writer queue in front of `/settle` submissions.
 
 ## A Hedera private key fails to load, or produces `INVALID_SIGNATURE`
 
@@ -229,7 +249,7 @@ const operatorKey = PrivateKey.fromStringDer(process.env.HEDERA_PRIVATE_KEY!)
 This is exactly what `packages/facilitator/scripts/create-topic.ts` and
 `examples/demo/src/run.ts` both do — see either for a working reference.
 
-## Mirror-node and Base Sepolia read-after-write lag
+## A balance or journal read comes back stale right after `/settle`
 
 **Symptom:** You call `/settle`, get back a transaction hash, and
 immediately read `Escrow.balanceOf(merchantEvm)` or query the Hedera mirror
@@ -256,7 +276,7 @@ reference implementations — reuse the same pattern rather than adding a fixed
 `sleep` before a single read, which just moves the flake to a different
 delay.
 
-## The `pnpm/action-setup` + `packageManager` CI conflict
+## CI fails with `Multiple versions of pnpm specified`
 
 **Symptom:** A GitHub Actions run using `pnpm/action-setup@v4` fails with
 `Multiple versions of pnpm specified`.

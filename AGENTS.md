@@ -1,16 +1,22 @@
 # AGENTS.md
 
-This file has two audiences, and they want different things. Don't mix them
-up:
+`ferry402` is an Express middleware, plus a matching facilitator service,
+that lets an HTTP route charge for access using **x402** — the protocol
+where an unpaid request gets back `402 Payment Required` instead of data —
+settled by a signed **EIP-3009** token transfer and journaled to Hedera's
+**HCS** (an ordered, timestamped message log). **This file is two unrelated
+documents stapled together — read the one that matches you, and skip the
+other:**
 
-- **Part 1** is for a coding agent making changes *to* this repository.
-- **Part 2** is for an autonomous agent that wants to *pay* a `ferry402`
-  route to consume a resource — it never touches this repo's source, it just
-  needs to speak the protocol correctly.
+| You are... | Read | Skip |
+|---|---|---|
+| A coding agent about to edit a file in this repo | [Part 1 — Working on this repository](#part-1--working-on-this-repository) | Part 2 |
+| An autonomous agent that just got a `402` from someone else's API and needs to pay it | [Part 2 — Paying for resources with ferry402](#part-2--paying-for-resources-with-ferry402) | Part 1 |
 
-If you're not sure which one you are: if you have this repo checked out and
-are about to edit a file in it, you're Part 1. If you're an agent that just
-got a `402` from someone else's API, you're Part 2.
+Part 2 never touches this repo's source — it's a protocol guide for a client
+calling a `ferry402`-protected API from the outside. If you're not sure which
+one you are: about to edit a file in this checkout → Part 1; just received a
+`402` from someone else's API → Part 2.
 
 ---
 
@@ -122,17 +128,20 @@ Both are pinned to the **same literal golden vectors** — not just
 across files: `packages/sdk/test/nonce.test.ts`,
 `packages/contracts/test/NonceGoldenVectors.t.sol`, and
 `packages/facilitator/test/verify.test.ts` all assert against the identical
-hardcoded nonces. Read `NonceGoldenVectors.t.sol`'s own doc comment for why
-this matters more than it sounds: if you change the encoding on only one
-side (say, `abi.encode` → `abi.encodePacked` in Solidity, or the equivalent
-in `nonce.ts`), that side's *own* test suite stays green, because its test
+hardcoded nonces.
+
+Read `NonceGoldenVectors.t.sol`'s own doc comment for why this matters more
+than it sounds: if you change the encoding on only one side (say,
+`abi.encode` → `abi.encodePacked` in Solidity, or the equivalent in
+`nonce.ts`), that side's *own* test suite stays green, because its test
 helpers recompute the nonce the same new way you just changed it to. Only a
 live cross-language run would catch the divergence — and the live e2e test
-is excluded from CI by design (see above). The failure mode in production is
-every single settlement reverting `MerchantNotBound`, discovered only on a
-real chain. If you ever touch `computeNonce` or `_checkBinding`, change both
-sides in the same commit and re-run both `pnpm --filter @ferry402/sdk test`
-and `forge test`.
+is excluded from CI by design (see above).
+
+The failure mode in production is every single settlement reverting
+`MerchantNotBound`, discovered only on a real chain. If you ever touch
+`computeNonce` or `_checkBinding`, change both sides in the same commit and
+re-run both `pnpm --filter @ferry402/sdk test` and `forge test`.
 
 Other invariants worth knowing before you refactor around them (see
 `docs/superpowers/specs/2026-09-23-ferry402-design.md`'s three Amendments
@@ -180,14 +189,16 @@ nonce = keccak256(abi.encode(merchantEvm, paymentId))
 server-side from a secret only the merchant's own `ferry402()` instances
 hold. A stock `x402@1.2.0` client (`x402-fetch`, `x402-axios`, or anything
 using `x402/client`'s `createNonce()`) mints its own nonce as random bytes.
+
 A random 32 bytes will never equal the two values `ferry402`'s
 `matchChallenge` actually checks against (the current and previous
 derivation window), so the request fails closed with `invalid_payment` —
 indistinguishable, from your side, from any other nonce mismatch (a
-genuinely stale challenge included). There is no
-configuration flag that makes a random nonce work; you must derive the
-nonce the way the merchant's middleware will recompute it, which means
-using `@ferry402/sdk`'s own `createPaymentHeader` (or re-implementing
+genuinely stale challenge included).
+
+There is no configuration flag that makes a random nonce work; you must
+derive the nonce the way the merchant's middleware will recompute it, which
+means using `@ferry402/sdk`'s own `createPaymentHeader` (or re-implementing
 `computeNonce` exactly — not recommended; see Part 1's invariant above for
 why a reimplementation is the easiest way to get this byte-for-byte wrong).
 
@@ -258,14 +269,14 @@ cause**, which matters for deciding whether to retry:
 
 | `error` code | Where it comes from | What it actually means | What to do |
 |---|---|---|---|
-| `invalid_payload` | Local (malformed base64/JSON, non-EVM payload shape) or facilitator (missing `extra.merchantEvm`/`paymentId`, bad address shape) | The `X-PAYMENT` header you sent isn't structurally valid, or you built it from a stale/foreign `accepts` entry | Fetch a fresh 402 from *this* URL and rebuild the header from that response |
+| `invalid_payload` | Local (malformed payload) or facilitator (missing `extra.merchantEvm`/`paymentId`, bad address shape) | The `X-PAYMENT` header you sent isn't structurally valid, or you built it from a stale/foreign `accepts` entry | Fetch a fresh 402 from *this* URL and rebuild the header from that response |
 | `invalid_network` | Local: you claimed a `network` this merchant has no entry for. Facilitator: unsupported network. | Typo, or you picked a chain the merchant doesn't accept | Re-read `accepts[].network` verbatim |
-| **`invalid_payment`** | **Collapses four distinct causes, local except the last**: (1) genuinely expired challenge (past the ~10-minute derivation window), (2) a nonce derived for the wrong resource or merchant address, (3) a stock-client nonce that was never derived at all, (4) a nonce already consumed — including by your own earlier identical request; facilitator responses with `isValid: false` and no specific `invalidReason` also surface as this code | The nonce you presented doesn't match what this server would derive right now (or the facilitator rejected the payment without naming a more specific reason), for any one of several reasons the client can't distinguish | **Always fetch a brand-new 402 and sign fresh.** Retrying the identical header is pointless for causes (2)-(4), and cause (1) needs a fresh derivation anyway. *(Before 0.2.0 this code was `payment_expired`, which asserted expiry specifically — a claim ferry402 was never actually in a position to make, since the window is enforced by HMAC derivation, not a store with timestamps to inspect. `invalid_payment`, a real x402 `ErrorReasons` member, says only what is actually known.)* |
+| **`invalid_payment`** | Collapses four distinct causes — see [below](#invalid_payment-the-four-causes-it-collapses) | The nonce you presented doesn't match what the server would derive right now | **Always fetch a brand-new 402 and sign fresh** — see below |
 | `invalid_exact_evm_payload_authorization_value` | Local or facilitator | You signed `value` below `maxAmountRequired` | Re-read the price off a fresh 402 and sign that amount |
 | `invalid_exact_evm_payload_recipient_mismatch` | Local, facilitator, or on-chain (`Escrow.RecipientMismatch`, surfaced by the facilitator as this same code) | `authorization.to` doesn't equal `payTo` | Use `requirement.payTo` verbatim as `to` |
 | `invalid_exact_evm_payload_authorization_valid_after` / `_valid_before` | Local or facilitator (facilitator adds a 10-second settlement buffer on top of the raw check) | Your signed time window hasn't started, or is too close to expiring to safely settle | Let `createPaymentHeader`'s defaults set the window; don't sign a `validBefore` only a few seconds out |
-| `invalid_exact_evm_payload_signature` | Facilitator only | Malformed signature, malleable (high-`s`) ECDSA signature, wrong recovered signer, or (for a smart-contract wallet) a failing EIP-1271 `isValidSignature` check | Re-sign; if `from` is a smart-contract wallet, confirm it actually returns the correct magic value |
-| `invalid_payment_requirements` | Facilitator only | `payTo` isn't an escrow this facilitator was configured to trust, or the escrow's bound token doesn't match `requirement.asset` | Not something you caused — a merchant/facilitator misconfiguration. Contact the operator |
+| `invalid_exact_evm_payload_signature` | Facilitator only | Malformed/malleable signature, wrong signer, or a failing EIP-1271 check (smart-contract wallets) | Re-sign; if `from` is a smart-contract wallet, confirm it actually returns the correct magic value |
+| `invalid_payment_requirements` | Facilitator only | `payTo` isn't a trusted escrow, or its token doesn't match `requirement.asset` | Not something you caused — a merchant/facilitator misconfiguration. Contact the operator |
 | `insufficient_funds` | Facilitator only, from a **live** on-chain balance read | Your wallet's current on-chain balance is below the price, checked right before the resource would be served | Top up USDC on that network, then retry — the nonce was not consumed (see "Idempotency" below) |
 | `unexpected_verify_error` | Facilitator unreachable/timed out, bad facilitator response, RPC down, or a local store error | A transient infrastructure problem, not a problem with your signature | Safe to retry the identical header — see "Idempotency" below |
 
@@ -275,6 +286,30 @@ report them — these aren't part of `ferry402()`'s own 402 vocabulary, since
 `/settle` only ever runs after a resource was already served. If you see one
 of these from a merchant's custom error field, treat it the same as
 `invalid_payment`: get a fresh 402.
+
+#### `invalid_payment`: the four causes it collapses
+
+A single `invalid_payment` response can mean any of these — the client has
+no way to tell which:
+
+1. **Genuinely expired challenge** — past the ~10-minute derivation window.
+   (Local.)
+2. **A nonce derived for the wrong resource or merchant address.** (Local.)
+3. **A stock-client nonce that was never derived at all** — see "Why a stock
+   x402 client cannot pay" above. (Local.)
+4. **A nonce already consumed** — including by your own earlier identical
+   request. (Local.) Facilitator responses with `isValid: false` and no
+   specific `invalidReason` also surface as this same code.
+
+**What to do:** always fetch a brand-new 402 and sign fresh. Retrying the
+identical header is pointless for causes 2–4, and cause 1 needs a fresh
+derivation anyway.
+
+*Before 0.2.0 this code was `payment_expired`, which asserted expiry
+specifically — a claim ferry402 was never actually in a position to make,
+since the window is enforced by HMAC derivation, not a store with
+timestamps to inspect. `invalid_payment`, a real x402 `ErrorReasons` member,
+says only what is actually known.*
 
 ### Idempotency and retries
 
@@ -288,15 +323,15 @@ challenge, not the same signed header.** The specifics, read directly off
   because it was never newly consumed by this request in the first place.
   Retrying the identical header will fail the identical way forever. Get a
   new 402.
-- If the facilitator call fails for any reason — network error, timeout,
+- If the facilitator call fails for any reason — network error, timeout, or
   the facilitator reports `isValid: false` for *any* reason including
   `insufficient_funds` or a bad signature — the middleware explicitly
   **releases** the nonce it had provisionally consumed
-  (`ConsumedNonceStore.release`). This means the identical signed header
-  genuinely can be retried in these cases, as long as you're still inside
-  its `validBefore` window: e.g. `insufficient_funds` → top up → retry the
-  *same* header; `unexpected_verify_error` → wait a moment → retry the
-  *same* header.
+  (`ConsumedNonceStore.release`).
+  - This means the identical signed header genuinely can be retried in
+    these cases, as long as you're still inside its `validBefore` window:
+    e.g. `insufficient_funds` → top up → retry the *same* header;
+    `unexpected_verify_error` → wait a moment → retry the *same* header.
 - Once a payment actually succeeds (`isValid: true`, and later `/settle`
   redeems it on-chain), that nonce is permanently spent. There is no
   idempotent "pay again safely" here by design — EIP-3009 nonces, like the
@@ -322,19 +357,21 @@ account with `privateKeyToAccount(facilitatorPrivateKey, { nonceManager })`
 — viem's `nonceManager` singleton, which queues nonce acquisition for the
 same `(address, chainId)` through one in-process promise chain. **What this
 covers:** concurrent `/settle` calls handled by the *same facilitator
-process* get distinct, sequential nonces, and both land. **What it does
-not cover:** `nonceManager`'s queue is in-memory, per process. If the
-facilitator you're paying is horizontally scaled — multiple processes or
-instances sharing the same `FACILITATOR_PRIVATE_KEY` behind a load balancer
-— each process has its own independent queue, and two processes can still
-read the same on-chain nonce and race. Nothing in this codebase coordinates
-nonce assignment across processes.
+process* get distinct, sequential nonces, and both land.
+
+**What it does not cover:** `nonceManager`'s queue is in-memory, per
+process. If the facilitator you're paying is horizontally scaled — multiple
+processes or instances sharing the same `FACILITATOR_PRIVATE_KEY` behind a
+load balancer — each process has its own independent queue, and two
+processes can still read the same on-chain nonce and race. Nothing in this
+codebase coordinates nonce assignment across processes.
 
 You, as the paying agent, have no visibility into how the facilitator you're
 talking to is deployed. Firing many payment requests at the same merchant in
 tight parallel multiplies your exposure to this race — one of your payments
 can fail with a confusing, generically-reported settle error that is
 actually just a dropped transaction, not a problem with your signature.
+
 **The safe default is to run your own payment loop sequentially**: await
 the full request → 402 → sign → retry → response cycle for one payment
 before starting the next, rather than issuing several `payAndFetch` calls
@@ -348,12 +385,13 @@ yourself. USDC uses 6 decimals, so `"10000"` is $0.01. This project's own
 live settlements on Base Sepolia are all exactly this: seven real
 settlements of `10000` atomic units ($0.01) each (see
 `.superpowers/sdd/2026-09-23-anychain402-base-slice/verified-chain-facts.md`
-for the verified on-chain figures). You never need ETH for the payment
-itself — EIP-3009 authorizations are signed off-chain and the facilitator's
-own wallet pays the gas to submit them — but you do need the quoted USDC
-amount actually available in your wallet on the chain you chose, checked
-live by the facilitator's `insufficient_funds` gate before anything is
-served.
+for the verified on-chain figures).
+
+You never need ETH for the payment itself — EIP-3009 authorizations are
+signed off-chain and the facilitator's own wallet pays the gas to submit
+them — but you do need the quoted USDC amount actually available in your
+wallet on the chain you chose, checked live by the facilitator's
+`insufficient_funds` gate before anything is served.
 
 ### Verifying a payment landed
 
@@ -386,9 +424,11 @@ There are two places to actually confirm it:
 shaped to look like a legitimate journal entry for a merchant they don't
 control. The journal is a useful ordered index (and the mirror node is far
 cheaper to poll than re-deriving reconciliation from raw chain state every
-time), but the only thing that actually proves a payment landed is the
-settlement transaction itself and the resulting balance on the `Escrow`
-contract — cross-check a journal entry's `txHash` against the real chain,
-never take the entry alone as proof. See `SECURITY.md`'s "Known
-limitations" for the full reasoning, and `docs/deployments.md` /
-`docs/troubleshooting.md` for more worked reconciliation examples.
+time) — but it is **never standalone proof of payment**.
+
+The only thing that actually proves a payment landed is the settlement
+transaction itself and the resulting balance on the `Escrow` contract —
+cross-check a journal entry's `txHash` against the real chain, never take
+the entry alone as proof. See `SECURITY.md`'s "Known limitations" for the
+full reasoning, and `docs/deployments.md` / `docs/troubleshooting.md` for
+more worked reconciliation examples.

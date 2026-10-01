@@ -71,17 +71,20 @@ forge verify-contract \
 
 **Read `admin_key: null` / `submit_key: null` honestly, not as a feature.**
 `admin_key: null` means the topic can never be deleted or reconfigured — that
-part is a genuine permanence guarantee. But `submit_key: null` means there is
-no gate on who can *write* to this topic: anyone with a Hedera account can
-submit a `ConsensusSubmitMessage` naming this topic id, including a message
-that looks exactly like a `ferry402` journal entry but was never produced by
-a real settlement. **A reader cannot treat a message on this topic as proof
-of payment on its own.** The only honest way to use this journal is the way
-the reconciliation below uses it: filter by `merchantEvm`, then cross-check
-each entry's `txHash` against the chain it claims. The journal is an ordered,
-timestamped *index* a reader must verify against Base Sepolia — it is not
-standalone, tamper-proof evidence of payment, and this document does not
-describe it that way.
+part is a genuine permanence guarantee.
+
+But `submit_key: null` means there is no gate on who can *write* to this
+topic: anyone with a Hedera account can submit a `ConsensusSubmitMessage`
+naming this topic id, including a message that looks exactly like a
+`ferry402` journal entry but was never produced by a real settlement. **A
+reader cannot treat a message on this topic as proof of payment on its
+own.**
+
+The only honest way to use this journal is the way the reconciliation below
+uses it: filter by `merchantEvm`, then cross-check each entry's `txHash`
+against the chain it claims. The journal is an ordered, timestamped *index* a
+reader must verify against Base Sepolia — **never standalone, tamper-proof
+evidence of payment** — and this document does not describe it that way.
 
 ## Settlement transactions (all 7)
 
@@ -104,13 +107,15 @@ transaction view (`/testnet/transaction/<consensus_timestamp>`).
 
 Settlement 1 cost **141900 gas**; every settlement after it cost **~107700
 gas** (107700, 107712, 107676, 107692, 107712, 107712 — a few hundred gas of
-natural variance, not a different code path). The difference is the cold
-`SSTORE` on `Escrow._balances[merchant]`: the EVM charges extra gas the first
-time a storage slot is written from its zero value (a cold write), and every
-write after that touches an already-nonzero slot (a warm write). A merchant's
-*first* settlement against this `Escrow` deployment costs ~141.9k gas; every
-subsequent settlement to the same merchant address costs ~107.7k gas, for as
-long as that balance slot stays nonzero.
+natural variance, not a different code path).
+
+The difference is the cold `SSTORE` on `Escrow._balances[merchant]`: the EVM
+charges extra gas the first time a storage slot is written from its zero
+value (a cold write), and every write after that touches an already-nonzero
+slot (a warm write). A merchant's *first* settlement against this `Escrow`
+deployment costs ~141.9k gas; every subsequent settlement to the same
+merchant address costs ~107.7k gas, for as long as that balance slot stays
+nonzero.
 
 ## The three-way reconciliation
 
