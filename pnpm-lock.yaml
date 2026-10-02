@@ -14,7 +14,7 @@ importers:
   packages/facilitator:
     dependencies:
       '@ferry402/sdk':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../sdk
       '@hashgraph/sdk':
         specifier: 2.81.0
