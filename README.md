@@ -331,7 +331,7 @@ reconcile by reading the journal.
 |---|---|
 | [`packages/contracts`](packages/contracts) | `Escrow.sol`, the non-custodial vault. Standalone Foundry project — **not** a pnpm workspace member, so `pnpm -r` never touches it |
 | [`packages/sdk`](packages/sdk) | `@ferry402/sdk` — the middleware, `createPaymentHeader`, and the challenge/nonce primitives. ESM only |
-| [`packages/facilitator`](packages/facilitator) | `createFacilitatorApp()` — the `/verify` + `/settle` service and journal writer. `private`, so self-host from source |
+| [`packages/facilitator`](packages/facilitator) | `@ferry402/facilitator` — `createFacilitatorApp()`, the `/verify` + `/settle` service and journal writer. Published, but run your own rather than trusting someone else's |
 | [`examples/quickstart`](examples/quickstart) | The smallest integration — one route, one middleware. Runs with zero setup; shows the 402 but cannot settle |
 | [`examples/demo`](examples/demo) | The narrated live demo. Installs the **published** SDK from npm, so it tests what you'd actually get |
 | [`examples/demo-ui`](examples/demo-ui) | The same flow in a browser, one card per step. Local-only: it needs your signing keys, so it is not and cannot be a hosted page |

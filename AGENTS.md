@@ -30,7 +30,7 @@ deliberate exception:
 | Path | What it is | In the pnpm workspace? |
 |---|---|---|
 | `packages/sdk` | `@ferry402/sdk` — the public, published package | Yes |
-| `packages/facilitator` | `@ferry402/facilitator` — private, self-hosted, not published | Yes |
+| `packages/facilitator` | `@ferry402/facilitator` — published; holds the signing key, so operators run their own | Yes |
 | `packages/contracts` | `Escrow.sol`, Foundry project | **No** — it has no `package.json` at all |
 | `examples/demo` | Runnable end-to-end demo | **No** — standalone npm project outside the workspace |
 

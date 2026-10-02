@@ -9,12 +9,16 @@ into a per-chain `Escrow` contract on Base, and journals every settled
 payment to a Hedera Consensus Service (HCS) topic (an ordered, independently
 queryable log) for reconciliation.
 
-**Not published to npm; `private: true`.** Running a facilitator means
-self-hosting it from this source — deliberately: nothing in ferry402
-requires trusting someone else's facilitator instance. Clone the repo and
-run `pnpm install` at the root (see the root README's "Try it in 30
-seconds"), then import `@ferry402/facilitator` from within the workspace as
-shown below.
+```bash
+npm install @ferry402/facilitator
+```
+
+**Run your own.** Nothing in ferry402 requires trusting someone else's
+facilitator, and you shouldn't: this is the component that holds a signing
+key, pays gas, and decides which escrow contracts to trust. An operator you
+don't control can refuse to settle your payments — it cannot steal from
+escrow or redirect a payment to another merchant (see
+[`SECURITY.md`](../../SECURITY.md)), but your availability is in its hands.
 
 See `docs/superpowers/specs/2026-09-23-ferry402-design.md` at the repo root
 for the full design, including Amendments 2 and 3, both binding on the

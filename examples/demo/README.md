@@ -11,10 +11,10 @@ security properties against the same live payment.
 This directory depends on the **published** `@ferry402/sdk` from npm (see
 `package.json` — a plain `"0.1.0"` dependency, not a pnpm `workspace:*`
 link), so it proves what a real integrator who just ran `npm install
-@ferry402/sdk` actually gets. `@ferry402/facilitator` is never published (see
-its own `package.json`'s `"private": true`), so the facilitator half runs
-straight from this monorepo's own source — the same thing a merchant who
-clones `ferry402` and self-hosts the facilitator would do.
+@ferry402/sdk` actually gets. The facilitator half runs from this monorepo's
+own source rather than from npm — not because it isn't published (it is, as
+`@ferry402/facilitator`), but because this example lives in the repo and
+testing against local source is the point.
 
 ## What it does
 
@@ -50,7 +50,7 @@ one-line verdicts, never as stack traces.
 - The **ferry402 monorepo itself** already set up one level up: from the
   repo root, `pnpm install && pnpm -r build`. This demo imports
   `@ferry402/facilitator` directly from `../../packages/facilitator/src`
-  (it's never published), so that package's own `node_modules` — and
+  rather than from npm, so that package's own `node_modules` — and
   `packages/sdk/dist`, which it resolves through the workspace symlink —
   must already exist.
 - A funded Base Sepolia payer (USDC) and facilitator (ETH for gas), a

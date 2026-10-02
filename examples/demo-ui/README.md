@@ -18,9 +18,9 @@ top — see `src/server.ts`'s header comment.
 - The **ferry402 monorepo itself** already set up one level up: from the
   repo root, `pnpm install && pnpm -r build`. This imports
   `@ferry402/facilitator` directly from `../../packages/facilitator/src`
-  (it's never published to npm), so that package's own `node_modules` —
-  and `packages/sdk/dist`, which it resolves through the workspace symlink
-  — must already exist.
+  rather than from npm, so that package's own `node_modules` — and
+  `packages/sdk/dist`, which it resolves through the workspace symlink —
+  must already exist.
 - A funded Base Sepolia payer (USDC) and facilitator (ETH for gas), a
   deployed `Escrow` contract, and a Hedera testnet operator account with an
   existing HCS topic. All of this is already live and funded for this

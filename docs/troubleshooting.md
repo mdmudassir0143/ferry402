@@ -18,7 +18,7 @@ cause in the code, and the fix.
 | Loading `HEDERA_PRIVATE_KEY` throws, or signs but submit fails with `INVALID_SIGNATURE` | [A Hedera private key fails to load, or produces `INVALID_SIGNATURE`](#a-hedera-private-key-fails-to-load-or-produces-invalid_signature) |
 | A balance or journal entry reads stale immediately after a successful `/settle` | [A balance or journal read comes back stale right after `/settle`](#a-balance-or-journal-read-comes-back-stale-right-after-settle) |
 | GitHub Actions fails with `Multiple versions of pnpm specified` | [CI fails with `Multiple versions of pnpm specified`](#ci-fails-with-multiple-versions-of-pnpm-specified) |
-| `npm install @ferry402/facilitator` fails or installs something unexpected | [`@ferry402/facilitator` cannot be installed from npm](#ferry402facilitator-cannot-be-installed-from-npm) |
+| You need a `/verify` + `/settle` service and don't know whether to install or self-host | [Running a facilitator](#running-a-facilitator) |
 
 See [`docs/architecture.md`](architecture.md) for how the pieces these
 failures touch fit together, and [`docs/deployments.md`](deployments.md) for
@@ -347,30 +347,34 @@ locally. This repo's own `.github/workflows/ci.yaml` does exactly this:
 - uses: pnpm/action-setup@v4
 ```
 
-## `@ferry402/facilitator` cannot be installed from npm
+## Running a facilitator
 
-**Symptom:** `npm install @ferry402/facilitator` (or the pnpm/yarn
-equivalent) fails to find the package, or installs something unexpected.
+**Symptom:** You need a `/verify` + `/settle` service and aren't sure whether
+to install one or run it from source.
 
-**Cause:** `packages/facilitator/package.json` sets `"private": true`
-deliberately — it is not published to npm, and that's not an oversight to
-work around. `@ferry402/sdk` is the published, developer-facing package;
-`@ferry402/facilitator` is meant to be **self-hosted from source**, so an
-operator always runs code they can read and audit rather than trusting a
-hosted or published build of the component that holds a signing key and
-decides which escrow contracts to trust.
-
-**Fix:** Clone the repo and run the facilitator from source, the same way
-`examples/demo/src/run.ts` does:
+**Either works.** `@ferry402/facilitator` is published:
 
 ```bash
-git clone https://github.com/mdmudassir0143/ferry402.git
-cd ferry402
-pnpm install
-pnpm -r build
+npm install @ferry402/facilitator
 ```
 
-Then import `createFacilitatorApp` from `packages/facilitator/src/index.js`
-(or point a bundler/runtime at that path) rather than from a package
-registry. See the root [`README.md`](../README.md)'s "Packages" table for how
-the pieces are divided between what's published and what's self-hosted.
+```ts
+import { createFacilitatorApp } from '@ferry402/facilitator'
+
+const app = createFacilitatorApp({
+  escrows: { 'base-sepolia': process.env.ESCROW_ADDRESS_BASE_SEPOLIA as `0x${string}` },
+  rpcUrls: { 'base-sepolia': process.env.BASE_SEPOLIA_RPC_URL },
+  facilitatorPrivateKey: process.env.FACILITATOR_PRIVATE_KEY as `0x${string}`,
+})
+app.listen(4000)
+```
+
+**Run it yourself, though — don't point at someone else's.** The facilitator
+holds a signing key, pays gas, and decides which escrow contracts to trust. A
+facilitator you don't control can refuse to settle your payments. It still
+cannot steal from escrow or redirect a payment to another merchant (see
+[`SECURITY.md`](../SECURITY.md)), but availability is entirely in its hands.
+
+This repo's own `examples/` import it from `packages/facilitator/src` rather
+than from npm — not because it isn't published, but because they live in this
+repo and testing against local source is the point.
