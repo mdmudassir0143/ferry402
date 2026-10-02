@@ -85,7 +85,7 @@ against the chain it claims. The journal is an ordered, timestamped *index* a
 reader must verify against Base Sepolia — **never standalone, tamper-proof
 evidence of payment** — and this document does not describe it that way.
 
-## Settlement transactions (all 7)
+## Settlement transactions
 
 Every settlement this deployment has processed, in order. The demo appends a
 new row each time it runs, so treat the count as a floor, not a fixed total.
